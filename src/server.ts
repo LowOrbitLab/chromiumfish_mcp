@@ -126,6 +126,52 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
+    "mouse_click",
+    {
+      description:
+        "Clicks at page coordinates (CSS pixels, origin at the viewport's top-left). Use for controls inside cross-origin iframes that snapshot cannot enumerate.",
+      inputSchema: {
+        x: z.number().finite(),
+        y: z.number().finite(),
+      },
+    },
+    async ({ x, y }) => text(await browser.mouseClick(x, y)),
+  );
+
+  server.registerTool(
+    "list_frames",
+    {
+      description:
+        "Lists the frames/iframes of the current page with their URL and, when available, their bounding box on the page, to help locate cross-origin embedded widgets.",
+      inputSchema: {},
+    },
+    async () => text(await browser.listFrames()),
+  );
+
+  server.registerTool(
+    "detect_challenge",
+    {
+      description:
+        "Detects a common browser interstitial or cross-origin challenge widget on the current page. Returns kind, the widget box, and related frames so a text-only agent can decide the next interaction.",
+      inputSchema: {},
+    },
+    async () => text(await browser.detectChallenge()),
+  );
+
+  server.registerTool(
+    "solve_turnstile",
+    {
+      description:
+        "Performs a human-like coordinate click on the standard checkbox widget inside a cross-origin challenge frame, then polls whether the page left the interstitial. Needs no vision model. The JSON ok field is authoritative.",
+      inputSchema: {
+        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+        maxClicks: z.number().int().min(1).max(30).default(12),
+      },
+    },
+    async ({ timeoutMs, maxClicks }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks })),
+  );
+
+  server.registerTool(
     "type_text",
     {
       description: "Focuses an element and types text, optionally clearing the existing value first and pressing Enter afterwards.",
