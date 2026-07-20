@@ -218,5 +218,5 @@ test("isVerifyingPhase detects verifying copy", () => {
 
 test("snippet trims whitespace and length", () => {
   assert.equal(snippet("  a   b  "), "a b");
-  assert.ok(snippet("x".repeat(400), 50).endsWith("…"));
+  assert.ok(snippet("x".repeat(400), 50).endsWith("..."));
 });

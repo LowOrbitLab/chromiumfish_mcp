@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseCli, parseProxy, parseWindowSize } from "../dist/config.js";
 
-test("解析完整 CLI 配置", () => {
+test("parses a complete CLI configuration", () => {
   const { config } = parseCli([
     "--persona-seed", "alice",
     "--chrome-path", "C:/browser/chrome.exe",
@@ -22,12 +22,12 @@ test("解析完整 CLI 配置", () => {
   assert.equal(config.allowEval, true);
 });
 
-test("拒绝越界窗口尺寸", () => {
-  assert.throws(() => parseWindowSize("100x100"), /超出允许范围/);
-  assert.throws(() => parseWindowSize("large"), /格式/);
+test("rejects out-of-range window sizes", () => {
+  assert.throws(() => parseWindowSize("100x100"), /between/);
+  assert.throws(() => parseWindowSize("large"), /format/);
 });
 
-test("代理凭据与服务地址分离", () => {
+test("separates proxy credentials from the server URL", () => {
   assert.deepEqual(parseProxy("http://alice:p%40ss@127.0.0.1:8080"), {
     server: "http://127.0.0.1:8080",
     username: "alice",

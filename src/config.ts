@@ -25,7 +25,7 @@ export interface ParsedCli {
 function readValue(argv: string[], index: number, flag: string): string {
   const value = argv[index + 1];
   if (!value || value.startsWith("--")) {
-    throw new Error(`${flag} 需要一个值`);
+    throw new Error(`${flag} requires a value`);
   }
   return value;
 }
@@ -33,12 +33,12 @@ function readValue(argv: string[], index: number, flag: string): string {
 export function parseWindowSize(value: string): [number, number] {
   const match = /^(\d+)x(\d+)$/i.exec(value);
   if (!match) {
-    throw new Error("--window-size 格式应为 WIDTHxHEIGHT，例如 1920x1080");
+    throw new Error("--window-size must use WIDTHxHEIGHT format, for example 1920x1080");
   }
   const width = Number(match[1]);
   const height = Number(match[2]);
   if (width < 320 || height < 240 || width > 16384 || height > 16384) {
-    throw new Error("窗口尺寸超出允许范围：320x240 至 16384x16384");
+    throw new Error("Window size must be between 320x240 and 16384x16384");
   }
   return [width, height];
 }
@@ -48,10 +48,10 @@ export function parseProxy(value: string): NonNullable<LaunchOptions["proxy"]> {
   try {
     url = new URL(value);
   } catch {
-    throw new Error("--proxy 必须是有效 URL");
+    throw new Error("--proxy must be a valid URL");
   }
   if (!["http:", "https:", "socks4:", "socks5:"].includes(url.protocol)) {
-    throw new Error("--proxy 仅支持 http、https、socks4 和 socks5");
+    throw new Error("--proxy supports only http, https, socks4, and socks5");
   }
   const server = `${url.protocol}//${url.host}`;
   const proxy: NonNullable<LaunchOptions["proxy"]> = { server };
@@ -120,7 +120,7 @@ export function parseCli(argv: string[]): ParsedCli {
       case "--max-text-chars": {
         const value = Number(readValue(argv, index, arg));
         if (!Number.isInteger(value) || value < 1_000 || value > 1_000_000) {
-          throw new Error("--max-text-chars 必须是 1000 至 1000000 之间的整数");
+          throw new Error("--max-text-chars must be an integer between 1000 and 1000000");
         }
         config.maxTextChars = value;
         index += 1;
@@ -131,7 +131,7 @@ export function parseCli(argv: string[]): ParsedCli {
         index += 1;
         break;
       default:
-        throw new Error(`未知参数：${arg}`);
+        throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
@@ -140,22 +140,22 @@ export function parseCli(argv: string[]): ParsedCli {
 
 export const HELP = `chromiumfish_mcp ${VERSION}
 
-用法：
-  chromiumfish_mcp [选项]
+Usage:
+  chromiumfish_mcp [options]
 
-选项：
-  --persona-seed VALUE       固定浏览器指纹人格
-  --chrome-path PATH         使用本地 ChromiumFish 可执行文件
-  --browser-version VERSION  指定上游浏览器构建版本
-  --headed                  显示浏览器窗口，默认无头模式
-  --window-size WIDTHxHEIGHT 窗口尺寸，默认 1920x1080
-  --timezone ZONE           IANA 时区或 auto
-  --proxy URL               浏览器代理
-  --allowed-host HOST       允许导航的主机，可重复传入
-  --max-text-chars N        页面文本最大字符数，默认 50000
-  --allow-eval              启用任意 JavaScript 执行工具
-  --allow-native-agent      启用浏览器内置代理工具
-  --help                    显示帮助
-  --version                 显示版本
+Options:
+  --persona-seed VALUE       Use a stable browser fingerprint persona
+  --chrome-path PATH         Use a local ChromiumFish executable
+  --browser-version VERSION  Select an upstream browser build
+  --headed                   Show the browser window (default: headless)
+  --window-size WIDTHxHEIGHT Set the window size (default: 1920x1080)
+  --timezone ZONE            Use an IANA time zone or auto
+  --proxy URL                Route browser traffic through a proxy
+  --allowed-host HOST        Allow navigation to a host; repeatable
+  --max-text-chars N         Limit page text output (default: 50000)
+  --allow-eval               Enable the arbitrary JavaScript execution tool
+  --allow-native-agent       Enable the native browser agent tool
+  --help                     Show help
+  --version                  Show version
 
-原生代理只从 OPENAI_API_KEY、OPENAI_API_BASE 和 OPENAI_API_MODEL 读取配置。`;
+The native agent reads configuration only from OPENAI_API_KEY, OPENAI_API_BASE, and OPENAI_API_MODEL.`;

@@ -62,7 +62,7 @@ export function isCloudflareFrameUrl(url: string): boolean {
 export function snippet(text: string, max = 280): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= max) return normalized;
-  return `${normalized.slice(0, max)}…`;
+  return `${normalized.slice(0, max)}...`;
 }
 
 /**
@@ -133,7 +133,7 @@ export function warmUpPath(box: {
   width: number;
   height: number;
 }): Array<{ x: number; y: number }> {
-  // Approach the checkbox from outside — do NOT end on the widget center
+  // Approach the checkbox from outside; do NOT end on the widget center.
   // (that reduced hit-rate in A/B tests vs a 3-point exterior path).
   return [
     { x: Math.max(8, box.x - 120), y: Math.max(8, box.y - 80) },
@@ -173,7 +173,7 @@ export function inferWidgetState(input: {
   tokenPresent: boolean;
   hasChallengeFrame: boolean;
   frameText?: string;
-  /** Main-document signals only — weak alone for embedded widgets. */
+  /** Main-document signals only; weak alone for embedded widgets. */
   mainBodyText?: string;
 }): WidgetState {
   if (input.tokenPresent) return "success";
@@ -195,7 +195,7 @@ export function inferWidgetState(input: {
 
 /**
  * Whether the challenge flow is done.
- * Embedded widgets require token or frame-level success — main body alone is not enough.
+ * Embedded widgets require token or frame-level success; the main body alone is not enough.
  */
 export function looksCleared(input: {
   title: string;
@@ -231,7 +231,7 @@ export function looksCleared(input: {
   if (STRONG_SUCCESS_BODY_RE.test(input.bodyText)) return true;
   if (INTERSTITIAL_BODY_RE.test(input.bodyText)) return false;
 
-  // Still hosting a challenge frame without a token → not clear.
+  // A challenge frame without a token is still present, so clearance is not confirmed.
   if (input.hasChallengeFrame && !input.tokenPresent) return false;
 
   const body = input.bodyText.replace(/\s+/g, " ").trim();

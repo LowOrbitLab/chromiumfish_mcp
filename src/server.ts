@@ -17,7 +17,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "browser_status",
     {
-      description: "返回浏览器是否启动、页面数量和当前页面。不会为了查询状态而启动浏览器。",
+      description: "Report whether the browser is running, the page count, and the current page. Does not start the browser just to inspect status.",
       inputSchema: {},
     },
     async () => text(await browser.status()),
@@ -26,7 +26,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "list_pages",
     {
-      description: "列出所有浏览器页面及其 pageId、标题、URL 和当前页面标记。",
+      description: "List all browser pages with their pageId, title, URL, and current-page marker.",
       inputSchema: {},
     },
     async () => text(await browser.listPages()),
@@ -35,7 +35,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "new_page",
     {
-      description: "新建并切换到一个页面，可选地打开 HTTP/HTTPS URL。",
+      description: "Create and select a new page, optionally opening an HTTP/HTTPS URL.",
       inputSchema: { url: z.string().url().optional() },
     },
     async ({ url }) => text(await browser.newPage(url)),
@@ -44,7 +44,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "select_page",
     {
-      description: "通过 list_pages 返回的 pageId 切换当前页面。",
+      description: "Select the current page by a pageId returned from list_pages.",
       inputSchema: { pageId: z.string().min(1) },
     },
     async ({ pageId }) => text(await browser.selectPage(pageId)),
@@ -53,19 +53,19 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "close_page",
     {
-      description: "关闭指定页面；省略 pageId 时关闭当前页面。",
+      description: "Close the specified page, or the current page when pageId is omitted.",
       inputSchema: { pageId: z.string().min(1).optional() },
     },
     async ({ pageId }) => {
       await browser.closePage(pageId);
-      return text("页面已关闭");
+      return text("Page closed");
     },
   );
 
   server.registerTool(
     "navigate",
     {
-      description: "在当前页面打开 HTTP/HTTPS URL，并等待 DOMContentLoaded。",
+      description: "Open an HTTP/HTTPS URL in the current page and wait for DOMContentLoaded.",
       inputSchema: { url: z.string().url() },
     },
     async ({ url }) => text(await browser.navigate(url)),
@@ -74,7 +74,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "go_back",
     {
-      description: "让当前页面返回上一条历史记录。",
+      description: "Navigate the current page to its previous history entry.",
       inputSchema: {},
     },
     async () => text(await browser.goBack()),
@@ -83,7 +83,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "snapshot",
     {
-      description: "列出当前页面可见的交互元素。返回的 e1、e2 等引用可传给 click、type_text 和 wait_for；页面变化后应重新获取快照。",
+      description: "List visible interactive elements. Pass references such as e1 and e2 to click, type_text, or wait_for; take a new snapshot after the page changes.",
       inputSchema: {},
     },
     async () => text(await browser.snapshot()),
@@ -92,7 +92,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "get_text",
     {
-      description: "读取当前页面可见正文，输出长度受 --max-text-chars 限制。",
+      description: "Read visible text from the current page, limited by --max-text-chars.",
       inputSchema: {},
     },
     async () => text(await browser.getText()),
@@ -101,7 +101,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "screenshot",
     {
-      description: "截取当前视口或整个页面的 PNG 图片。",
+      description: "Capture the current viewport or the full page as a PNG image.",
       inputSchema: { fullPage: z.boolean().default(false) },
     },
     async ({ fullPage }) => ({
@@ -116,12 +116,12 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "click",
     {
-      description: "点击 snapshot 返回的元素引用，也可传入 CSS selector。",
+      description: "Click an element reference returned by snapshot or a CSS selector.",
       inputSchema: { target: z.string().min(1) },
     },
     async ({ target }) => {
       await browser.click(target);
-      return text(`已点击 ${target}`);
+      return text(`Clicked ${target}`);
     },
   );
 
@@ -129,7 +129,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "mouse_click",
     {
       description:
-        "按页面坐标点击（CSS 像素，原点在视口左上角）。适用于 snapshot 无法枚举的跨域 iframe 内控件。",
+        "Click page coordinates in CSS pixels from the viewport's top-left corner. Useful for controls inside cross-origin iframes that snapshot cannot enumerate.",
       inputSchema: {
         x: z.number().finite(),
         y: z.number().finite(),
@@ -142,7 +142,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "list_frames",
     {
       description:
-        "列出当前页面的 frame/iframe，包含 URL；默认附带 bounding box。includeBox=false 可只返回 URL/name（更快）。",
+        "List frames and iframes in the current page with their URLs. Bounding boxes are included by default; set includeBox=false for faster URL/name-only results.",
       inputSchema: {
         includeBox: z.boolean().default(true),
       },
@@ -154,7 +154,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "find_challenge",
     {
       description:
-        "查找当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 present、kind、widgetState、tokenPresent、widget 坐标框与相关 frame。",
+        "Detect common browser interstitials and embedded cross-origin challenge controls. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
       inputSchema: {},
     },
     async () => text(await browser.findChallenge()),
@@ -164,7 +164,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "click_challenge",
     {
       description:
-        "对跨域 challenge frame 内的标准 checkbox 控件做拟人坐标点击，并轮询直到确认清除（response token / widget 成功态 / 离开 interstitial）。不依赖视觉模型。结果以 JSON 的 ok 字段为准。",
+        "Use human-like coordinate clicks on a standard checkbox inside a cross-origin challenge frame, then poll until clearance is confirmed by a response token, widget success state, or interstitial exit. Does not require a vision model; use the JSON ok field as the result.",
       inputSchema: {
         timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
         maxClicks: z.number().int().min(1).max(30).default(6),
@@ -176,7 +176,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "type_text",
     {
-      description: "聚焦元素后输入文本，可先清空原值并在输入后按 Enter。",
+      description: "Focus an element and enter text, optionally clearing its current value and pressing Enter afterward.",
       inputSchema: {
         target: z.string().min(1),
         text: z.string(),
@@ -186,26 +186,26 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     },
     async ({ target, text: value, clear, submit }) => {
       await browser.typeText(target, value, clear, submit);
-      return text(`已向 ${target} 输入文本${submit ? "并按下 Enter" : ""}`);
+      return text(`Entered text in ${target}${submit ? " and pressed Enter" : ""}`);
     },
   );
 
   server.registerTool(
     "press_key",
     {
-      description: "在当前页面按键，例如 Enter、Escape、ArrowDown 或 Control+A。",
+      description: "Press a key in the current page, such as Enter, Escape, ArrowDown, or Control+A.",
       inputSchema: { key: z.string().min(1).max(100) },
     },
     async ({ key }) => {
       await browser.pressKey(key);
-      return text(`已按下 ${key}`);
+      return text(`Pressed ${key}`);
     },
   );
 
   server.registerTool(
     "scroll",
     {
-      description: "滚动当前页面；正 deltaY 向下，负 deltaY 向上。",
+      description: "Scroll the current page; positive deltaY scrolls down and negative deltaY scrolls up.",
       inputSchema: {
         deltaX: z.number().finite().default(0),
         deltaY: z.number().finite(),
@@ -213,14 +213,14 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     },
     async ({ deltaX, deltaY }) => {
       await browser.scroll(deltaX, deltaY);
-      return text("滚动完成");
+      return text("Scroll complete");
     },
   );
 
   server.registerTool(
     "wait_for",
     {
-      description: "等待元素引用或 CSS selector 达到指定状态。",
+      description: "Wait for an element reference or CSS selector to reach the requested state.",
       inputSchema: {
         target: z.string().min(1),
         state: z.enum(["attached", "detached", "visible", "hidden"]).default("visible"),
@@ -229,7 +229,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     },
     async ({ target, state, timeoutMs }) => {
       await browser.waitFor(target, state, timeoutMs);
-      return text(`${target} 已达到 ${state} 状态`);
+      return text(`${target} reached the ${state} state`);
     },
   );
 
@@ -237,7 +237,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     server.registerTool(
       "eval_js",
       {
-        description: "在当前页面执行任意 JavaScript。该高风险工具只有使用 --allow-eval 时才会注册。",
+        description: "Execute arbitrary JavaScript in the current page. This high-risk tool is registered only when --allow-eval is enabled.",
         inputSchema: { expression: z.string().min(1) },
       },
       async ({ expression }) => text(await browser.evalJs(expression)),
@@ -248,7 +248,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     server.registerTool(
       "run_task",
       {
-        description: "把完整目标交给 ChromiumFish 浏览器内置代理。需要通过环境变量配置 OpenAI 兼容接口。",
+        description: "Delegate a complete goal to the native ChromiumFish browser agent. Requires an OpenAI-compatible endpoint configured through environment variables.",
         inputSchema: {
           task: z.string().min(1),
           url: z.string().url().optional(),

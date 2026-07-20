@@ -109,7 +109,7 @@ const INTERACTIVE_SELECTOR = [
 
 function clip(value: string, max: number): string {
   if (value.length <= max) return value;
-  return `${value.slice(0, max)}\n\n[内容已截断，共 ${value.length} 个字符]`;
+  return `${value.slice(0, max)}\n\n[Content truncated; ${value.length} characters total]`;
 }
 
 function jsonValue(value: unknown): string {
@@ -123,18 +123,18 @@ export function assertNavigationUrl(rawUrl: string, allowedHosts: string[]): URL
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error("URL 无效，必须包含 http:// 或 https://");
+    throw new Error("Invalid URL; include http:// or https://");
   }
   if (!["http:", "https:"].includes(url.protocol)) {
-    throw new Error("只允许导航到 HTTP 或 HTTPS URL");
+    throw new Error("Navigation supports only HTTP or HTTPS URLs");
   }
   if (url.username || url.password) {
-    throw new Error("导航 URL 不允许包含用户名或密码");
+    throw new Error("Navigation URLs cannot include a username or password");
   }
   if (allowedHosts.length > 0) {
     const host = url.hostname.toLowerCase();
     const allowed = allowedHosts.some((candidate) => host === candidate || host.endsWith(`.${candidate}`));
-    if (!allowed) throw new Error(`目标主机 ${host} 不在 --allowed-host 白名单中`);
+    if (!allowed) throw new Error(`Target host ${host} is not permitted by --allowed-host`);
   }
   return url;
 }
@@ -178,10 +178,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     const nativeAgentArgs = this.nativeAgentArgs();
     if (this.config.chromePath) {
       if (!existsSync(this.config.chromePath)) {
-        throw new Error(`ChromiumFish 可执行文件不存在：${this.config.chromePath}`);
+        throw new Error(`ChromiumFish executable does not exist: ${this.config.chromePath}`);
       }
       if (this.config.timezone === "auto") {
-        throw new Error("--chrome-path 暂不支持 --timezone auto，请传入明确的 IANA 时区");
+        throw new Error("--chrome-path does not support --timezone auto; specify an IANA time zone");
       }
       const env = this.config.timezone
         ? { ...(process.env as Record<string, string>), TZ: this.config.timezone }
@@ -284,7 +284,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   async selectPage(pageId: string): Promise<PageSummary> {
     const context = await this.ensureContext();
     const page = context.pages().find((candidate) => this.pageId(candidate) === pageId && !candidate.isClosed());
-    if (!page) throw new Error(`未找到页面 ${pageId}`);
+    if (!page) throw new Error(`Page ${pageId} not found`);
     this.currentPage = page;
     await page.bringToFront();
     return this.pageSummary(page);
@@ -294,7 +294,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const page = pageId
       ? (await this.ensureContext()).pages().find((candidate) => this.pageId(candidate) === pageId)
       : await this.page();
-    if (!page || page.isClosed()) throw new Error(`未找到页面 ${pageId ?? "current"}`);
+    if (!page || page.isClosed()) throw new Error(`Page ${pageId ?? "current"} not found`);
     await this.clearRefs(page);
     await page.close();
     if (this.currentPage === page) this.currentPage = undefined;
@@ -363,7 +363,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       lines.push(`[${ref}] ${info.role} "${info.label}"${suffix ? ` ${suffix}` : ""}`);
     }
     this.refs.set(page, refs);
-    return lines.length > 0 ? lines.join("\n") : "(没有可见的交互元素)";
+    return lines.length > 0 ? lines.join("\n") : "(No visible interactive elements)";
   }
 
   async getText(): Promise<string> {
@@ -378,9 +378,9 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async resolveTarget(page: Page, target: string): Promise<InteractiveHandle> {
     const ref = this.refs.get(page)?.get(target);
     const handle = ref ?? await page.locator(target).first().elementHandle();
-    if (!handle) throw new Error(`未找到目标 ${target}；页面变化后请重新调用 snapshot`);
+    if (!handle) throw new Error(`Target ${target} not found; call snapshot again after the page changes`);
     const connected = await handle.evaluate((element) => element.isConnected).catch(() => false);
-    if (!connected) throw new Error(`目标 ${target} 已失效；请重新调用 snapshot`);
+    if (!connected) throw new Error(`Target ${target} is stale; call snapshot again`);
     return handle as InteractiveHandle;
   }
 
@@ -405,7 +405,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async moveTo(page: Page, handle: InteractiveHandle): Promise<void> {
     await handle.scrollIntoViewIfNeeded();
     const box = await handle.boundingBox();
-    if (!box) throw new Error("目标当前不可点击");
+    if (!box) throw new Error("Target is not currently clickable");
     const destination = {
       x: box.x + box.width * (0.35 + Math.random() * 0.3),
       y: box.y + box.height * (0.35 + Math.random() * 0.3),
@@ -424,14 +424,14 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   async mouseClick(x: number, y: number): Promise<MouseClickResult> {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      throw new Error("mouse_click 需要有限数值坐标 x/y");
+      throw new Error("mouse_click requires finite numeric x/y coordinates");
     }
     const page = await this.page();
     const viewport = page.viewportSize();
     if (viewport) {
       if (x < 0 || y < 0 || x > viewport.width || y > viewport.height) {
         throw new Error(
-          `坐标 (${x}, ${y}) 超出视口 ${viewport.width}x${viewport.height}`,
+          `Coordinates (${x}, ${y}) are outside the ${viewport.width}x${viewport.height} viewport`,
         );
       }
     }
@@ -477,7 +477,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (!includeBox) {
       return frames.map((frame) => ({ url: frame.url(), name: frame.name() }));
     }
-    // Bounding boxes only — do not scroll frames during listing (avoids layout thrash).
+    // Bounding boxes only; do not scroll frames during listing (avoids layout thrash).
     const boxes = await Promise.all(frames.map(async (frame) => ({
       frame,
       box: await this.frameBox(frame, { scroll: false }),
@@ -494,7 +494,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     // A/B: evaluateAll on cf-turnstile-response / cf-chl-widget* before click => 0/3 pass;
     // same click path without the probe => 3/3 pass.
     const title = await page.title().catch(() => "");
-    if (/just a moment|安全验证|checking your browser|performing security verification/i.test(title)) {
+    if (/just a moment|\u5b89\u5168\u9a8c\u8bc1|checking your browser|performing security verification/i.test(title)) {
       return "";
     }
 
@@ -647,7 +647,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         tokenPresent: false,
         clicks: [],
         reason: "busy",
-        error: "click_challenge 已在执行中，请等待当前调用结束",
+        error: "click_challenge is already running; wait for the current call to finish",
       };
     }
 
@@ -733,7 +733,7 @@ export class ChromiumFishBrowser implements BrowserApi {
           sawVerifying = true;
           continue;
         }
-        // Not verifying and not cleared → another click may help.
+        // Not verifying and not cleared; another click may help.
         if (sawVerifying) return "ready_for_click";
         // Never entered verifying in this wait window.
         if (Date.now() >= deadline) break;
@@ -799,13 +799,13 @@ export class ChromiumFishBrowser implements BrowserApi {
         attempts: 0,
         clicks,
         reason: "not_found",
-        error: "未找到跨域 challenge 控件区域",
+        error: "Cross-origin challenge control area not found",
       });
     }
 
     widget = await this.ensureWidgetInViewport(page, widget);
 
-    // Seed cursor away from (0,0) — A/B tests showed origin starts reduce hit-rate.
+    // Seed the cursor away from (0,0); A/B tests showed origin starts reduce hit rate.
     const seed = initialCursorPos(page.viewportSize());
     await page.mouse.move(seed.x, seed.y);
     this.mousePositions.set(page, seed);
@@ -825,7 +825,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     let attempts = 0;
 
     while (Date.now() - started < timeoutMs && attempts < maxClicks) {
-      // If already verifying, do NOT click — only wait.
+      // If already verifying, do NOT click; only wait.
       observed = await this.observeChallenge(page);
       let bodyText = await page.locator("body").innerText().catch(() => "");
       if (isVerifyingPhase({
@@ -856,7 +856,7 @@ export class ChromiumFishBrowser implements BrowserApi {
               clicks,
               widget,
               reason: "stuck_verifying",
-              error: "页面停留在 Verifying 状态过久，已停止继续点击",
+              error: "The page remained in the Verifying state too long; stopped clicking",
             });
           }
         }
@@ -884,7 +884,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       await page.mouse.up();
 
       // After each click: long no-click wait (verifying-aware).
-      // First click gets a longer window — successful manual path clears in ~1–3s.
+      // The first click gets a longer window; successful manual paths clear in about 1-3s.
       const waitBudget = attempts === 1 ? 18_000 : 12_000;
       const waitResult = await waitWithoutClicking(kind, waitBudget);
       if (waitResult === "cleared") {
@@ -909,7 +909,7 @@ export class ChromiumFishBrowser implements BrowserApi {
             clicks,
             widget,
             reason: "stuck_verifying",
-            error: "点击后页面停留在 Verifying 状态过久，已停止继续点击",
+            error: "The page remained in the Verifying state too long after a click; stopped clicking",
           });
         }
       }
@@ -944,8 +944,8 @@ export class ChromiumFishBrowser implements BrowserApi {
       tokenPresent: observed.tokenPresent,
       reason: stuck ? "stuck_verifying" : "timeout",
       error: stuck
-        ? "页面停留在 Verifying 状态过久，已停止继续点击"
-        : "在超时时间内未能确认 challenge 已清除",
+        ? "The page remained in the Verifying state too long; stopped clicking"
+        : "Could not confirm challenge clearance before the timeout",
     });
   }
 
@@ -981,7 +981,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const page = await this.page();
     if (/^e\d+$/.test(target)) {
       const handle = this.refs.get(page)?.get(target);
-      if (!handle) throw new Error(`未知元素引用 ${target}；请重新调用 snapshot`);
+      if (!handle) throw new Error(`Unknown element reference ${target}; call snapshot again`);
       await page.waitForFunction(
         ({ element, desired }) => {
           const connected = element.isConnected;
@@ -1010,12 +1010,12 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async targetId(page: Page, session: CDPSession): Promise<string> {
     const result = await session.send("Target.getTargetInfo") as { targetInfo?: { targetId?: string } };
     const targetId = result.targetInfo?.targetId;
-    if (!targetId) throw new Error("无法确定当前页面的 CDP targetId");
+    if (!targetId) throw new Error("Unable to determine the current page's CDP targetId");
     return targetId;
   }
 
   async runTask(task: string, rawUrl: string | undefined, maxSteps: number): Promise<NativeTaskResult> {
-    if (!this.config.allowNativeAgent) throw new Error("原生代理工具未启用");
+    if (!this.config.allowNativeAgent) throw new Error("Native agent tool is not enabled");
     if (rawUrl) await this.navigate(rawUrl);
     const page = await this.page();
     const session = await page.context().newCDPSession(page);
