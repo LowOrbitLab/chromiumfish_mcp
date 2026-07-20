@@ -81,21 +81,39 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "snapshot",
+    "go_forward",
     {
-      description: "List visible interactive elements. Pass references such as e1 and e2 to click, type_text, or wait_for; take a new snapshot after the page changes.",
+      description: "Navigate the current page to its next history entry.",
       inputSchema: {},
     },
-    async () => text(await browser.snapshot()),
+    async () => text(await browser.goForward()),
+  );
+
+  server.registerTool(
+    "reload",
+    {
+      description: "Reload the current page and wait for DOMContentLoaded.",
+      inputSchema: {},
+    },
+    async () => text(await browser.reload()),
+  );
+
+  server.registerTool(
+    "snapshot",
+    {
+      description: "List visible interactive elements in the main document or a frame. Pass references such as e1 and e2 to interaction tools; take a new snapshot after the page changes.",
+      inputSchema: { frameId: z.string().min(1).optional() },
+    },
+    async ({ frameId }) => text(await browser.snapshot(frameId)),
   );
 
   server.registerTool(
     "get_text",
     {
-      description: "Read visible text from the current page, limited by --max-text-chars.",
-      inputSchema: {},
+      description: "Read visible text from the main document or a frame, limited by --max-text-chars.",
+      inputSchema: { frameId: z.string().min(1).optional() },
     },
-    async () => text(await browser.getText()),
+    async ({ frameId }) => text(await browser.getText(frameId)),
   );
 
   server.registerTool(
@@ -116,12 +134,30 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "click",
     {
-      description: "Click an element reference returned by snapshot or a CSS selector.",
-      inputSchema: { target: z.string().min(1) },
+      description: "Click an element reference returned by snapshot or a CSS selector. Use frameId with selectors inside a frame.",
+      inputSchema: {
+        target: z.string().min(1),
+        frameId: z.string().min(1).optional(),
+      },
     },
-    async ({ target }) => {
-      await browser.click(target);
+    async ({ target, frameId }) => {
+      await browser.click(target, frameId);
       return text(`Clicked ${target}`);
+    },
+  );
+
+  server.registerTool(
+    "hover",
+    {
+      description: "Move the mouse over an element reference or CSS selector without clicking.",
+      inputSchema: {
+        target: z.string().min(1),
+        frameId: z.string().min(1).optional(),
+      },
+    },
+    async ({ target, frameId }) => {
+      await browser.hover(target, frameId);
+      return text(`Hovered over ${target}`);
     },
   );
 
@@ -142,7 +178,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "list_frames",
     {
       description:
-        "List frames and iframes in the current page with their URLs. Bounding boxes are included by default; set includeBox=false for faster URL/name-only results.",
+        "List frames and iframes with stable frameId values, parent relationships, URLs, and names. Bounding boxes are included by default; set includeBox=false for faster results.",
       inputSchema: {
         includeBox: z.boolean().default(true),
       },
@@ -176,18 +212,50 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "type_text",
     {
-      description: "Focus an element and enter text, optionally clearing its current value and pressing Enter afterward.",
+      description: "Focus an element and enter text, optionally clearing its current value and pressing Enter afterward. Use frameId with selectors inside a frame.",
       inputSchema: {
         target: z.string().min(1),
         text: z.string(),
         clear: z.boolean().default(true),
         submit: z.boolean().default(false),
+        frameId: z.string().min(1).optional(),
       },
     },
-    async ({ target, text: value, clear, submit }) => {
-      await browser.typeText(target, value, clear, submit);
+    async ({ target, text: value, clear, submit, frameId }) => {
+      await browser.typeText(target, value, clear, submit, frameId);
       return text(`Entered text in ${target}${submit ? " and pressed Enter" : ""}`);
     },
+  );
+
+  server.registerTool(
+    "select_option",
+    {
+      description: "Select one or more native dropdown options by value or label.",
+      inputSchema: {
+        target: z.string().min(1),
+        values: z.array(z.string()).min(1).max(50),
+        matchBy: z.enum(["value", "label"]).default("value"),
+        frameId: z.string().min(1).optional(),
+      },
+    },
+    async ({ target, values, matchBy, frameId }) => text({
+      selectedValues: await browser.selectOption(target, values, matchBy, frameId),
+    }),
+  );
+
+  server.registerTool(
+    "set_checked",
+    {
+      description: "Set a checkbox or radio element to a deterministic checked state.",
+      inputSchema: {
+        target: z.string().min(1),
+        checked: z.boolean(),
+        frameId: z.string().min(1).optional(),
+      },
+    },
+    async ({ target, checked, frameId }) => text({
+      checked: await browser.setChecked(target, checked, frameId),
+    }),
   );
 
   server.registerTool(
@@ -220,16 +288,32 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "wait_for",
     {
-      description: "Wait for an element reference or CSS selector to reach the requested state.",
+      description: "Wait for exactly one condition: an element state, text visibility, URL glob, page load state, or duration.",
       inputSchema: {
-        target: z.string().min(1),
-        state: z.enum(["attached", "detached", "visible", "hidden"]).default("visible"),
+        target: z.string().min(1).optional(),
+        state: z.enum(["attached", "detached", "visible", "hidden"]).optional(),
+        text: z.string().min(1).optional(),
+        textState: z.enum(["visible", "hidden"]).optional(),
+        url: z.string().min(1).optional(),
+        loadState: z.enum(["load", "domcontentloaded", "networkidle"]).optional(),
+        timeMs: z.number().int().min(0).max(120_000).optional(),
+        frameId: z.string().min(1).optional(),
         timeoutMs: z.number().int().min(100).max(120_000).default(30_000),
       },
     },
-    async ({ target, state, timeoutMs }) => {
-      await browser.waitFor(target, state, timeoutMs);
-      return text(`${target} reached the ${state} state`);
+    async ({ target, state, text: expectedText, textState, url, loadState, timeMs, frameId, timeoutMs }) => {
+      await browser.waitFor({
+        target,
+        state,
+        text: expectedText,
+        textState,
+        url,
+        loadState,
+        timeMs,
+        frameId,
+        timeoutMs,
+      });
+      return text("Wait condition satisfied");
     },
   );
 
