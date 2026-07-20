@@ -371,7 +371,13 @@ test("setChecked rejects unchecking a radio", async () => {
 test("screenshots reject oversized documents and viewports", async () => {
   let captured = false;
   const page = {
-    evaluate: async () => ({ width: 10_000, height: 10_000 }),
+    evaluate: async () => ({
+      scale: 1,
+      scrollWidth: 10_000,
+      scrollHeight: 10_000,
+      innerWidth: 10_000,
+      innerHeight: 10_000,
+    }),
     viewportSize: () => ({ width: 10_000, height: 10_000 }),
     screenshot: async () => {
       captured = true;
@@ -383,6 +389,30 @@ test("screenshots reject oversized documents and viewports", async () => {
 
   await assert.rejects(browser.screenshot(true), /too large/);
   await assert.rejects(browser.screenshot(false), /too large/);
+  assert.equal(captured, false);
+});
+
+test("screenshot budget accounts for the device scale factor", async () => {
+  let captured = false;
+  const page = {
+    evaluate: async () => ({
+      scale: 2,
+      scrollWidth: 4_000,
+      scrollHeight: 4_000,
+      innerWidth: 4_000,
+      innerHeight: 4_000,
+    }),
+    viewportSize: () => ({ width: 4_000, height: 4_000 }),
+    screenshot: async () => {
+      captured = true;
+      return Buffer.from("png");
+    },
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  // 4000x4000 CSS px is 16M pixels, but at scale 2 the PNG is 8000x8000 = 64M px.
+  await assert.rejects(browser.screenshot(true), /8000x8000/);
   assert.equal(captured, false);
 });
 

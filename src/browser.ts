@@ -153,6 +153,8 @@ const MIN_SNAPSHOT_CHARS = 5_000;
 const HANDLE_BATCH_SIZE = 32;
 const MAX_SCREENSHOT_PIXELS = 25_000_000;
 const MAX_SCREENSHOT_DIMENSION = 20_000;
+const TEXT_LOCATOR_TIMEOUT_MS = 5_000;
+const SNAPSHOT_TRUNCATION_MARKER = "narrow scope or adjust maxElements/maxChars";
 
 function clip(value: string, max: number): string {
   if (value.length <= max) return value;
@@ -267,28 +269,20 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (this.config.allowedHosts.length === 0) return;
     await context.route("**/*", async (route) => {
       const request = route.request();
-      if (!request.isNavigationRequest()) {
-        await route.continue();
-        return;
+      let allow = true;
+      if (request.isNavigationRequest()) {
+        try {
+          // Only top-level navigations are policed; subframes and assets pass through.
+          const topLevel = request.frame().parentFrame() === null;
+          if (topLevel) assertNavigationUrl(request.url(), this.config.allowedHosts);
+        } catch {
+          allow = false;
+        }
       }
-
-      let topLevel = false;
       try {
-        topLevel = request.frame().parentFrame() === null;
+        await (allow ? route.continue() : route.abort("blockedbyclient"));
       } catch {
-        await route.abort("blockedbyclient");
-        return;
-      }
-      if (!topLevel) {
-        await route.continue();
-        return;
-      }
-
-      try {
-        assertNavigationUrl(request.url(), this.config.allowedHosts);
-        await route.continue();
-      } catch {
-        await route.abort("blockedbyclient");
+        // Route already handled or the page closed mid-flight; nothing actionable.
       }
     });
   }
@@ -596,12 +590,19 @@ export class ChromiumFishBrowser implements BrowserApi {
 
       this.refs.set(page, refs);
       completed = true;
-      if (truncated) {
-        lines.push(
-          `[Snapshot truncated after ${refs.size} elements; narrow scope or adjust maxElements/maxChars]`,
-        );
+      if (!truncated) {
+        // Per-line accounting already kept the body within maxChars.
+        return lines.length > 0 ? lines.join("\n") : "(No visible interactive elements)";
       }
-      return lines.length > 0 ? clip(lines.join("\n"), maxChars) : "(No visible interactive elements)";
+      // Append the marker and, if the body was char-bound, drop trailing lines so the
+      // marker always survives the budget instead of being clipped away.
+      const marker = `[Snapshot truncated after ${refs.size} elements; ${SNAPSHOT_TRUNCATION_MARKER}]`;
+      let output = lines.length > 0 ? `${lines.join("\n")}\n${marker}` : marker;
+      while (output.length > maxChars && lines.length > 0) {
+        lines.pop();
+        output = lines.length > 0 ? `${lines.join("\n")}\n${marker}` : marker;
+      }
+      return output;
     } finally {
       await this.disposeHandles(
         handles.filter((handle) => !completed || !retained.has(handle)),
@@ -613,9 +614,11 @@ export class ChromiumFishBrowser implements BrowserApi {
     const page = await this.page();
     const frame = this.resolveFrame(page, options.frameId);
     const locator = frame.locator(options.selector ?? "body").first();
+    // Bound the auto-wait so a non-matching selector fails fast instead of hanging
+    // for Playwright's default timeout.
     const text = options.selector
-      ? await locator.innerText()
-      : await locator.innerText().catch(() => "");
+      ? await locator.innerText({ timeout: TEXT_LOCATOR_TIMEOUT_MS })
+      : await locator.innerText({ timeout: TEXT_LOCATOR_TIMEOUT_MS }).catch(() => "");
     const defaultMax = Math.min(DEFAULT_SNAPSHOT_CHARS, this.config.maxTextChars);
     const maxChars = Math.min(
       clampInteger(options.maxChars, defaultMax, 100, this.config.maxTextChars),
@@ -626,24 +629,29 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   async screenshot(fullPage: boolean): Promise<Buffer> {
     const page = await this.page();
-    const dimensions = fullPage
-      ? await page.evaluate(() => ({
-        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0),
-        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0),
-      }))
-      : page.viewportSize() ?? await page.evaluate(() => ({
-        width: window.innerWidth,
-        height: window.innerHeight,
-      }));
-    const pixels = dimensions.width * dimensions.height;
+    const metrics = await page.evaluate(() => ({
+      scale: window.devicePixelRatio || 1,
+      scrollWidth: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0),
+      scrollHeight: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0),
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+    }));
+    const viewport = page.viewportSize();
+    const cssWidth = fullPage ? metrics.scrollWidth : viewport?.width ?? metrics.innerWidth;
+    const cssHeight = fullPage ? metrics.scrollHeight : viewport?.height ?? metrics.innerHeight;
+    // The encoded PNG is CSS pixels times the device scale factor on each axis.
+    const scale = Number.isFinite(metrics.scale) && metrics.scale > 0 ? metrics.scale : 1;
+    const width = Math.ceil(cssWidth * scale);
+    const height = Math.ceil(cssHeight * scale);
+    const pixels = width * height;
     if (
-      dimensions.width > MAX_SCREENSHOT_DIMENSION
-      || dimensions.height > MAX_SCREENSHOT_DIMENSION
+      width > MAX_SCREENSHOT_DIMENSION
+      || height > MAX_SCREENSHOT_DIMENSION
       || pixels > MAX_SCREENSHOT_PIXELS
     ) {
       const advice = fullPage ? "capture the viewport or reduce --window-size" : "reduce --window-size";
       throw new Error(
-        `${fullPage ? "Full-page" : "Viewport"} screenshot is too large (${dimensions.width}x${dimensions.height}); ${advice}`,
+        `${fullPage ? "Full-page" : "Viewport"} screenshot is too large (${width}x${height}); ${advice}`,
       );
     }
     return page.screenshot({ type: "png", fullPage });
