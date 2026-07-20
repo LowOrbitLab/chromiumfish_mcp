@@ -31,7 +31,7 @@ for (let i = 1; i <= runs; i += 1) {
     console.log(`\n=== run ${i}/${runs} ===`);
     await browser.navigate(URL);
     await new Promise((r) => setTimeout(r, 2000));
-    const detected = await browser.detectChallenge();
+    const detected = await browser.findChallenge();
     console.log("detect:", JSON.stringify({
       present: detected.present,
       kind: detected.kind,

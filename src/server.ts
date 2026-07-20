@@ -151,13 +151,13 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "detect_challenge",
+    "find_challenge",
     {
       description:
-        "Detects a common browser interstitial or cross-origin challenge widget on the current page. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
+        "Looks for a common browser interstitial or cross-origin challenge widget on the current page. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
       inputSchema: {},
     },
-    async () => text(await browser.detectChallenge()),
+    async () => text(await browser.findChallenge()),
   );
 
   server.registerTool(
