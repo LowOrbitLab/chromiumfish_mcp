@@ -125,7 +125,7 @@ export interface BrowserApi {
   pressKey(key: string): Promise<void>;
   scroll(deltaX: number, deltaY: number): Promise<void>;
   waitFor(options: WaitForOptions): Promise<void>;
-  evalJs(expression: string): Promise<unknown>;
+  evalJs(expression: string): Promise<string>;
   runTask(task: string, url: string | undefined, maxSteps: number): Promise<NativeTaskResult>;
   close(): Promise<void>;
 }
@@ -669,8 +669,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (!ref && /^e\d+$/.test(target)) {
       throw new Error(`Unknown element reference ${target}; call snapshot again`);
     }
-    const frame = ref ? undefined : this.resolveFrame(page, frameId);
-    const handle = ref ?? await frame!.locator(target).first().elementHandle();
+    const handle = ref ?? await this.resolveFrame(page, frameId).locator(target).first().elementHandle();
     if (!handle) throw new Error(`Target ${target} not found; call snapshot again after the page changes`);
     const connected = await handle.evaluate((element) => element.isConnected).catch(() => false);
     if (!connected) throw new Error(`Target ${target} is stale; call snapshot again`);
@@ -858,11 +857,8 @@ export class ChromiumFishBrowser implements BrowserApi {
     return value;
   }
 
-  private async readChallengeFrameText(page: Page): Promise<string> {
-    // IMPORTANT: Do NOT call innerText/content on challenges.cloudflare.com frames.
-    // Reading the challenge frame before click also collapses clearance rates.
-    void page;
-    return "";
+  private async readBody(page: Page): Promise<string> {
+    return page.locator("body").innerText().catch(() => "");
   }
 
   private async findTurnstileWidget(page: Page): Promise<WidgetBox | undefined> {
@@ -918,19 +914,21 @@ export class ChromiumFishBrowser implements BrowserApi {
     widgetState: WidgetState;
     tokenPresent: boolean;
     hasChallengeFrame: boolean;
+    bodyText: string;
   }> {
     const title = await page.title().catch(() => "");
     const url = page.url();
-    const bodyText = await page.locator("body").innerText().catch(() => "");
+    const bodyText = await this.readBody(page);
     const frameUrls = page.frames().map((frame) => frame.url());
     const hasChallengeFrame = frameUrls.some((frameUrl) => isCloudflareFrameUrl(frameUrl));
     const token = await this.readTurnstileToken(page);
     const tokenPresent = token.length > 10;
-    const frameText = hasChallengeFrame ? await this.readChallengeFrameText(page) : "";
+    // Challenge-frame text is deliberately not read: probing challenges.cloudflare.com
+    // frames before clearance collapses success rates, so widget state relies on token
+    // presence and main-document signals only.
     const widgetState = inferWidgetState({
       tokenPresent,
       hasChallengeFrame,
-      frameText,
       mainBodyText: bodyText,
     });
     const classified = classifyChallenge({
@@ -954,6 +952,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       widgetState,
       tokenPresent,
       hasChallengeFrame,
+      bodyText,
       detection: {
         present,
         kind,
@@ -978,7 +977,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       const page = await this.page();
       const title = await page.title().catch(() => "");
       const url = page.url();
-      const bodySnippet = snippet(await page.locator("body").innerText().catch(() => ""));
+      const bodySnippet = snippet(await this.readBody(page));
       return {
         ok: false,
         method: "busy",
@@ -1036,12 +1035,11 @@ export class ChromiumFishBrowser implements BrowserApi {
 
     const clearanceInput = (
       observed: Awaited<ReturnType<ChromiumFishBrowser["observeChallenge"]>>,
-      bodyText: string,
       kind: ChallengeKind,
     ) => ({
       title: observed.detection.title,
       url: observed.detection.url,
-      bodyText,
+      bodyText: observed.bodyText,
       hadChallenge: true as const,
       kind,
       tokenPresent: observed.tokenPresent,
@@ -1059,19 +1057,17 @@ export class ChromiumFishBrowser implements BrowserApi {
       while (Date.now() < deadline) {
         await page.waitForTimeout(450);
         const observed = await this.observeChallenge(page);
-        const bodyText = await page.locator("body").innerText().catch(() => "");
-        if (looksCleared(clearanceInput(observed, bodyText, kind))) {
+        if (looksCleared(clearanceInput(observed, kind))) {
           // Confirm briefly.
           await page.waitForTimeout(500);
           const confirmed = await this.observeChallenge(page);
-          const confirmedBody = await page.locator("body").innerText().catch(() => "");
-          if (looksCleared(clearanceInput(confirmed, confirmedBody, kind))) {
+          if (looksCleared(clearanceInput(confirmed, kind))) {
             return "cleared";
           }
         }
         if (isVerifyingPhase({
           widgetState: observed.widgetState,
-          bodyText,
+          bodyText: observed.bodyText,
           title: observed.detection.title,
         })) {
           sawVerifying = true;
@@ -1083,11 +1079,10 @@ export class ChromiumFishBrowser implements BrowserApi {
         if (Date.now() >= deadline) break;
       }
       const end = await this.observeChallenge(page);
-      const endBody = await page.locator("body").innerText().catch(() => "");
-      if (looksCleared(clearanceInput(end, endBody, kind))) return "cleared";
+      if (looksCleared(clearanceInput(end, kind))) return "cleared";
       if (isVerifyingPhase({
         widgetState: end.widgetState,
-        bodyText: endBody,
+        bodyText: end.bodyText,
         title: end.detection.title,
       })) {
         return "still_verifying";
@@ -1168,41 +1163,40 @@ export class ChromiumFishBrowser implements BrowserApi {
 
     let attempts = 0;
 
+    const clearedResult = (): Promise<ClickChallengeResult> =>
+      finish({ ok: true, method: "click", attempts, clicks, widget });
+
+    const bumpStuckVerifying = (
+      errorMessage: string,
+    ): Promise<ClickChallengeResult> | undefined => {
+      stuckVerifyingRounds += 1;
+      if (stuckVerifyingRounds < maxStuckVerifyingRounds) return undefined;
+      return finish({
+        ok: false,
+        method: "timeout",
+        attempts,
+        clicks,
+        widget,
+        reason: "stuck_verifying",
+        error: errorMessage,
+      });
+    };
+
     while (Date.now() - started < timeoutMs && attempts < maxClicks) {
       // If already verifying, do NOT click; only wait.
       observed = await this.observeChallenge(page);
-      let bodyText = await page.locator("body").innerText().catch(() => "");
       if (isVerifyingPhase({
         widgetState: observed.widgetState,
-        bodyText,
+        bodyText: observed.bodyText,
         title: observed.detection.title,
       })) {
         const waitResult = await waitWithoutClicking(kind, 15_000);
-        if (waitResult === "cleared") {
-          observed = await this.observeChallenge(page);
-          return finish({
-            ok: true,
-            method: "click",
-            attempts,
-            clicks,
-            widget,
-            widgetState: observed.widgetState,
-            tokenPresent: observed.tokenPresent,
-          });
-        }
+        if (waitResult === "cleared") return clearedResult();
         if (waitResult === "still_verifying") {
-          stuckVerifyingRounds += 1;
-          if (stuckVerifyingRounds >= maxStuckVerifyingRounds) {
-            return finish({
-              ok: false,
-              method: "timeout",
-              attempts,
-              clicks,
-              widget,
-              reason: "stuck_verifying",
-              error: "The page remained in the Verifying state too long; stopped clicking",
-            });
-          }
+          const stuckResult = bumpStuckVerifying(
+            "The page remained in the Verifying state too long; stopped clicking",
+          );
+          if (stuckResult) return stuckResult;
         }
       }
 
@@ -1231,37 +1225,17 @@ export class ChromiumFishBrowser implements BrowserApi {
       // The first click gets a longer window; successful manual paths clear in about 1-3s.
       const waitBudget = attempts === 1 ? 18_000 : 12_000;
       const waitResult = await waitWithoutClicking(kind, waitBudget);
-      if (waitResult === "cleared") {
-        observed = await this.observeChallenge(page);
-        return finish({
-          ok: true,
-          method: "click",
-          attempts,
-          clicks,
-          widget,
-          widgetState: observed.widgetState,
-          tokenPresent: observed.tokenPresent,
-        });
-      }
+      if (waitResult === "cleared") return clearedResult();
       if (waitResult === "still_verifying") {
-        stuckVerifyingRounds += 1;
-        if (stuckVerifyingRounds >= maxStuckVerifyingRounds) {
-          return finish({
-            ok: false,
-            method: "timeout",
-            attempts,
-            clicks,
-            widget,
-            reason: "stuck_verifying",
-            error: "The page remained in the Verifying state too long after a click; stopped clicking",
-          });
-        }
+        const stuckResult = bumpStuckVerifying(
+          "The page remained in the Verifying state too long after a click; stopped clicking",
+        );
+        if (stuckResult) return stuckResult;
       }
     }
 
     observed = await this.observeChallenge(page);
-    const bodyText = await page.locator("body").innerText().catch(() => "");
-    const cleared = looksCleared(clearanceInput(observed, bodyText, kind));
+    const cleared = looksCleared(clearanceInput(observed, kind));
     if (cleared) {
       return finish({
         ok: true,
@@ -1275,7 +1249,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     }
     const stuck = isVerifyingPhase({
       widgetState: observed.widgetState,
-      bodyText,
+      bodyText: observed.bodyText,
       title: observed.detection.title,
     });
     return finish({
@@ -1383,7 +1357,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     await page.waitForTimeout(condition.timeMs);
   }
 
-  async evalJs(expression: string): Promise<unknown> {
+  async evalJs(expression: string): Promise<string> {
     const value = await (await this.page()).evaluate((source) => {
       return (0, eval)(source) as unknown;
     }, expression);
