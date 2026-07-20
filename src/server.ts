@@ -17,7 +17,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "browser_status",
     {
-      description: "Returns whether the browser is running, the page count, and the current page. Never launches the browser just to report status.",
+      description: "Report whether the browser is running, the page count, and the current page. Does not start the browser just to inspect status.",
       inputSchema: {},
     },
     async () => text(await browser.status()),
@@ -26,7 +26,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "list_pages",
     {
-      description: "Lists all browser pages with their pageId, title, URL, and a current-page marker.",
+      description: "List all browser pages with their pageId, title, URL, and current-page marker.",
       inputSchema: {},
     },
     async () => text(await browser.listPages()),
@@ -35,7 +35,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "new_page",
     {
-      description: "Creates and switches to a new page, optionally opening an HTTP/HTTPS URL.",
+      description: "Create and select a new page, optionally opening an HTTP/HTTPS URL.",
       inputSchema: { url: z.string().url().optional() },
     },
     async ({ url }) => text(await browser.newPage(url)),
@@ -44,7 +44,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "select_page",
     {
-      description: "Switches the current page by a pageId returned from list_pages.",
+      description: "Select the current page by a pageId returned from list_pages.",
       inputSchema: { pageId: z.string().min(1) },
     },
     async ({ pageId }) => text(await browser.selectPage(pageId)),
@@ -53,7 +53,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "close_page",
     {
-      description: "Closes the given page; closes the current page when pageId is omitted.",
+      description: "Close the specified page, or the current page when pageId is omitted.",
       inputSchema: { pageId: z.string().min(1).optional() },
     },
     async ({ pageId }) => {
@@ -65,7 +65,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "navigate",
     {
-      description: "Opens an HTTP/HTTPS URL in the current page and waits for DOMContentLoaded.",
+      description: "Open an HTTP/HTTPS URL in the current page and wait for DOMContentLoaded.",
       inputSchema: { url: z.string().url() },
     },
     async ({ url }) => text(await browser.navigate(url)),
@@ -74,7 +74,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "go_back",
     {
-      description: "Moves the current page back one history entry.",
+      description: "Navigate the current page to its previous history entry.",
       inputSchema: {},
     },
     async () => text(await browser.goBack()),
@@ -83,7 +83,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "snapshot",
     {
-      description: "Lists the visible interactive elements of the current page. The returned refs (e1, e2, ...) can be passed to click, type_text, and wait_for; take a new snapshot after the page changes.",
+      description: "List visible interactive elements. Pass references such as e1 and e2 to click, type_text, or wait_for; take a new snapshot after the page changes.",
       inputSchema: {},
     },
     async () => text(await browser.snapshot()),
@@ -92,7 +92,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "get_text",
     {
-      description: "Reads the visible text of the current page; output length is capped by --max-text-chars.",
+      description: "Read visible text from the current page, limited by --max-text-chars.",
       inputSchema: {},
     },
     async () => text(await browser.getText()),
@@ -101,7 +101,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "screenshot",
     {
-      description: "Captures a PNG of the current viewport or the full page.",
+      description: "Capture the current viewport or the full page as a PNG image.",
       inputSchema: { fullPage: z.boolean().default(false) },
     },
     async ({ fullPage }) => ({
@@ -116,7 +116,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "click",
     {
-      description: "Clicks an element ref returned by snapshot, or a CSS selector.",
+      description: "Click an element reference returned by snapshot or a CSS selector.",
       inputSchema: { target: z.string().min(1) },
     },
     async ({ target }) => {
@@ -129,7 +129,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "mouse_click",
     {
       description:
-        "Clicks at page coordinates (CSS pixels, origin at the viewport's top-left). Use for controls inside cross-origin iframes that snapshot cannot enumerate.",
+        "Click page coordinates in CSS pixels from the viewport's top-left corner. Useful for controls inside cross-origin iframes that snapshot cannot enumerate.",
       inputSchema: {
         x: z.number().finite(),
         y: z.number().finite(),
@@ -142,7 +142,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "list_frames",
     {
       description:
-        "Lists the frames/iframes of the current page with their URL; includes the bounding box by default. includeBox=false returns only URL/name (faster).",
+        "List frames and iframes in the current page with their URLs. Bounding boxes are included by default; set includeBox=false for faster URL/name-only results.",
       inputSchema: {
         includeBox: z.boolean().default(true),
       },
@@ -154,7 +154,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "find_challenge",
     {
       description:
-        "Looks for a common browser interstitial or cross-origin challenge widget on the current page. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
+        "Detect common browser interstitials and embedded cross-origin challenge controls. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
       inputSchema: {},
     },
     async () => text(await browser.findChallenge()),
@@ -164,7 +164,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "click_challenge",
     {
       description:
-        "Performs a human-like coordinate click on the standard checkbox widget inside a cross-origin challenge frame, then polls until clearance is confirmed (response token / widget success state / interstitial left). Needs no vision model. The JSON ok field is authoritative.",
+        "Use human-like coordinate clicks on a standard checkbox inside a cross-origin challenge frame, then poll until clearance is confirmed by a response token, widget success state, or interstitial exit. Does not require a vision model; use the JSON ok field as the result.",
       inputSchema: {
         timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
         maxClicks: z.number().int().min(1).max(30).default(6),
@@ -176,7 +176,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "type_text",
     {
-      description: "Focuses an element and types text, optionally clearing the existing value first and pressing Enter afterwards.",
+      description: "Focus an element and enter text, optionally clearing its current value and pressing Enter afterward.",
       inputSchema: {
         target: z.string().min(1),
         text: z.string(),
@@ -186,14 +186,14 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     },
     async ({ target, text: value, clear, submit }) => {
       await browser.typeText(target, value, clear, submit);
-      return text(`Typed text into ${target}${submit ? " and pressed Enter" : ""}`);
+      return text(`Entered text in ${target}${submit ? " and pressed Enter" : ""}`);
     },
   );
 
   server.registerTool(
     "press_key",
     {
-      description: "Presses a key in the current page, for example Enter, Escape, ArrowDown, or Control+A.",
+      description: "Press a key in the current page, such as Enter, Escape, ArrowDown, or Control+A.",
       inputSchema: { key: z.string().min(1).max(100) },
     },
     async ({ key }) => {
@@ -205,7 +205,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "scroll",
     {
-      description: "Scrolls the current page; positive deltaY scrolls down, negative scrolls up.",
+      description: "Scroll the current page; positive deltaY scrolls down and negative deltaY scrolls up.",
       inputSchema: {
         deltaX: z.number().finite().default(0),
         deltaY: z.number().finite(),
@@ -213,14 +213,14 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     },
     async ({ deltaX, deltaY }) => {
       await browser.scroll(deltaX, deltaY);
-      return text("Scrolled");
+      return text("Scroll complete");
     },
   );
 
   server.registerTool(
     "wait_for",
     {
-      description: "Waits for an element ref or CSS selector to reach the given state.",
+      description: "Wait for an element reference or CSS selector to reach the requested state.",
       inputSchema: {
         target: z.string().min(1),
         state: z.enum(["attached", "detached", "visible", "hidden"]).default("visible"),
@@ -229,7 +229,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     },
     async ({ target, state, timeoutMs }) => {
       await browser.waitFor(target, state, timeoutMs);
-      return text(`${target} reached state ${state}`);
+      return text(`${target} reached the ${state} state`);
     },
   );
 
@@ -237,7 +237,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     server.registerTool(
       "eval_js",
       {
-        description: "Runs arbitrary JavaScript in the current page. This high-risk tool is registered only with --allow-eval.",
+        description: "Execute arbitrary JavaScript in the current page. This high-risk tool is registered only when --allow-eval is enabled.",
         inputSchema: { expression: z.string().min(1) },
       },
       async ({ expression }) => text(await browser.evalJs(expression)),
@@ -248,7 +248,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     server.registerTool(
       "run_task",
       {
-        description: "Hands a complete goal to the ChromiumFish built-in browser agent. Requires an OpenAI-compatible endpoint configured through environment variables.",
+        description: "Delegate a complete goal to the native ChromiumFish browser agent. Requires an OpenAI-compatible endpoint configured through environment variables.",
         inputSchema: {
           task: z.string().min(1),
           url: z.string().url().optional(),

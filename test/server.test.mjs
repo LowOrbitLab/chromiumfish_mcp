@@ -23,7 +23,7 @@ function fakeBrowser() {
     navigate: async (url) => ({ title: "Example", url }),
     goBack: async () => ({ title: "", url: "about:blank" }),
     snapshot: async () => "[e1] button \"Submit\"",
-    getText: async () => "Page text",
+    getText: async () => "Page body",
     screenshot: async () => Buffer.from("png"),
     click: async () => undefined,
     mouseClick: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
@@ -58,7 +58,7 @@ function fakeBrowser() {
     scroll: async () => undefined,
     waitFor: async () => undefined,
     evalJs: async () => 42,
-    runTask: async () => ({ success: true, finalText: "Done", steps: 1 }),
+    runTask: async () => ({ success: true, finalText: "Completed", steps: 1 }),
     close: async () => undefined,
   };
 }
@@ -125,7 +125,7 @@ test("list_frames supports includeBox", async (context) => {
   assert.doesNotMatch(noBox.content[0].text, /"width"/);
 });
 
-test("registers dangerous tools when explicitly configured", async (context) => {
+test("registers dangerous tools when explicitly enabled", async (context) => {
   const { client, server } = await connectedClient({ allowEval: true, allowNativeAgent: true });
   context.after(async () => {
     await client.close();

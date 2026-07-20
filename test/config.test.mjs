@@ -23,11 +23,11 @@ test("parses a complete CLI configuration", () => {
 });
 
 test("rejects out-of-range window sizes", () => {
-  assert.throws(() => parseWindowSize("100x100"), /out of allowed range/);
+  assert.throws(() => parseWindowSize("100x100"), /between/);
   assert.throws(() => parseWindowSize("large"), /format/);
 });
 
-test("proxy credentials are separated from the server address", () => {
+test("separates proxy credentials from the server URL", () => {
   assert.deepEqual(parseProxy("http://alice:p%40ss@127.0.0.1:8080"), {
     server: "http://127.0.0.1:8080",
     username: "alice",

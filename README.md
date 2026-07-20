@@ -99,13 +99,13 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 Some embedded controls live in cross-origin iframes and never appear in `snapshot`. For those cases:
 
 1. `navigate` to the target URL
-2. `find_challenge` — inspect `present`, `kind`, and `widget`
-3. `click_challenge` — automatic clicks near the widget checkbox region + clearance polling
+2. `find_challenge` -- inspect `present`, `kind`, and `widget`
+3. `click_challenge` -- automatic clicks near the widget checkbox region + clearance polling
 4. Or `list_frames` + `mouse_click` for manual coordinate control
 
 `click_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
 
-Do **not** read challenge-frame document text or probe `cf-turnstile-response` / `cf-chl-widget*` inputs while still on the gate page — that can collapse interactive clearance rates.
+Do **not** read challenge-frame document text or probe `cf-turnstile-response` / `cf-chl-widget*` inputs while still on the gate page; that can collapse interactive clearance rates.
 
 A `snapshot` call returns output similar to this:
 
