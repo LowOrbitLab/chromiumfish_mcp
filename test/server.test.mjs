@@ -26,6 +26,33 @@ function fakeBrowser() {
     getText: async () => "页面正文",
     screenshot: async () => Buffer.from("png"),
     click: async () => undefined,
+    mouseClick: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
+    listFrames: async (options) => {
+      if (options?.includeBox === false) return [{ url: "https://example.com/", name: "" }];
+      return [{ url: "https://example.com/", name: "", box: { x: 0, y: 0, width: 100, height: 100 } }];
+    },
+    detectChallenge: async () => ({
+      present: false,
+      kind: "none",
+      widgetState: "absent",
+      title: "Example",
+      url: "https://example.com/",
+      bodySnippet: "Example Domain",
+      tokenPresent: false,
+      frames: [{ url: "https://example.com/" }],
+    }),
+    solveTurnstile: async () => ({
+      ok: true,
+      method: "already_clear",
+      attempts: 0,
+      elapsedMs: 1,
+      title: "Example",
+      url: "https://example.com/",
+      bodySnippet: "Example Domain",
+      widgetState: "absent",
+      tokenPresent: false,
+      clicks: [],
+    }),
     typeText: async () => undefined,
     pressKey: async () => undefined,
     scroll: async () => undefined,
@@ -53,8 +80,54 @@ test("默认工具集不包含危险工具", async (context) => {
   const names = (await client.listTools()).tools.map((tool) => tool.name);
   assert.ok(names.includes("snapshot"));
   assert.ok(names.includes("list_pages"));
-  assert.ok(!names.includes("eval_js"));
-  assert.ok(!names.includes("run_task"));
+  assert.ok(names.includes("click_challenge"));
+    assert.ok(names.includes("solve_turnstile")); // alias
+    assert.ok(names.includes("mouse_click"));
+    assert.ok(names.includes("list_frames"));
+    assert.ok(names.includes("detect_challenge"));
+    assert.equal(names.includes("eval_js"), false);
+    assert.equal(names.includes("run_task"), false);
+  });
+
+  test("click_challenge 与 mouse_click 返回结构化结果", async (context) => {
+    const { client, server } = await connectedClient();
+    context.after(async () => {
+      await client.close();
+      await server.close();
+    });
+    const solved = await client.callTool({
+      name: "click_challenge",
+      arguments: { timeoutMs: 5000, maxClicks: 3 },
+    });
+    assert.match(solved.content[0].text, /already_clear/);
+    const alias = await client.callTool({
+      name: "solve_turnstile",
+      arguments: { timeoutMs: 5000, maxClicks: 3 },
+    });
+    assert.match(alias.content[0].text, /already_clear/);
+    const clicked = await client.callTool({
+      name: "mouse_click",
+      arguments: { x: 10, y: 20 },
+    });
+    assert.match(clicked.content[0].text, /"x": 10/);
+  });
+
+test("list_frames 支持 includeBox", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const withBox = await client.callTool({
+    name: "list_frames",
+    arguments: { includeBox: true },
+  });
+  assert.match(withBox.content[0].text, /"width"/);
+  const noBox = await client.callTool({
+    name: "list_frames",
+    arguments: { includeBox: false },
+  });
+  assert.doesNotMatch(noBox.content[0].text, /"width"/);
 });
 
 test("显式配置后注册危险工具", async (context) => {

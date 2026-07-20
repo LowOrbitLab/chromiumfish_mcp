@@ -126,6 +126,74 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
+    "mouse_click",
+    {
+      description:
+        "按页面坐标点击（CSS 像素，原点在视口左上角）。适用于 snapshot 无法枚举的跨域 iframe 内控件。",
+      inputSchema: {
+        x: z.number().finite(),
+        y: z.number().finite(),
+      },
+    },
+    async ({ x, y }) => text(await browser.mouseClick(x, y)),
+  );
+
+  server.registerTool(
+    "list_frames",
+    {
+      description:
+        "列出当前页面的 frame/iframe，包含 URL；默认附带 bounding box。includeBox=false 可只返回 URL/name（更快）。",
+      inputSchema: {
+        includeBox: z.boolean().default(true),
+      },
+    },
+    async ({ includeBox }) => text(await browser.listFrames({ includeBox })),
+  );
+
+  server.registerTool(
+    "detect_challenge",
+    {
+      description:
+        "检测当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 present、kind、widgetState、tokenPresent、widget 坐标框与相关 frame。",
+      inputSchema: {},
+    },
+    async () => text(await browser.detectChallenge()),
+  );
+
+  const clickChallengeInput = {
+    timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+    maxClicks: z.number().int().min(1).max(30).default(6),
+  };
+  const clickChallengeHandler = async ({
+    timeoutMs,
+    maxClicks,
+  }: {
+    timeoutMs: number;
+    maxClicks: number;
+  }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks }));
+
+  server.registerTool(
+    "click_challenge",
+    {
+      description:
+        "对跨域 challenge frame 内的标准 checkbox 控件做拟人坐标点击，并轮询直到确认清除（response token / widget 成功态 / 离开 interstitial）。不依赖视觉模型。结果以 JSON 的 ok 字段为准。",
+      inputSchema: clickChallengeInput,
+    },
+    clickChallengeHandler,
+  );
+
+  // Backward-compatible alias (same handler). Prefer click_challenge in new integrations.
+  server.registerTool(
+    "solve_turnstile",
+    {
+      description:
+        "click_challenge 的别名（兼容旧名）。对跨域 challenge checkbox 做坐标点击并确认清除。新接入请优先用 click_challenge。",
+      inputSchema: clickChallengeInput,
+    },
+    clickChallengeHandler,
+  );
+
+  server.registerTool(
     "type_text",
     {
       description: "聚焦元素后输入文本，可先清空原值并在输入后按 Enter。",
