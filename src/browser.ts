@@ -14,6 +14,7 @@ import {
   checkboxClickCandidates,
   classifyChallenge,
   inferWidgetState,
+  initialCursorPos,
   isCloudflareFrameUrl,
   isVerifyingPhase,
   looksCleared,
@@ -489,49 +490,35 @@ export class ChromiumFishBrowser implements BrowserApi {
   }
 
   private async readTurnstileToken(page: Page): Promise<string> {
-    const selectors = [
-      "input[name=\"cf-turnstile-response\"]",
-      "textarea[name=\"cf-turnstile-response\"]",
-      "input[name=\"cf-turnstile-response-field\"]",
-      "[name=\"cf-turnstile-response\"]",
-      "input[id^=\"cf-chl-widget\"][name*=\"response\"]",
-    ];
-    for (const selector of selectors) {
-      const values = await page.locator(selector).evaluateAll((nodes) =>
-        nodes
-          .map((node) => {
-            if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
-              return node.value || "";
-            }
-            return (node as HTMLElement).textContent || "";
-          })
-          .filter((value) => value.trim().length > 0),
-      ).catch(() => [] as string[]);
-      if (values[0]) return values[0];
+    // Avoid probing challenge-related inputs while still on a CF gate page.
+    // A/B: evaluateAll on cf-turnstile-response / cf-chl-widget* before click => 0/3 pass;
+    // same click path without the probe => 3/3 pass.
+    const title = await page.title().catch(() => "");
+    if (/just a moment|安全验证|checking your browser|performing security verification/i.test(title)) {
+      return "";
     }
-    // Hidden fields inside same-origin wrappers
-    const anyToken = await page.evaluate(() => {
+
+    // Prefer a single lightweight read after leaving the gate.
+    const value = await page.evaluate(() => {
       const nodes = Array.from(document.querySelectorAll("input, textarea"));
       for (const node of nodes) {
         const el = node as HTMLInputElement | HTMLTextAreaElement;
-        const name = (el.name || el.id || "").toLowerCase();
-        if (name.includes("turnstile") && name.includes("response") && el.value?.trim()) {
-          return el.value.trim();
-        }
+        const key = `${el.name || ""} ${el.id || ""}`.toLowerCase();
+        if (!key.includes("turnstile") && !key.includes("cf-chl")) continue;
+        if (!key.includes("response")) continue;
+        const v = (el.value || "").trim();
+        if (v.length > 10) return v;
       }
       return "";
     }).catch(() => "");
-    return anyToken;
+    return value;
   }
 
   private async readChallengeFrameText(page: Page): Promise<string> {
-    const parts: string[] = [];
-    for (const frame of page.frames()) {
-      if (!isCloudflareFrameUrl(frame.url())) continue;
-      const text = await frame.locator("body").innerText({ timeout: 800 }).catch(() => "");
-      if (text.trim()) parts.push(text.trim());
-    }
-    return parts.join("\n");
+    // IMPORTANT: Do NOT call innerText/content on challenges.cloudflare.com frames.
+    // Reading the challenge frame before click also collapses clearance rates.
+    void page;
+    return "";
   }
 
   private async findTurnstileWidget(page: Page): Promise<WidgetBox | undefined> {
@@ -818,15 +805,21 @@ export class ChromiumFishBrowser implements BrowserApi {
 
     widget = await this.ensureWidgetInViewport(page, widget);
 
-    // Human-ish warm-up path near the widget.
+    // Seed cursor away from (0,0) — A/B tests showed origin starts reduce hit-rate.
+    const seed = initialCursorPos(page.viewportSize());
+    await page.mouse.move(seed.x, seed.y);
+    this.mousePositions.set(page, seed);
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 80));
+
+    // Exterior warm-up path (matches high-success A/B pattern).
     for (const point of warmUpPath(widget)) {
       if (Date.now() - started > timeoutMs) break;
       const viewport = page.viewportSize();
       if (viewport && (point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height)) {
         continue;
       }
-      await this.moveMouse(page, point.x, point.y, 8 + Math.floor(Math.random() * 6));
-      await page.waitForTimeout(60 + Math.floor(Math.random() * 120));
+      await this.moveMouse(page, point.x, point.y, 8 + Math.floor(Math.random() * 4));
+      await page.waitForTimeout(50 + Math.floor(Math.random() * 80));
     }
 
     let attempts = 0;
@@ -866,32 +859,34 @@ export class ChromiumFishBrowser implements BrowserApi {
               error: "页面停留在 Verifying 状态过久，已停止继续点击",
             });
           }
-          // One more careful click after a stuck verify round.
         }
-        // ready_for_click → fall through to click
       }
 
       widget = await this.ensureWidgetInViewport(
         page,
         (await this.findTurnstileWidget(page)) ?? widget,
       );
-      const queue = checkboxClickCandidates(widget);
-      const target = queue[attempts % queue.length] ?? {
-        x: widget.x + Math.min(40, widget.width * 0.15),
+      // Prefer the left-checkbox primary target first (same as successful A/B: box.x+28).
+      const primary = {
+        x: widget.x + Math.min(36, Math.max(22, widget.width * 0.1)),
         y: widget.y + widget.height / 2,
       };
-      const x = target.x + (Math.random() - 0.5) * 4;
-      const y = target.y + (Math.random() - 0.5) * 3;
+      const queue = attempts === 0 ? [primary, ...checkboxClickCandidates(widget)] : checkboxClickCandidates(widget);
+      const target = queue[attempts % queue.length] ?? primary;
+      const x = target.x + (Math.random() - 0.5) * 3;
+      const y = target.y + (Math.random() - 0.5) * 2;
       attempts += 1;
       clicks.push({ x, y });
-      await this.moveMouse(page, x, y, 16);
-      await page.waitForTimeout(100 + Math.floor(Math.random() * 180));
+      await this.moveMouse(page, x, y, 14 + Math.floor(Math.random() * 6));
+      await page.waitForTimeout(80 + Math.floor(Math.random() * 100));
       await page.mouse.down();
-      await page.waitForTimeout(50 + Math.floor(Math.random() * 80));
+      await page.waitForTimeout(45 + Math.floor(Math.random() * 60));
       await page.mouse.up();
 
       // After each click: long no-click wait (verifying-aware).
-      const waitResult = await waitWithoutClicking(kind, 14_000);
+      // First click gets a longer window — successful manual path clears in ~1–3s.
+      const waitBudget = attempts === 1 ? 18_000 : 12_000;
+      const waitResult = await waitWithoutClicking(kind, waitBudget);
       if (waitResult === "cleared") {
         observed = await this.observeChallenge(page);
         return finish({

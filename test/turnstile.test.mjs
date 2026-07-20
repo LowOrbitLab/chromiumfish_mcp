@@ -4,6 +4,7 @@ import {
   checkboxClickCandidates,
   classifyChallenge,
   inferWidgetState,
+  initialCursorPos,
   isCloudflareFrameUrl,
   isVerifyingPhase,
   looksCleared,
@@ -93,11 +94,24 @@ test("checkboxClickCandidates scale with widget width", () => {
   assert.ok(narrow[0].x < 10 + 40);
 });
 
-test("warmUpPath stays near widget", () => {
+test("warmUpPath stays near widget and avoids center rest", () => {
   const box = { x: 512, y: 304, width: 300, height: 65 };
   const path = warmUpPath(box);
   assert.ok(path.length >= 3);
   assert.ok(path.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)));
+  // Should not park on widget center before the real checkbox click.
+  const centerX = box.x + box.width / 2;
+  const centerY = box.y + box.height / 2;
+  const last = path[path.length - 1];
+  assert.ok(Math.hypot(last.x - centerX, last.y - centerY) > 15);
+});
+
+test("initialCursorPos never returns origin", () => {
+  for (let i = 0; i < 20; i += 1) {
+    const p = initialCursorPos({ width: 1920, height: 1080 });
+    assert.ok(p.x > 10 && p.y > 10);
+    assert.ok(p.x < 1920 && p.y < 1080);
+  }
 });
 
 test("inferWidgetState from token and frame text", () => {
