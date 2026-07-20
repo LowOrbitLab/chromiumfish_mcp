@@ -126,6 +126,52 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
+    "mouse_click",
+    {
+      description:
+        "按页面坐标点击（CSS 像素，原点在视口左上角）。用于 snapshot 看不到的跨域 iframe 控件，例如 Cloudflare Turnstile checkbox。",
+      inputSchema: {
+        x: z.number().finite(),
+        y: z.number().finite(),
+      },
+    },
+    async ({ x, y }) => text(await browser.mouseClick(x, y)),
+  );
+
+  server.registerTool(
+    "list_frames",
+    {
+      description:
+        "列出当前页面的 frame/iframe，包含 URL 与（可得时）在页面上的 bounding box，便于定位 Turnstile 等跨域控件。",
+      inputSchema: {},
+    },
+    async () => text(await browser.listFrames()),
+  );
+
+  server.registerTool(
+    "detect_challenge",
+    {
+      description:
+        "检测当前页是否存在 Cloudflare 人机验证（managed challenge / Turnstile 等）。返回 kind、widget 坐标框与相关 frame，供无多模态代理决策。",
+      inputSchema: {},
+    },
+    async () => text(await browser.detectChallenge()),
+  );
+
+  server.registerTool(
+    "solve_turnstile",
+    {
+      description:
+        "本地尝试通过 Cloudflare Turnstile / managed challenge：定位 challenge frame，在 checkbox 区域做拟人坐标点击并轮询是否通过。不调用第三方打码，不需要视觉模型。成功与否以 JSON 的 ok 字段为准。",
+      inputSchema: {
+        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+        maxClicks: z.number().int().min(1).max(30).default(12),
+      },
+    },
+    async ({ timeoutMs, maxClicks }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks })),
+  );
+
+  server.registerTool(
     "type_text",
     {
       description: "聚焦元素后输入文本，可先清空原值并在输入后按 Enter。",

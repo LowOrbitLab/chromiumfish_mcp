@@ -26,6 +26,26 @@ function fakeBrowser() {
     getText: async () => "页面正文",
     screenshot: async () => Buffer.from("png"),
     click: async () => undefined,
+    mouseClick: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
+    listFrames: async () => [{ url: "https://example.com/", name: "" }],
+    detectChallenge: async () => ({
+      present: false,
+      kind: "none",
+      title: "Example",
+      url: "https://example.com/",
+      bodySnippet: "Example Domain",
+      frames: [{ url: "https://example.com/" }],
+    }),
+    solveTurnstile: async () => ({
+      ok: true,
+      method: "already_clear",
+      attempts: 0,
+      elapsedMs: 1,
+      title: "Example",
+      url: "https://example.com/",
+      bodySnippet: "Example Domain",
+      clicks: [],
+    }),
     typeText: async () => undefined,
     pressKey: async () => undefined,
     scroll: async () => undefined,
@@ -53,8 +73,30 @@ test("默认工具集不包含危险工具", async (context) => {
   const names = (await client.listTools()).tools.map((tool) => tool.name);
   assert.ok(names.includes("snapshot"));
   assert.ok(names.includes("list_pages"));
+  assert.ok(names.includes("mouse_click"));
+  assert.ok(names.includes("list_frames"));
+  assert.ok(names.includes("detect_challenge"));
+  assert.ok(names.includes("solve_turnstile"));
   assert.ok(!names.includes("eval_js"));
   assert.ok(!names.includes("run_task"));
+});
+
+test("solve_turnstile 与 mouse_click 返回结构化结果", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const solved = await client.callTool({
+    name: "solve_turnstile",
+    arguments: { timeoutMs: 5000, maxClicks: 3 },
+  });
+  assert.match(solved.content[0].text, /already_clear/);
+  const clicked = await client.callTool({
+    name: "mouse_click",
+    arguments: { x: 10, y: 20 },
+  });
+  assert.match(clicked.content[0].text, /"x": 10/);
 });
 
 test("显式配置后注册危险工具", async (context) => {

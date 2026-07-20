@@ -5,10 +5,24 @@ import type {
   BrowserContext,
   CDPSession,
   ElementHandle,
+  Frame,
   Page,
 } from "playwright-core";
 import { chromium } from "playwright-core";
 import type { ServerConfig } from "./config.js";
+import {
+  checkboxClickCandidates,
+  classifyChallenge,
+  isCloudflareFrameUrl,
+  looksCleared,
+  snippet,
+  warmUpPath,
+  type ChallengeDetection,
+  type SolveTurnstileResult,
+  type WidgetBox,
+} from "./turnstile.js";
+
+export type { ChallengeDetection, SolveTurnstileResult, WidgetBox };
 
 export interface PageSummary {
   id: string;
@@ -34,6 +48,19 @@ export interface NativeTaskResult {
   steps: number;
 }
 
+export interface FrameSummary {
+  url: string;
+  name: string;
+  box?: { x: number; y: number; width: number; height: number };
+}
+
+export interface MouseClickResult {
+  x: number;
+  y: number;
+  title: string;
+  url: string;
+}
+
 export interface BrowserApi {
   status(): Promise<BrowserStatus>;
   listPages(): Promise<PageSummary[]>;
@@ -46,6 +73,10 @@ export interface BrowserApi {
   getText(): Promise<string>;
   screenshot(fullPage: boolean): Promise<Buffer>;
   click(target: string): Promise<void>;
+  mouseClick(x: number, y: number): Promise<MouseClickResult>;
+  listFrames(): Promise<FrameSummary[]>;
+  detectChallenge(): Promise<ChallengeDetection>;
+  solveTurnstile(options?: { timeoutMs?: number; maxClicks?: number }): Promise<SolveTurnstileResult>;
   typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void>;
   pressKey(key: string): Promise<void>;
   scroll(deltaX: number, deltaY: number): Promise<void>;
@@ -378,6 +409,262 @@ export class ChromiumFishBrowser implements BrowserApi {
     await page.mouse.down();
     await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
     await page.mouse.up();
+  }
+
+  private async moveMouseTo(page: Page, x: number, y: number, steps = 12): Promise<void> {
+    const start = this.mousePositions.get(page) ?? { x: 0, y: 0 };
+    const control = {
+      x: (start.x + x) / 2 + (Math.random() - 0.5) * 80,
+      y: (start.y + y) / 2 + (Math.random() - 0.5) * 80,
+    };
+    const total = Math.max(4, steps);
+    for (let index = 1; index <= total; index += 1) {
+      const t = index / total;
+      const inverse = 1 - t;
+      await page.mouse.move(
+        inverse * inverse * start.x + 2 * inverse * t * control.x + t * t * x,
+        inverse * inverse * start.y + 2 * inverse * t * control.y + t * t * y,
+      );
+    }
+    this.mousePositions.set(page, { x, y });
+  }
+
+  async mouseClick(x: number, y: number): Promise<MouseClickResult> {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error("mouse_click 需要有限数值坐标 x/y");
+    }
+    const page = await this.page();
+    const viewport = page.viewportSize();
+    if (viewport) {
+      if (x < 0 || y < 0 || x > viewport.width || y > viewport.height) {
+        throw new Error(
+          `坐标 (${x}, ${y}) 超出视口 ${viewport.width}x${viewport.height}`,
+        );
+      }
+    }
+    await this.moveMouseTo(page, x, y, 14);
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 90));
+    await page.mouse.down();
+    await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
+    await page.mouse.up();
+    return {
+      x,
+      y,
+      title: await page.title().catch(() => ""),
+      url: page.url(),
+    };
+  }
+
+  private async frameBox(frame: Frame): Promise<WidgetBox | undefined> {
+    try {
+      const box = await frame.locator("body").boundingBox({ timeout: 1500 });
+      if (!box || box.width <= 0 || box.height <= 0) return undefined;
+      return {
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+        frameUrl: frame.url(),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  async listFrames(): Promise<FrameSummary[]> {
+    const page = await this.page();
+    const frames = page.frames();
+    const summaries: FrameSummary[] = [];
+    for (const frame of frames) {
+      const box = await this.frameBox(frame);
+      summaries.push({
+        url: frame.url(),
+        name: frame.name(),
+        ...(box
+          ? { box: { x: box.x, y: box.y, width: box.width, height: box.height } }
+          : {}),
+      });
+    }
+    return summaries;
+  }
+
+  private async findTurnstileWidget(page: Page): Promise<WidgetBox | undefined> {
+    const preferred = page.frames().filter((frame) => isCloudflareFrameUrl(frame.url()));
+    const ordered = [...preferred, ...page.frames().filter((frame) => !preferred.includes(frame))];
+    let fallback: WidgetBox | undefined;
+    for (const frame of ordered) {
+      const box = await this.frameBox(frame);
+      if (!box) continue;
+      // Interactive Turnstile widget is typically ~300x65; ignore full-page frames.
+      if (box.width >= 200 && box.width <= 420 && box.height >= 50 && box.height <= 120) {
+        return box;
+      }
+      if (isCloudflareFrameUrl(frame.url()) && box.width >= 120 && box.height >= 40) {
+        fallback ??= box;
+      }
+    }
+    return fallback;
+  }
+
+  async detectChallenge(): Promise<ChallengeDetection> {
+    const page = await this.page();
+    const title = await page.title().catch(() => "");
+    const url = page.url();
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    const frames = page.frames().map((frame) => ({ url: frame.url() }));
+    const classified = classifyChallenge({
+      title,
+      url,
+      bodyText,
+      frameUrls: frames.map((frame) => frame.url),
+    });
+    const widget = classified.present ? await this.findTurnstileWidget(page) : undefined;
+    return {
+      present: classified.present,
+      kind: classified.kind,
+      title,
+      url,
+      bodySnippet: snippet(bodyText),
+      ...(widget ? { widget } : {}),
+      frames,
+    };
+  }
+
+  async solveTurnstile(options: { timeoutMs?: number; maxClicks?: number } = {}): Promise<SolveTurnstileResult> {
+    const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 45_000, 3_000), 180_000);
+    const maxClicks = Math.min(Math.max(options.maxClicks ?? 12, 1), 30);
+    const started = Date.now();
+    const clicks: Array<{ x: number; y: number }> = [];
+    const page = await this.page();
+
+    const snapshot = async () => {
+      const title = await page.title().catch(() => "");
+      const url = page.url();
+      const bodyText = await page.locator("body").innerText().catch(() => "");
+      return { title, url, bodyText };
+    };
+
+    let initial = await this.detectChallenge();
+    if (!initial.present) {
+      const state = await snapshot();
+      return {
+        ok: true,
+        method: "already_clear",
+        attempts: 0,
+        elapsedMs: Date.now() - started,
+        title: state.title,
+        url: state.url,
+        bodySnippet: snippet(state.bodyText),
+        clicks,
+      };
+    }
+
+    // Wait for the widget frame to finish mounting.
+    let widget = initial.widget;
+    while (!widget && Date.now() - started < Math.min(15_000, timeoutMs)) {
+      await page.waitForTimeout(350);
+      widget = await this.findTurnstileWidget(page);
+      initial = await this.detectChallenge();
+      if (!initial.present) {
+        const state = await snapshot();
+        return {
+          ok: true,
+          method: "already_clear",
+          attempts: 0,
+          elapsedMs: Date.now() - started,
+          title: state.title,
+          url: state.url,
+          bodySnippet: snippet(state.bodyText),
+          clicks,
+        };
+      }
+    }
+
+    if (!widget) {
+      const state = await snapshot();
+      return {
+        ok: false,
+        method: "not_found",
+        attempts: 0,
+        elapsedMs: Date.now() - started,
+        title: state.title,
+        url: state.url,
+        bodySnippet: snippet(state.bodyText),
+        clicks,
+        error: "未找到 Cloudflare Turnstile / challenge 控件区域",
+      };
+    }
+
+    // Human-ish warm-up path near the widget.
+    for (const point of warmUpPath(widget)) {
+      if (Date.now() - started > timeoutMs) break;
+      await this.moveMouseTo(page, point.x, point.y, 8 + Math.floor(Math.random() * 6));
+      await page.waitForTimeout(60 + Math.floor(Math.random() * 120));
+    }
+
+    const candidates = checkboxClickCandidates(widget);
+    let attempts = 0;
+
+    while (Date.now() - started < timeoutMs && attempts < maxClicks) {
+      // Refresh widget box — layout can shift after partial verification.
+      widget = (await this.findTurnstileWidget(page)) ?? widget;
+      const queue = attempts === 0
+        ? candidates
+        : checkboxClickCandidates(widget);
+      const target = queue[attempts % queue.length] ?? {
+        x: widget.x + 40,
+        y: widget.y + widget.height / 2,
+      };
+      // Tiny jitter so repeated attempts are not pixel-identical.
+      const x = target.x + (Math.random() - 0.5) * 4;
+      const y = target.y + (Math.random() - 0.5) * 3;
+      attempts += 1;
+      clicks.push({ x, y });
+      await this.moveMouseTo(page, x, y, 16);
+      await page.waitForTimeout(100 + Math.floor(Math.random() * 180));
+      await page.mouse.down();
+      await page.waitForTimeout(50 + Math.floor(Math.random() * 80));
+      await page.mouse.up();
+
+      // Poll briefly after each click for clearance.
+      const deadline = Math.min(Date.now() + 5_000, started + timeoutMs);
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(400);
+        const state = await snapshot();
+        if (!looksCleared({ ...state, hadChallenge: true })) continue;
+        // Confirm the page stays clear briefly (avoid interim "Loading…" flashes).
+        await page.waitForTimeout(700);
+        const confirmed = await snapshot();
+        if (looksCleared({ ...confirmed, hadChallenge: true })) {
+          return {
+            ok: true,
+            method: "click",
+            attempts,
+            elapsedMs: Date.now() - started,
+            title: confirmed.title,
+            url: confirmed.url,
+            bodySnippet: snippet(confirmed.bodyText),
+            widget,
+            clicks,
+          };
+        }
+      }
+    }
+
+    const state = await snapshot();
+    const cleared = looksCleared({ ...state, hadChallenge: true });
+    return {
+      ok: cleared,
+      method: cleared ? "click" : "timeout",
+      attempts,
+      elapsedMs: Date.now() - started,
+      title: state.title,
+      url: state.url,
+      bodySnippet: snippet(state.bodyText),
+      widget,
+      clicks,
+      ...(cleared ? {} : { error: "在超时时间内未能通过 Cloudflare 验证" }),
+    };
   }
 
   async typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void> {
