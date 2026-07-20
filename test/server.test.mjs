@@ -41,7 +41,7 @@ function fakeBrowser() {
       tokenPresent: false,
       frames: [{ url: "https://example.com/" }],
     }),
-    solveTurnstile: async () => ({
+    clickChallenge: async () => ({
       ok: true,
       method: "already_clear",
       attempts: 0,
@@ -81,36 +81,31 @@ test("默认工具集不包含危险工具", async (context) => {
   assert.ok(names.includes("snapshot"));
   assert.ok(names.includes("list_pages"));
   assert.ok(names.includes("click_challenge"));
-    assert.ok(names.includes("solve_turnstile")); // alias
-    assert.ok(names.includes("mouse_click"));
-    assert.ok(names.includes("list_frames"));
-    assert.ok(names.includes("detect_challenge"));
-    assert.equal(names.includes("eval_js"), false);
-    assert.equal(names.includes("run_task"), false);
-  });
+  assert.equal(names.includes("solve_turnstile"), false);
+  assert.ok(names.includes("mouse_click"));
+  assert.ok(names.includes("list_frames"));
+  assert.ok(names.includes("detect_challenge"));
+  assert.equal(names.includes("eval_js"), false);
+  assert.equal(names.includes("run_task"), false);
+});
 
-  test("click_challenge 与 mouse_click 返回结构化结果", async (context) => {
-    const { client, server } = await connectedClient();
-    context.after(async () => {
-      await client.close();
-      await server.close();
-    });
-    const solved = await client.callTool({
-      name: "click_challenge",
-      arguments: { timeoutMs: 5000, maxClicks: 3 },
-    });
-    assert.match(solved.content[0].text, /already_clear/);
-    const alias = await client.callTool({
-      name: "solve_turnstile",
-      arguments: { timeoutMs: 5000, maxClicks: 3 },
-    });
-    assert.match(alias.content[0].text, /already_clear/);
-    const clicked = await client.callTool({
-      name: "mouse_click",
-      arguments: { x: 10, y: 20 },
-    });
-    assert.match(clicked.content[0].text, /"x": 10/);
+test("click_challenge 与 mouse_click 返回结构化结果", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
   });
+  const solved = await client.callTool({
+    name: "click_challenge",
+    arguments: { timeoutMs: 5000, maxClicks: 3 },
+  });
+  assert.match(solved.content[0].text, /already_clear/);
+  const clicked = await client.callTool({
+    name: "mouse_click",
+    arguments: { x: 10, y: 20 },
+  });
+  assert.match(clicked.content[0].text, /"x": 10/);
+});
 
 test("list_frames 支持 includeBox", async (context) => {
   const { client, server } = await connectedClient();

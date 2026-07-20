@@ -160,37 +160,17 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async () => text(await browser.detectChallenge()),
   );
 
-  const clickChallengeInput = {
-    timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
-    maxClicks: z.number().int().min(1).max(30).default(6),
-  };
-  const clickChallengeHandler = async ({
-    timeoutMs,
-    maxClicks,
-  }: {
-    timeoutMs: number;
-    maxClicks: number;
-  }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks }));
-
   server.registerTool(
     "click_challenge",
     {
       description:
         "对跨域 challenge frame 内的标准 checkbox 控件做拟人坐标点击，并轮询直到确认清除（response token / widget 成功态 / 离开 interstitial）。不依赖视觉模型。结果以 JSON 的 ok 字段为准。",
-      inputSchema: clickChallengeInput,
+      inputSchema: {
+        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+        maxClicks: z.number().int().min(1).max(30).default(6),
+      },
     },
-    clickChallengeHandler,
-  );
-
-  // Backward-compatible alias (same handler). Prefer click_challenge in new integrations.
-  server.registerTool(
-    "solve_turnstile",
-    {
-      description:
-        "click_challenge 的别名（兼容旧名）。对跨域 challenge checkbox 做坐标点击并确认清除。新接入请优先用 click_challenge。",
-      inputSchema: clickChallengeInput,
-    },
-    clickChallengeHandler,
+    async ({ timeoutMs, maxClicks }) => text(await browser.clickChallenge({ timeoutMs, maxClicks })),
   );
 
   server.registerTool(
