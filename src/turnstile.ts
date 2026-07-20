@@ -133,12 +133,26 @@ export function warmUpPath(box: {
   width: number;
   height: number;
 }): Array<{ x: number; y: number }> {
+  // Approach the checkbox from outside — do NOT end on the widget center
+  // (that reduced hit-rate in A/B tests vs a 3-point exterior path).
   return [
     { x: Math.max(8, box.x - 120), y: Math.max(8, box.y - 80) },
     { x: box.x + box.width * 0.7, y: box.y + box.height + 40 },
-    { x: box.x + 10, y: box.y - 20 },
-    { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+    { x: box.x + 10, y: Math.max(8, box.y - 20) },
   ];
+}
+
+/** Natural starting cursor position before the warm-up path (never 0,0). */
+export function initialCursorPos(viewport?: { width: number; height: number } | null): {
+  x: number;
+  y: number;
+} {
+  const w = viewport?.width ?? 1920;
+  const h = viewport?.height ?? 1080;
+  return {
+    x: Math.round(w * (0.15 + Math.random() * 0.2)),
+    y: Math.round(h * (0.2 + Math.random() * 0.25)),
+  };
 }
 
 export function isVerifyingPhase(input: {
