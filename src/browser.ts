@@ -123,18 +123,18 @@ export function assertNavigationUrl(rawUrl: string, allowedHosts: string[]): URL
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new Error("Invalid URL; it must include http:// or https://");
+    throw new Error("Invalid URL; include http:// or https://");
   }
   if (!["http:", "https:"].includes(url.protocol)) {
-    throw new Error("Only HTTP or HTTPS URLs may be navigated to");
+    throw new Error("Navigation supports only HTTP or HTTPS URLs");
   }
   if (url.username || url.password) {
-    throw new Error("Navigation URLs may not contain a username or password");
+    throw new Error("Navigation URLs cannot include a username or password");
   }
   if (allowedHosts.length > 0) {
     const host = url.hostname.toLowerCase();
     const allowed = allowedHosts.some((candidate) => host === candidate || host.endsWith(`.${candidate}`));
-    if (!allowed) throw new Error(`Target host ${host} is not in the --allowed-host allowlist`);
+    if (!allowed) throw new Error(`Target host ${host} is not permitted by --allowed-host`);
   }
   return url;
 }
@@ -178,10 +178,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     const nativeAgentArgs = this.nativeAgentArgs();
     if (this.config.chromePath) {
       if (!existsSync(this.config.chromePath)) {
-        throw new Error(`ChromiumFish executable not found: ${this.config.chromePath}`);
+        throw new Error(`ChromiumFish executable does not exist: ${this.config.chromePath}`);
       }
       if (this.config.timezone === "auto") {
-        throw new Error("--chrome-path does not support --timezone auto yet; pass an explicit IANA time zone");
+        throw new Error("--chrome-path does not support --timezone auto; specify an IANA time zone");
       }
       const env = this.config.timezone
         ? { ...(process.env as Record<string, string>), TZ: this.config.timezone }
@@ -363,7 +363,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       lines.push(`[${ref}] ${info.role} "${info.label}"${suffix ? ` ${suffix}` : ""}`);
     }
     this.refs.set(page, refs);
-    return lines.length > 0 ? lines.join("\n") : "(no visible interactive elements)";
+    return lines.length > 0 ? lines.join("\n") : "(No visible interactive elements)";
   }
 
   async getText(): Promise<string> {
@@ -405,7 +405,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async moveTo(page: Page, handle: InteractiveHandle): Promise<void> {
     await handle.scrollIntoViewIfNeeded();
     const box = await handle.boundingBox();
-    if (!box) throw new Error("Target is not clickable right now");
+    if (!box) throw new Error("Target is not currently clickable");
     const destination = {
       x: box.x + box.width * (0.35 + Math.random() * 0.3),
       y: box.y + box.height * (0.35 + Math.random() * 0.3),
@@ -477,7 +477,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (!includeBox) {
       return frames.map((frame) => ({ url: frame.url(), name: frame.name() }));
     }
-    // Bounding boxes only — do not scroll frames during listing (avoids layout thrash).
+    // Bounding boxes only; do not scroll frames during listing (avoids layout thrash).
     const boxes = await Promise.all(frames.map(async (frame) => ({
       frame,
       box: await this.frameBox(frame, { scroll: false }),
@@ -733,7 +733,7 @@ export class ChromiumFishBrowser implements BrowserApi {
           sawVerifying = true;
           continue;
         }
-        // Not verifying and not cleared → another click may help.
+        // Not verifying and not cleared; another click may help.
         if (sawVerifying) return "ready_for_click";
         // Never entered verifying in this wait window.
         if (Date.now() >= deadline) break;
@@ -799,13 +799,13 @@ export class ChromiumFishBrowser implements BrowserApi {
         attempts: 0,
         clicks,
         reason: "not_found",
-        error: "Cross-origin challenge widget area not found",
+        error: "Cross-origin challenge control area not found",
       });
     }
 
     widget = await this.ensureWidgetInViewport(page, widget);
 
-    // Seed cursor away from (0,0) — A/B tests showed origin starts reduce hit-rate.
+    // Seed the cursor away from (0,0); A/B tests showed origin starts reduce hit rate.
     const seed = initialCursorPos(page.viewportSize());
     await page.mouse.move(seed.x, seed.y);
     this.mousePositions.set(page, seed);
@@ -825,7 +825,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     let attempts = 0;
 
     while (Date.now() - started < timeoutMs && attempts < maxClicks) {
-      // If already verifying, do NOT click — only wait.
+      // If already verifying, do NOT click; only wait.
       observed = await this.observeChallenge(page);
       let bodyText = await page.locator("body").innerText().catch(() => "");
       if (isVerifyingPhase({
@@ -856,7 +856,7 @@ export class ChromiumFishBrowser implements BrowserApi {
               clicks,
               widget,
               reason: "stuck_verifying",
-              error: "Page stayed in the Verifying state too long; stopped clicking",
+              error: "The page remained in the Verifying state too long; stopped clicking",
             });
           }
         }
@@ -884,7 +884,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       await page.mouse.up();
 
       // After each click: long no-click wait (verifying-aware).
-      // First click gets a longer window — successful manual path clears in ~1–3s.
+      // The first click gets a longer window; successful manual paths clear in about 1-3s.
       const waitBudget = attempts === 1 ? 18_000 : 12_000;
       const waitResult = await waitWithoutClicking(kind, waitBudget);
       if (waitResult === "cleared") {
@@ -909,7 +909,7 @@ export class ChromiumFishBrowser implements BrowserApi {
             clicks,
             widget,
             reason: "stuck_verifying",
-            error: "Page stayed in the Verifying state too long after the click; stopped clicking",
+            error: "The page remained in the Verifying state too long after a click; stopped clicking",
           });
         }
       }
@@ -944,8 +944,8 @@ export class ChromiumFishBrowser implements BrowserApi {
       tokenPresent: observed.tokenPresent,
       reason: stuck ? "stuck_verifying" : "timeout",
       error: stuck
-        ? "Page stayed in the Verifying state too long; stopped clicking"
-        : "Could not confirm the challenge cleared within the timeout",
+        ? "The page remained in the Verifying state too long; stopped clicking"
+        : "Could not confirm challenge clearance before the timeout",
     });
   }
 
@@ -1010,12 +1010,12 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async targetId(page: Page, session: CDPSession): Promise<string> {
     const result = await session.send("Target.getTargetInfo") as { targetInfo?: { targetId?: string } };
     const targetId = result.targetInfo?.targetId;
-    if (!targetId) throw new Error("Cannot determine the CDP targetId of the current page");
+    if (!targetId) throw new Error("Unable to determine the current page's CDP targetId");
     return targetId;
   }
 
   async runTask(task: string, rawUrl: string | undefined, maxSteps: number): Promise<NativeTaskResult> {
-    if (!this.config.allowNativeAgent) throw new Error("The native agent tool is not enabled");
+    if (!this.config.allowNativeAgent) throw new Error("Native agent tool is not enabled");
     if (rawUrl) await this.navigate(rawUrl);
     const page = await this.page();
     const session = await page.context().newCDPSession(page);

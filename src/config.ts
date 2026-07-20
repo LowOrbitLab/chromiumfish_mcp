@@ -33,12 +33,12 @@ function readValue(argv: string[], index: number, flag: string): string {
 export function parseWindowSize(value: string): [number, number] {
   const match = /^(\d+)x(\d+)$/i.exec(value);
   if (!match) {
-    throw new Error("--window-size format must be WIDTHxHEIGHT, for example 1920x1080");
+    throw new Error("--window-size must use WIDTHxHEIGHT format, for example 1920x1080");
   }
   const width = Number(match[1]);
   const height = Number(match[2]);
   if (width < 320 || height < 240 || width > 16384 || height > 16384) {
-    throw new Error("Window size out of allowed range: 320x240 to 16384x16384");
+    throw new Error("Window size must be between 320x240 and 16384x16384");
   }
   return [width, height];
 }
@@ -144,18 +144,18 @@ Usage:
   chromiumfish_mcp [options]
 
 Options:
-  --persona-seed VALUE       Pin the browser fingerprint persona
+  --persona-seed VALUE       Use a stable browser fingerprint persona
   --chrome-path PATH         Use a local ChromiumFish executable
-  --browser-version VERSION  Upstream browser build version
-  --headed                  Show the browser window; headless by default
-  --window-size WIDTHxHEIGHT Window size, default 1920x1080
-  --timezone ZONE           IANA time zone or auto
-  --proxy URL               Browser proxy
-  --allowed-host HOST       Host allowed for navigation; repeatable
-  --max-text-chars N        Maximum characters of page text, default 50000
-  --allow-eval              Enable the arbitrary JavaScript tool
-  --allow-native-agent      Enable the built-in browser agent tool
-  --help                    Show help
-  --version                 Show version
+  --browser-version VERSION  Select an upstream browser build
+  --headed                   Show the browser window (default: headless)
+  --window-size WIDTHxHEIGHT Set the window size (default: 1920x1080)
+  --timezone ZONE            Use an IANA time zone or auto
+  --proxy URL                Route browser traffic through a proxy
+  --allowed-host HOST        Allow navigation to a host; repeatable
+  --max-text-chars N         Limit page text output (default: 50000)
+  --allow-eval               Enable the arbitrary JavaScript execution tool
+  --allow-native-agent       Enable the native browser agent tool
+  --help                     Show help
+  --version                  Show version
 
-The native agent reads its configuration only from OPENAI_API_KEY, OPENAI_API_BASE, and OPENAI_API_MODEL.`;
+The native agent reads configuration only from OPENAI_API_KEY, OPENAI_API_BASE, and OPENAI_API_MODEL.`;
