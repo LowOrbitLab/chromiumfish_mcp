@@ -88,9 +88,9 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 - `get_text`, `screenshot`: retrieve page content.
 - `click`, `type_text`, `press_key`, `scroll`, `wait_for`: interact with the page.
 - `mouse_click`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
-- `list_frames`: list frames/iframes with URLs and bounding boxes when available.
+- `list_frames`: list frames/iframes with URLs; bounding boxes included by default (`includeBox: false` for a faster URL-only listing).
 - `detect_challenge`: detect common interstitial / framed-challenge page states for text-only agents (`present`, `kind`, `widgetState`, `tokenPresent`, `widget`).
-- `solve_turnstile`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / frame success / interstitial exit).
+- `solve_turnstile`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
 - `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 

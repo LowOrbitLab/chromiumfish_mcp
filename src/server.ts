@@ -142,10 +142,12 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "list_frames",
     {
       description:
-        "Lists the frames/iframes of the current page with their URL and, when available, their bounding box on the page, to help locate cross-origin embedded widgets.",
-      inputSchema: {},
+        "Lists the frames/iframes of the current page with their URL; includes the bounding box by default. includeBox=false returns only URL/name (faster).",
+      inputSchema: {
+        includeBox: z.boolean().default(true),
+      },
     },
-    async () => text(await browser.listFrames()),
+    async ({ includeBox }) => text(await browser.listFrames({ includeBox })),
   );
 
   server.registerTool(
