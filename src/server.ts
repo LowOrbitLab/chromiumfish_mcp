@@ -151,13 +151,13 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "detect_challenge",
+    "find_challenge",
     {
       description:
-        "检测当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 present、kind、widgetState、tokenPresent、widget 坐标框与相关 frame。",
+        "查找当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 present、kind、widgetState、tokenPresent、widget 坐标框与相关 frame。",
       inputSchema: {},
     },
-    async () => text(await browser.detectChallenge()),
+    async () => text(await browser.findChallenge()),
   );
 
   server.registerTool(

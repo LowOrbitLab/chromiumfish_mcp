@@ -31,7 +31,7 @@ function fakeBrowser() {
       if (options?.includeBox === false) return [{ url: "https://example.com/", name: "" }];
       return [{ url: "https://example.com/", name: "", box: { x: 0, y: 0, width: 100, height: 100 } }];
     },
-    detectChallenge: async () => ({
+    findChallenge: async () => ({
       present: false,
       kind: "none",
       widgetState: "absent",
@@ -84,7 +84,7 @@ test("默认工具集不包含危险工具", async (context) => {
   assert.equal(names.includes("solve_turnstile"), false);
   assert.ok(names.includes("mouse_click"));
   assert.ok(names.includes("list_frames"));
-  assert.ok(names.includes("detect_challenge"));
+  assert.ok(names.includes("find_challenge"));
   assert.equal(names.includes("eval_js"), false);
   assert.equal(names.includes("run_task"), false);
 });

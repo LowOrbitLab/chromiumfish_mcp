@@ -80,7 +80,7 @@ export interface BrowserApi {
   click(target: string): Promise<void>;
   mouseClick(x: number, y: number): Promise<MouseClickResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
-  detectChallenge(): Promise<ChallengeDetection>;
+  findChallenge(): Promise<ChallengeDetection>;
   clickChallenge(options?: { timeoutMs?: number; maxClicks?: number }): Promise<ClickChallengeResult>;
   typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void>;
   pressKey(key: string): Promise<void>;
@@ -624,7 +624,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
   }
 
-  async detectChallenge(): Promise<ChallengeDetection> {
+  async findChallenge(): Promise<ChallengeDetection> {
     const page = await this.page();
     return (await this.observeChallenge(page)).detection;
   }
