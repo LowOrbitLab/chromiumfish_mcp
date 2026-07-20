@@ -54,6 +54,8 @@ export interface NativeTaskResult {
 }
 
 export interface FrameSummary {
+  frameId: string;
+  parentFrameId?: string;
   url: string;
   name: string;
   box?: { x: number; y: number; width: number; height: number };
@@ -66,6 +68,22 @@ export interface MouseClickResult {
   url: string;
 }
 
+export type ElementState = "attached" | "detached" | "visible" | "hidden";
+export type LoadState = "load" | "domcontentloaded" | "networkidle";
+export type SelectOptionMatch = "value" | "label";
+
+export interface WaitForOptions {
+  target?: string;
+  state?: ElementState;
+  text?: string;
+  textState?: "visible" | "hidden";
+  url?: string;
+  loadState?: LoadState;
+  timeMs?: number;
+  frameId?: string;
+  timeoutMs: number;
+}
+
 export interface BrowserApi {
   status(): Promise<BrowserStatus>;
   listPages(): Promise<PageSummary[]>;
@@ -74,18 +92,28 @@ export interface BrowserApi {
   closePage(pageId?: string): Promise<void>;
   navigate(url: string): Promise<NavigationResult>;
   goBack(): Promise<NavigationResult>;
-  snapshot(): Promise<string>;
-  getText(): Promise<string>;
+  goForward(): Promise<NavigationResult>;
+  reload(): Promise<NavigationResult>;
+  snapshot(frameId?: string): Promise<string>;
+  getText(frameId?: string): Promise<string>;
   screenshot(fullPage: boolean): Promise<Buffer>;
-  click(target: string): Promise<void>;
+  click(target: string, frameId?: string): Promise<void>;
+  hover(target: string, frameId?: string): Promise<void>;
+  selectOption(
+    target: string,
+    values: string[],
+    matchBy: SelectOptionMatch,
+    frameId?: string,
+  ): Promise<string[]>;
+  setChecked(target: string, checked: boolean, frameId?: string): Promise<boolean>;
   mouseClick(x: number, y: number): Promise<MouseClickResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   findChallenge(): Promise<ChallengeDetection>;
   clickChallenge(options?: { timeoutMs?: number; maxClicks?: number }): Promise<ClickChallengeResult>;
-  typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void>;
+  typeText(target: string, text: string, clear: boolean, submit: boolean, frameId?: string): Promise<void>;
   pressKey(key: string): Promise<void>;
   scroll(deltaX: number, deltaY: number): Promise<void>;
-  waitFor(target: string, state: "attached" | "detached" | "visible" | "hidden", timeoutMs: number): Promise<void>;
+  waitFor(options: WaitForOptions): Promise<void>;
   evalJs(expression: string): Promise<unknown>;
   runTask(task: string, url: string | undefined, maxSteps: number): Promise<NativeTaskResult>;
   close(): Promise<void>;
@@ -145,6 +173,8 @@ export class ChromiumFishBrowser implements BrowserApi {
   private currentPage?: Page;
   private readonly pageIds = new WeakMap<Page, string>();
   private nextPageId = 1;
+  private readonly frameIds = new WeakMap<Frame, string>();
+  private nextFrameId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
   /** Prevent concurrent click_challenge runs from fighting over the same mouse. */
@@ -235,6 +265,27 @@ export class ChromiumFishBrowser implements BrowserApi {
     return id;
   }
 
+  private frameId(frame: Frame): string {
+    const existing = this.frameIds.get(frame);
+    if (existing) return existing;
+    const id = `frame-${this.nextFrameId++}`;
+    this.frameIds.set(frame, id);
+    return id;
+  }
+
+  private resolveFrame(page: Page, frameId?: string): Frame {
+    const frame = frameId
+      ? page.frames().find((candidate) => this.frameId(candidate) === frameId)
+      : page.mainFrame();
+    if (!frame) throw new Error(`Frame ${frameId} not found in the current page`);
+    if (frameId && isCloudflareFrameUrl(frame.url())) {
+      throw new Error(
+        `DOM access to challenge frame ${frameId} is disabled; use find_challenge and click_challenge`,
+      );
+    }
+    return frame;
+  }
+
   private async pageSummary(page: Page): Promise<PageSummary> {
     let title = "";
     try {
@@ -315,6 +366,20 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { title: await page.title(), url: page.url() };
   }
 
+  async goForward(): Promise<NavigationResult> {
+    const page = await this.page();
+    await this.clearRefs(page);
+    await page.goForward({ waitUntil: "domcontentloaded" });
+    return { title: await page.title(), url: page.url() };
+  }
+
+  async reload(): Promise<NavigationResult> {
+    const page = await this.page();
+    await this.clearRefs(page);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    return { title: await page.title(), url: page.url() };
+  }
+
   private async clearRefs(page: Page): Promise<void> {
     const refs = this.refs.get(page);
     this.refs.delete(page);
@@ -322,10 +387,11 @@ export class ChromiumFishBrowser implements BrowserApi {
     await Promise.all([...refs.values()].map((handle) => handle.dispose().catch(() => undefined)));
   }
 
-  async snapshot(): Promise<string> {
+  async snapshot(frameId?: string): Promise<string> {
     const page = await this.page();
     await this.clearRefs(page);
-    const handles = await page.locator(INTERACTIVE_SELECTOR).elementHandles();
+    const frame = this.resolveFrame(page, frameId);
+    const handles = await frame.locator(INTERACTIVE_SELECTOR).elementHandles();
     const refs = new Map<string, InteractiveHandle>();
     const lines: string[] = [];
 
@@ -336,19 +402,56 @@ export class ChromiumFishBrowser implements BrowserApi {
       }
       const info = await handle.evaluate((element) => {
         const html = element as HTMLElement;
-        const input = element as HTMLInputElement;
+        const input = element instanceof HTMLInputElement ? element : undefined;
+        const textarea = element instanceof HTMLTextAreaElement ? element : undefined;
+        const select = element instanceof HTMLSelectElement ? element : undefined;
+        const labels = input?.labels ?? textarea?.labels ?? select?.labels;
+        const type = input?.type.toLowerCase() ?? "";
         const label = html.getAttribute("aria-label")
-          || input.labels?.[0]?.textContent
-          || input.value
-          || input.placeholder
+          || labels?.[0]?.textContent
+          || (["button", "submit", "reset"].includes(type) ? input?.value : "")
+          || input?.placeholder
+          || textarea?.placeholder
           || html.innerText
           || html.getAttribute("title")
           || "";
+        const ariaChecked = html.getAttribute("aria-checked");
+        const ariaExpanded = html.getAttribute("aria-expanded");
+        const checked = input && ["checkbox", "radio"].includes(type)
+          ? input.checked
+          : ariaChecked === "true"
+            ? true
+            : ariaChecked === "false"
+              ? false
+              : null;
+        const value = input && !["password", "checkbox", "radio", "file", "button", "submit", "reset"].includes(type)
+          ? input.value
+          : textarea
+            ? textarea.value
+            : null;
         return {
           role: html.getAttribute("role") || html.tagName.toLowerCase(),
           label: label.trim().replace(/\s+/g, " ").slice(0, 120),
           href: element instanceof HTMLAnchorElement ? element.href : "",
           disabled: "disabled" in html && Boolean((html as HTMLButtonElement).disabled),
+          type,
+          value: value?.slice(0, 120) ?? null,
+          passwordSet: type === "password" && Boolean(input?.value),
+          checked,
+          selected: select
+            ? Array.from(select.selectedOptions).map((option) => option.value).slice(0, 20)
+            : [],
+          options: select
+            ? Array.from(select.options).slice(0, 20).map((option) => ({
+              value: option.value,
+              label: option.label.trim().replace(/\s+/g, " ").slice(0, 80),
+            }))
+            : [],
+          expanded: ariaExpanded === "true"
+            ? true
+            : ariaExpanded === "false"
+              ? false
+              : null,
         };
       }).catch(() => null);
       if (!info) {
@@ -357,7 +460,17 @@ export class ChromiumFishBrowser implements BrowserApi {
       }
       const ref = `e${refs.size + 1}`;
       refs.set(ref, handle);
-      const suffix = [info.disabled ? "disabled" : "", info.href ? `-> ${info.href}` : ""]
+      const suffix = [
+        info.type ? `type=${info.type}` : "",
+        info.disabled ? "disabled" : "",
+        info.checked === true ? "checked" : info.checked === false ? "unchecked" : "",
+        info.expanded === true ? "expanded" : info.expanded === false ? "collapsed" : "",
+        info.value !== null ? `value=${JSON.stringify(info.value)}` : "",
+        info.passwordSet ? "value=<redacted>" : "",
+        info.selected.length > 0 ? `selected=${JSON.stringify(info.selected)}` : "",
+        info.options.length > 0 ? `options=${JSON.stringify(info.options)}` : "",
+        info.href ? `-> ${info.href}` : "",
+      ]
         .filter(Boolean)
         .join(" ");
       lines.push(`[${ref}] ${info.role} "${info.label}"${suffix ? ` ${suffix}` : ""}`);
@@ -366,8 +479,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     return lines.length > 0 ? lines.join("\n") : "(No visible interactive elements)";
   }
 
-  async getText(): Promise<string> {
-    const text = await (await this.page()).locator("body").innerText().catch(() => "");
+  async getText(frameId?: string): Promise<string> {
+    const page = await this.page();
+    const frame = this.resolveFrame(page, frameId);
+    const text = await frame.locator("body").innerText().catch(() => "");
     return clip(text, this.config.maxTextChars);
   }
 
@@ -375,9 +490,20 @@ export class ChromiumFishBrowser implements BrowserApi {
     return (await this.page()).screenshot({ type: "png", fullPage });
   }
 
-  private async resolveTarget(page: Page, target: string): Promise<InteractiveHandle> {
+  private async resolveTarget(page: Page, target: string, frameId?: string): Promise<InteractiveHandle> {
     const ref = this.refs.get(page)?.get(target);
-    const handle = ref ?? await page.locator(target).first().elementHandle();
+    if (ref && frameId) {
+      const requestedFrame = this.resolveFrame(page, frameId);
+      const ownerFrame = await ref.ownerFrame();
+      if (ownerFrame !== requestedFrame) {
+        throw new Error(`Target ${target} does not belong to frame ${frameId}`);
+      }
+    }
+    if (!ref && /^e\d+$/.test(target)) {
+      throw new Error(`Unknown element reference ${target}; call snapshot again`);
+    }
+    const frame = ref ? undefined : this.resolveFrame(page, frameId);
+    const handle = ref ?? await frame!.locator(target).first().elementHandle();
     if (!handle) throw new Error(`Target ${target} not found; call snapshot again after the page changes`);
     const connected = await handle.evaluate((element) => element.isConnected).catch(() => false);
     if (!connected) throw new Error(`Target ${target} is stale; call snapshot again`);
@@ -413,13 +539,49 @@ export class ChromiumFishBrowser implements BrowserApi {
     await this.moveMouse(page, destination.x, destination.y, 12);
   }
 
-  async click(target: string): Promise<void> {
-    const page = await this.page();
-    const handle = await this.resolveTarget(page, target);
+  private async clickHandle(page: Page, handle: InteractiveHandle): Promise<void> {
     await this.moveTo(page, handle);
     await page.mouse.down();
     await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
     await page.mouse.up();
+  }
+
+  async click(target: string, frameId?: string): Promise<void> {
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target, frameId);
+    await this.clickHandle(page, handle);
+  }
+
+  async hover(target: string, frameId?: string): Promise<void> {
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target, frameId);
+    await this.moveTo(page, handle);
+  }
+
+  async selectOption(
+    target: string,
+    values: string[],
+    matchBy: SelectOptionMatch,
+    frameId?: string,
+  ): Promise<string[]> {
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target, frameId);
+    const options = values.map((value) => matchBy === "label" ? { label: value } : { value });
+    return handle.selectOption(options);
+  }
+
+  async setChecked(target: string, checked: boolean, frameId?: string): Promise<boolean> {
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target, frameId);
+    let actual = await handle.isChecked();
+    if (actual !== checked) {
+      await this.clickHandle(page, handle);
+      actual = await handle.isChecked();
+    }
+    if (actual !== checked) {
+      throw new Error(`Target ${target} did not reach the requested checked state`);
+    }
+    return actual;
   }
 
   async mouseClick(x: number, y: number): Promise<MouseClickResult> {
@@ -474,8 +636,17 @@ export class ChromiumFishBrowser implements BrowserApi {
     const includeBox = options.includeBox !== false;
     const page = await this.page();
     const frames = page.frames();
+    const summary = (frame: Frame): Omit<FrameSummary, "box"> => {
+      const parent = frame.parentFrame();
+      return {
+        frameId: this.frameId(frame),
+        ...(parent ? { parentFrameId: this.frameId(parent) } : {}),
+        url: frame.url(),
+        name: frame.name(),
+      };
+    };
     if (!includeBox) {
-      return frames.map((frame) => ({ url: frame.url(), name: frame.name() }));
+      return frames.map(summary);
     }
     // Bounding boxes only; do not scroll frames during listing (avoids layout thrash).
     const boxes = await Promise.all(frames.map(async (frame) => ({
@@ -483,8 +654,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       box: await this.frameBox(frame, { scroll: false }),
     })));
     return boxes.map(({ frame, box }) => ({
-      url: frame.url(),
-      name: frame.name(),
+      ...summary(frame),
       ...(box ? { box: { x: box.x, y: box.y, width: box.width, height: box.height } } : {}),
     }));
   }
@@ -949,9 +1119,15 @@ export class ChromiumFishBrowser implements BrowserApi {
     });
   }
 
-  async typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void> {
+  async typeText(
+    target: string,
+    text: string,
+    clear: boolean,
+    submit: boolean,
+    frameId?: string,
+  ): Promise<void> {
     const page = await this.page();
-    const handle = await this.resolveTarget(page, target);
+    const handle = await this.resolveTarget(page, target, frameId);
     await this.moveTo(page, handle);
     await page.mouse.click(
       this.mousePositions.get(page)?.x ?? 0,
@@ -973,16 +1149,43 @@ export class ChromiumFishBrowser implements BrowserApi {
     await (await this.page()).mouse.wheel(deltaX, deltaY);
   }
 
-  async waitFor(
-    target: string,
-    state: "attached" | "detached" | "visible" | "hidden",
-    timeoutMs: number,
-  ): Promise<void> {
+  async waitFor(options: WaitForOptions): Promise<void> {
     const page = await this.page();
-    if (/^e\d+$/.test(target)) {
-      const handle = this.refs.get(page)?.get(target);
-      if (!handle) throw new Error(`Unknown element reference ${target}; call snapshot again`);
-      await page.waitForFunction(
+    const conditionCount = [
+      options.target !== undefined,
+      options.text !== undefined,
+      options.url !== undefined,
+      options.loadState !== undefined,
+      options.timeMs !== undefined,
+    ].filter(Boolean).length;
+    if (conditionCount !== 1) {
+      throw new Error("wait_for requires exactly one of target, text, url, loadState, or timeMs");
+    }
+    if (options.state && options.target === undefined) {
+      throw new Error("wait_for state requires target");
+    }
+    if (options.textState && options.text === undefined) {
+      throw new Error("wait_for textState requires text");
+    }
+    if (options.frameId && options.target === undefined && options.text === undefined) {
+      throw new Error("wait_for frameId is valid only with target or text");
+    }
+
+    if (options.target !== undefined) {
+      const state = options.state ?? "visible";
+      if (!/^e\d+$/.test(options.target)) {
+        const frame = this.resolveFrame(page, options.frameId);
+        await frame.locator(options.target).first().waitFor({ state, timeout: options.timeoutMs });
+        return;
+      }
+      const handle = this.refs.get(page)?.get(options.target);
+      if (!handle) throw new Error(`Unknown element reference ${options.target}; call snapshot again`);
+      const ownerFrame = await handle.ownerFrame();
+      if (!ownerFrame) throw new Error(`Target ${options.target} is no longer attached to a frame`);
+      if (options.frameId && ownerFrame !== this.resolveFrame(page, options.frameId)) {
+        throw new Error(`Target ${options.target} does not belong to frame ${options.frameId}`);
+      }
+      await ownerFrame.waitForFunction(
         ({ element, desired }) => {
           const connected = element.isConnected;
           const rect = element.getBoundingClientRect();
@@ -993,11 +1196,34 @@ export class ChromiumFishBrowser implements BrowserApi {
           return !visible;
         },
         { element: handle, desired: state },
-        { timeout: timeoutMs },
+        { timeout: options.timeoutMs },
       );
       return;
     }
-    await page.locator(target).first().waitFor({ state, timeout: timeoutMs });
+
+    if (options.text !== undefined) {
+      const frame = this.resolveFrame(page, options.frameId);
+      await frame.getByText(options.text, { exact: false }).first().waitFor({
+        state: options.textState ?? "visible",
+        timeout: options.timeoutMs,
+      });
+      return;
+    }
+
+    if (options.url !== undefined) {
+      await page.waitForURL(options.url, {
+        timeout: options.timeoutMs,
+        waitUntil: "domcontentloaded",
+      });
+      return;
+    }
+
+    if (options.loadState !== undefined) {
+      await page.waitForLoadState(options.loadState, { timeout: options.timeoutMs });
+      return;
+    }
+
+    await page.waitForTimeout(options.timeMs!);
   }
 
   async evalJs(expression: string): Promise<unknown> {

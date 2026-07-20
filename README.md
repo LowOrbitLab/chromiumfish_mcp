@@ -83,20 +83,28 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 
 - `browser_status`: report lazy startup state, page count, and the current page.
 - `list_pages`, `new_page`, `select_page`, `close_page`: manage browser pages.
-- `navigate`, `go_back`: navigate and use page history.
-- `snapshot`: list visible interactive elements and create temporary references.
-- `get_text`, `screenshot`: retrieve page content.
-- `click`, `type_text`, `press_key`, `scroll`, `wait_for`: interact with the page.
+- `navigate`, `go_back`, `go_forward`, `reload`: navigate and use page history.
+- `snapshot`: list visible interactive elements, form state, and temporary references in the main document or a frame.
+- `get_text`, `screenshot`: retrieve page or frame content.
+- `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for`: interact with the page.
 - `mouse_click`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
-- `list_frames`: list frames/iframes with URLs; bounding boxes included by default (`includeBox: false` for a faster URL-only listing).
+- `list_frames`: list frames/iframes with stable IDs, parent relationships, URLs, and optional bounding boxes.
 - `find_challenge`: detect common interstitial / framed-challenge page states for text-only agents (`present`, `kind`, `widgetState`, `tokenPresent`, `widget`).
 - `click_challenge`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
 - `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
-### Cross-origin framed widgets
+### Frames and form controls
 
-Some embedded controls live in cross-origin iframes and never appear in `snapshot`. For those cases:
+`list_frames` returns a stable `frameId` for each frame in the current page. Pass that ID to `snapshot` or `get_text` to inspect the frame. Element references created by a frame snapshot work with `click`, `hover`, `type_text`, `select_option`, `set_checked`, and `wait_for`; when using a CSS selector instead of a reference, pass the same `frameId` to the action. Refresh `list_frames` after navigation because detached child frames receive new IDs.
+
+`snapshot` reports relevant state such as input type and value, checked/unchecked, selected values, up to 20 dropdown options, expanded/collapsed, and disabled. Password values are never returned. Use `select_option` with `matchBy: "value"` or `matchBy: "label"`, and use `set_checked` instead of toggling a checkbox blindly.
+
+`wait_for` accepts exactly one condition per call: `target`, `text`, `url`, `loadState`, or `timeMs`. Element state defaults to `visible`; text can wait for `visible` or `hidden`; URL values support Playwright glob patterns such as `**/dashboard`.
+
+### Cross-origin challenge widgets
+
+Ordinary frames can be inspected by `frameId`, including cross-origin application frames. DOM access to known Cloudflare challenge frames is intentionally blocked because probing them can reduce clearance rates. For those cases:
 
 1. `navigate` to the target URL
 2. `find_challenge` -- inspect `present`, `kind`, and `widget`
@@ -110,12 +118,14 @@ Do **not** read challenge-frame document text or probe `cf-turnstile-response` /
 A `snapshot` call returns output similar to this:
 
 ```text
-[e1] input "Search"
+[e1] input "Search" type=text value=""
 [e2] button "Submit"
-[e3] link "Documentation" -> https://example.com/docs
+[e3] input "Remember me" type=checkbox unchecked
+[e4] select "Region" selected=["us"]
+[e5] link "Documentation" -> https://example.com/docs
 ```
 
-Pass `e1` to `type_text` or `e2` to `click`. Element references belong to the latest snapshot of the current page. Request a new snapshot after the page changes.
+Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. Element references belong to the latest snapshot of the current page and selected frame. Request a new snapshot after the page changes.
 
 ## Command-Line Options
 
