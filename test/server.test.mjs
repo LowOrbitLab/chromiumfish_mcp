@@ -270,6 +270,25 @@ test("wait_for rejects legacy flat conditions at the MCP boundary", async (conte
   assert.equal(result.isError, true);
 });
 
+test("wait_for accepts a JSON-string condition from clients that stringify objects", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const result = await client.callTool({
+    name: "wait_for",
+    arguments: {
+      condition: JSON.stringify({ kind: "text", text: "Ready", state: "visible" }),
+      timeoutMs: 5000,
+    },
+  });
+  assert.notEqual(result.isError, true);
+  const call = browser.calls.find((entry) => entry[0] === "waitFor");
+  assert.equal(call[1].condition.kind, "text");
+  assert.equal(call[1].condition.text, "Ready");
+});
+
 test("registers dangerous tools when explicitly enabled", async (context) => {
   const { client, server } = await connectedClient({ allowEval: true, allowNativeAgent: true });
   context.after(async () => {
