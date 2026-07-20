@@ -1,49 +1,49 @@
 # chromiumfish_mcp
 
-`chromiumfish_mcp` is an independent Model Context Protocol (MCP) server for [ChromiumFish](https://github.com/arman-bd/chromiumfish). It lets Claude Code, Claude Desktop, Cursor, and other MCP clients control the ChromiumFish browser through structured tools.
+`chromiumfish_mcp` is an independent Model Context Protocol (MCP) server for [ChromiumFish](https://github.com/arman-bd/chromiumfish). It lets Claude Code, Claude Desktop, Cursor, and other MCP clients control a ChromiumFish browser through structured tools.
 
-This project reuses the official ChromiumFish npm package and contains no Chromium source or browser binaries. The upstream SDK downloads the browser on the first browser tool call and caches it per version.
+This project uses the official ChromiumFish npm package. It does not include Chromium source code or browser binaries. On the first browser tool call, the upstream SDK downloads the matching browser build and caches it by version.
 
 ## Features
 
-- MCP stdio transport, suited to local desktop and developer tools.
-- The browser launches on demand and is cleaned up when the MCP client disconnects.
-- Multi-page management: create, switch, list, and close pages.
-- Snapshot element references: use `e1`, `e2` to act on elements in the current snapshot.
-- Tools for navigation, page text, screenshots, clicking, typing, key presses, scrolling, and waiting.
-- Supports ChromiumFish persona seed, proxy, window size, and time zone.
-- `eval_js` and the built-in browser agent are not registered by default and must be enabled explicitly.
-- Configurable navigation host allowlist and text output limit.
+- MCP over stdio for local desktop clients and development tools.
+- Lazy browser startup and automatic cleanup when the MCP client disconnects.
+- Multi-page management: create, select, list, and close pages.
+- Snapshot references such as `e1` and `e2` for reliable interaction with the current page state.
+- Navigation, text extraction, screenshots, clicking, typing, key presses, scrolling, and waits.
+- ChromiumFish persona seeds, proxies, window sizes, browser versions, and time zones.
+- `eval_js` and the native browser agent are disabled by default and require explicit opt-in.
+- Optional navigation host allowlists and text output limits.
 
 ## Requirements
 
 - Node.js 20 or later.
-- An operating system and hardware architecture currently supported by ChromiumFish.
-- The first launch needs network access to download a ChromiumFish browser build.
+- An operating system and architecture supported by ChromiumFish.
+- Network access for the initial ChromiumFish browser download.
 
-The automatic download depends on whether the upstream ChromiumFish release provides a build asset for the current platform. If it does not, build ChromiumFish yourself and point `--chrome-path` or `CHROME_BIN` at the executable.
+Automatic download depends on the upstream ChromiumFish release containing an asset for your platform. If no matching asset is available, build ChromiumFish locally and use `--chrome-path` or `CHROME_BIN` to point to the executable.
 
 ## Installation
 
-Install from GitHub:
+Install directly from GitHub:
 
 ```bash
 npm install --global github:LowOrbitLab/chromiumfish_mcp
 ```
 
-After installing, run:
+Then start the server:
 
 ```bash
 chromiumfish_mcp --persona-seed alice
 ```
 
-Or run it without a global install:
+You can also run it without a global installation:
 
 ```bash
 npx --yes github:LowOrbitLab/chromiumfish_mcp --persona-seed alice
 ```
 
-## MCP client configuration
+## MCP Client Configuration
 
 Using the globally installed command:
 
@@ -58,7 +58,7 @@ Using the globally installed command:
 }
 ```
 
-Run directly from GitHub:
+Running directly from GitHub:
 
 ```json
 {
@@ -76,50 +76,50 @@ Run directly from GitHub:
 }
 ```
 
-If a Windows client cannot resolve `npx`, change `command` to `npx.cmd`.
+On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`.
 
 ## Tools
 
-- `browser_status`: query the lazy-launch state.
-- `list_pages`, `new_page`, `select_page`, `close_page`: manage pages.
-- `navigate`, `go_back`: navigation and history.
-- `snapshot`: read interactive elements and produce temporary references.
-- `get_text`, `screenshot`: read page content.
-- `click`, `type_text`, `press_key`, `scroll`, `wait_for`: perform page actions.
-- `eval_js`: arbitrary JavaScript, available only with `--allow-eval`.
-- `run_task`: the ChromiumFish built-in browser agent, available only with `--allow-native-agent`.
+- `browser_status`: report lazy startup state, page count, and the current page.
+- `list_pages`, `new_page`, `select_page`, `close_page`: manage browser pages.
+- `navigate`, `go_back`: navigate and use page history.
+- `snapshot`: list visible interactive elements and create temporary references.
+- `get_text`, `screenshot`: retrieve page content.
+- `click`, `type_text`, `press_key`, `scroll`, `wait_for`: interact with the page.
+- `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
+- `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
-Calling `snapshot` returns a result like this:
+A `snapshot` call returns output similar to this:
 
 ```text
 [e1] input "Search"
 [e2] button "Submit"
-[e3] link "Docs" -> https://example.com/docs
+[e3] link "Documentation" -> https://example.com/docs
 ```
 
-Pass `e1` to `type_text`, or `e2` to `click`. Element references belong only to the latest snapshot of the current page; call `snapshot` again after the page changes.
+Pass `e1` to `type_text` or `e2` to `click`. Element references belong to the latest snapshot of the current page. Request a new snapshot after the page changes.
 
-## Startup options
+## Command-Line Options
 
 ```text
---persona-seed VALUE       Pin the browser fingerprint persona
+--persona-seed VALUE       Use a stable browser fingerprint persona
 --chrome-path PATH         Use a local ChromiumFish executable
---browser-version VERSION  Upstream browser build version
---headed                  Show the browser window
---window-size WIDTHxHEIGHT Window size
---timezone ZONE           IANA time zone or auto
---proxy URL               Browser proxy
---allowed-host HOST       Navigation host allowlist; repeatable
---max-text-chars N        Maximum characters of page text
---allow-eval              Enable arbitrary JavaScript
---allow-native-agent      Enable the built-in browser agent
+--browser-version VERSION  Select an upstream ChromiumFish build version
+--headed                   Show the browser window
+--window-size WIDTHxHEIGHT Set the browser window size
+--timezone ZONE            Use an IANA time zone or auto
+--proxy URL                Route browser traffic through a proxy
+--allowed-host HOST        Allow navigation to a host and its subdomains; repeatable
+--max-text-chars N         Limit the number of characters returned by get_text
+--allow-eval               Enable arbitrary JavaScript execution
+--allow-native-agent       Enable the native ChromiumFish browser agent
 ```
 
-Proxy credentials can go in the proxy URL, but that puts them in the MCP client configuration. Never commit configuration files containing proxy passwords, cookies, or API keys.
+Proxy credentials can be embedded in the proxy URL, but doing so exposes them in the MCP client configuration. Never commit configuration files containing proxy passwords, cookies, or API keys.
 
-## Built-in browser agent
+## Native Browser Agent
 
-An MCP client can already compose the fine-grained browser tools, so `run_task` is usually unnecessary. When you do need ChromiumFish's built-in browser agent, provide an OpenAI-compatible endpoint through environment variables:
+An MCP client can normally complete workflows by composing the granular browser tools, so `run_task` is usually unnecessary. To use ChromiumFish's native browser agent, configure an OpenAI-compatible endpoint through these environment variables:
 
 ```text
 OPENAI_API_KEY
@@ -127,17 +127,17 @@ OPENAI_API_BASE
 OPENAI_API_MODEL
 ```
 
-Then add `--allow-native-agent`. This mode hands the key to the local ChromiumFish browser process and enables unattended operation, so use it only in a trusted environment.
+Then start the server with `--allow-native-agent`. This mode forwards the credentials to the local ChromiumFish browser process and enables unattended browser actions. Use it only in a trusted environment.
 
-## Security boundaries
+## Security Boundaries
 
-- The server speaks stdio only; never expose the Chromium DevTools port directly to the public internet.
-- `eval_js` is off by default because it can read or modify any data on the page.
-- Use `--allowed-host example.com` to restrict navigation; subdomains are allowed too.
-- MCP clients can click and type, which may cause external side effects; keep a human confirmation step for purchases, publishing, or deleting data.
-- Each MCP process keeps its own browser context and is not meant for multi-tenant sharing.
+- The server supports stdio only. Do not expose the Chromium DevTools endpoint to the public internet.
+- `eval_js` is disabled by default because it can read or modify any data available to the page.
+- Use `--allowed-host example.com` to limit navigation to a host and its subdomains.
+- MCP clients can click and type, which may cause external side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
+- Each MCP process maintains an independent browser context. This server is not designed as a shared multi-tenant service.
 
-## Local development
+## Local Development
 
 ```bash
 npm ci
@@ -145,8 +145,8 @@ npm test
 node dist/index.js --help
 ```
 
-The unit tests use an in-memory MCP transport to verify tool discovery, the dangerous-tool switches, and call results, without downloading or launching a browser.
+The test suite uses an in-memory MCP transport to verify tool discovery, dangerous-tool opt-in, and tool results. It does not download or launch a browser.
 
-## License and attribution
+## License and Attribution
 
-This project is licensed under MIT. ChromiumFish code and the ChromiumFish name belong to the original project's contributors; see [NOTICE](NOTICE). This project is an independent wrapper, not an official ChromiumFish release.
+This project is licensed under the MIT License. ChromiumFish code and trademarks belong to their respective project contributors; see [NOTICE](NOTICE) for attribution. This is an independent wrapper and is not an official ChromiumFish release.
