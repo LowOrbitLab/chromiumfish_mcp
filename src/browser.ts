@@ -147,7 +147,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   private nextPageId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
-  /** Prevent concurrent solve_turnstile runs from fighting over the same mouse. */
+  /** Prevent concurrent click_challenge / solve_turnstile runs from fighting over the same mouse. */
   private solveInFlight = false;
 
   constructor(private readonly config: ServerConfig) {}
@@ -647,7 +647,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         tokenPresent: false,
         clicks: [],
         reason: "busy",
-        error: "solve_turnstile 已在执行中，请等待当前调用结束",
+        error: "click_challenge 已在执行中，请等待当前调用结束",
       };
     }
 

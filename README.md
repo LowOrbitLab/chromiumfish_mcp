@@ -90,7 +90,8 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 - `mouse_click`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
 - `list_frames`: list frames/iframes with URLs; bounding boxes included by default (`includeBox: false` for a faster URL-only listing).
 - `detect_challenge`: detect common interstitial / framed-challenge page states for text-only agents (`present`, `kind`, `widgetState`, `tokenPresent`, `widget`).
-- `solve_turnstile`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
+- `click_challenge`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
+- `solve_turnstile`: **alias of `click_challenge`** (kept for compatibility).
 - `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
@@ -100,10 +101,12 @@ Some embedded controls live in cross-origin iframes and never appear in `snapsho
 
 1. `navigate` to the target URL
 2. `detect_challenge` — inspect `present`, `kind`, and `widget`
-3. `solve_turnstile` — automatic clicks near the widget checkbox region + clearance polling
+3. `click_challenge` — automatic clicks near the widget checkbox region + clearance polling
 4. Or `list_frames` + `mouse_click` for manual coordinate control
 
-`solve_turnstile` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
+`click_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
+
+Do **not** read challenge-frame document text or probe `cf-turnstile-response` / `cf-chl-widget*` inputs while still on the gate page — that can collapse interactive clearance rates.
 
 A `snapshot` call returns output similar to this:
 
