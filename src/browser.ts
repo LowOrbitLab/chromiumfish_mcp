@@ -13,16 +13,19 @@ import type { ServerConfig } from "./config.js";
 import {
   checkboxClickCandidates,
   classifyChallenge,
+  inferWidgetState,
   isCloudflareFrameUrl,
   looksCleared,
   snippet,
   warmUpPath,
   type ChallengeDetection,
+  type ChallengeKind,
   type SolveTurnstileResult,
   type WidgetBox,
+  type WidgetState,
 } from "./turnstile.js";
 
-export type { ChallengeDetection, SolveTurnstileResult, WidgetBox };
+export type { ChallengeDetection, ChallengeKind, SolveTurnstileResult, WidgetBox, WidgetState };
 
 export interface PageSummary {
   id: string;
@@ -457,7 +460,8 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   private async frameBox(frame: Frame): Promise<WidgetBox | undefined> {
     try {
-      const box = await frame.locator("body").boundingBox({ timeout: 1500 });
+      await frame.locator("body").scrollIntoViewIfNeeded({ timeout: 800 }).catch(() => undefined);
+      const box = await frame.locator("body").boundingBox({ timeout: 1200 });
       if (!box || box.width <= 0 || box.height <= 0) return undefined;
       return {
         x: box.x,
@@ -474,23 +478,74 @@ export class ChromiumFishBrowser implements BrowserApi {
   async listFrames(): Promise<FrameSummary[]> {
     const page = await this.page();
     const frames = page.frames();
-    const summaries: FrameSummary[] = [];
-    for (const frame of frames) {
+    const boxes = await Promise.all(frames.map(async (frame) => {
+      // Skip expensive box lookup for empty about:blank children when many exist.
+      if (frame === page.mainFrame()) {
+        const box = await this.frameBox(frame);
+        return { frame, box };
+      }
       const box = await this.frameBox(frame);
-      summaries.push({
-        url: frame.url(),
-        name: frame.name(),
-        ...(box
-          ? { box: { x: box.x, y: box.y, width: box.width, height: box.height } }
-          : {}),
-      });
+      return { frame, box };
+    }));
+    return boxes.map(({ frame, box }) => ({
+      url: frame.url(),
+      name: frame.name(),
+      ...(box ? { box: { x: box.x, y: box.y, width: box.width, height: box.height } } : {}),
+    }));
+  }
+
+  private async readTurnstileToken(page: Page): Promise<string> {
+    const selectors = [
+      "input[name=\"cf-turnstile-response\"]",
+      "textarea[name=\"cf-turnstile-response\"]",
+      "input[name=\"cf-turnstile-response-field\"]",
+      "[name=\"cf-turnstile-response\"]",
+      "input[id^=\"cf-chl-widget\"][name*=\"response\"]",
+    ];
+    for (const selector of selectors) {
+      const values = await page.locator(selector).evaluateAll((nodes) =>
+        nodes
+          .map((node) => {
+            if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+              return node.value || "";
+            }
+            return (node as HTMLElement).textContent || "";
+          })
+          .filter((value) => value.trim().length > 0),
+      ).catch(() => [] as string[]);
+      if (values[0]) return values[0];
     }
-    return summaries;
+    // Hidden fields inside same-origin wrappers
+    const anyToken = await page.evaluate(() => {
+      const nodes = Array.from(document.querySelectorAll("input, textarea"));
+      for (const node of nodes) {
+        const el = node as HTMLInputElement | HTMLTextAreaElement;
+        const name = (el.name || el.id || "").toLowerCase();
+        if (name.includes("turnstile") && name.includes("response") && el.value?.trim()) {
+          return el.value.trim();
+        }
+      }
+      return "";
+    }).catch(() => "");
+    return anyToken;
+  }
+
+  private async readChallengeFrameText(page: Page): Promise<string> {
+    const parts: string[] = [];
+    for (const frame of page.frames()) {
+      if (!isCloudflareFrameUrl(frame.url())) continue;
+      const text = await frame.locator("body").innerText({ timeout: 800 }).catch(() => "");
+      if (text.trim()) parts.push(text.trim());
+    }
+    return parts.join("\n");
   }
 
   private async findTurnstileWidget(page: Page): Promise<WidgetBox | undefined> {
     const preferred = page.frames().filter((frame) => isCloudflareFrameUrl(frame.url()));
-    const ordered = [...preferred, ...page.frames().filter((frame) => !preferred.includes(frame))];
+    const ordered = [
+      ...preferred,
+      ...page.frames().filter((frame) => !preferred.includes(frame) && frame !== page.mainFrame()),
+    ];
     let fallback: WidgetBox | undefined;
     for (const frame of ordered) {
       const box = await this.frameBox(frame);
@@ -499,35 +554,100 @@ export class ChromiumFishBrowser implements BrowserApi {
       if (box.width >= 200 && box.width <= 420 && box.height >= 50 && box.height <= 120) {
         return box;
       }
-      if (isCloudflareFrameUrl(frame.url()) && box.width >= 120 && box.height >= 40) {
+      if (isCloudflareFrameUrl(frame.url()) && box.width >= 120 && box.width <= 500 && box.height >= 40 && box.height <= 200) {
         fallback ??= box;
       }
     }
     return fallback;
   }
 
-  async detectChallenge(): Promise<ChallengeDetection> {
-    const page = await this.page();
+  private async ensureWidgetInViewport(page: Page, widget: WidgetBox): Promise<WidgetBox> {
+    const viewport = page.viewportSize();
+    if (!viewport) return widget;
+    const margin = 12;
+    const fullyVisible =
+      widget.x >= margin
+      && widget.y >= margin
+      && widget.x + widget.width <= viewport.width - margin
+      && widget.y + widget.height <= viewport.height - margin;
+    if (fullyVisible) return widget;
+
+    // Scroll the challenge frame body into view, then re-measure.
+    for (const frame of page.frames()) {
+      if (frame.url() !== widget.frameUrl && !isCloudflareFrameUrl(frame.url())) continue;
+      await frame.locator("body").scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
+    }
+    // Also nudge main page scroll toward widget center.
+    await page.evaluate(({ x, y }) => {
+      const cx = x;
+      const cy = y;
+      const targetY = window.scrollY + cy - window.innerHeight / 2;
+      window.scrollTo({ top: Math.max(0, targetY), left: 0, behavior: "instant" as ScrollBehavior });
+    }, { x: widget.x + widget.width / 2, y: widget.y + widget.height / 2 }).catch(() => undefined);
+
+    await page.waitForTimeout(120);
+    return (await this.findTurnstileWidget(page)) ?? widget;
+  }
+
+  private async observeChallenge(page: Page): Promise<{
+    detection: ChallengeDetection;
+    kind: ChallengeKind;
+    widgetState: WidgetState;
+    tokenPresent: boolean;
+    hasChallengeFrame: boolean;
+  }> {
     const title = await page.title().catch(() => "");
     const url = page.url();
     const bodyText = await page.locator("body").innerText().catch(() => "");
-    const frames = page.frames().map((frame) => ({ url: frame.url() }));
+    const frameUrls = page.frames().map((frame) => frame.url());
+    const hasChallengeFrame = frameUrls.some((frameUrl) => isCloudflareFrameUrl(frameUrl));
+    const token = await this.readTurnstileToken(page);
+    const tokenPresent = token.length > 10;
+    const frameText = hasChallengeFrame ? await this.readChallengeFrameText(page) : "";
+    const widgetState = inferWidgetState({
+      tokenPresent,
+      hasChallengeFrame,
+      frameText,
+      mainBodyText: bodyText,
+    });
     const classified = classifyChallenge({
       title,
       url,
       bodyText,
-      frameUrls: frames.map((frame) => frame.url),
+      frameUrls,
+      tokenPresent,
+      widgetState,
     });
-    const widget = classified.present ? await this.findTurnstileWidget(page) : undefined;
+    const widget = (classified.present || widgetState === "success")
+      ? await this.findTurnstileWidget(page)
+      : undefined;
+
+    // If token/success already, force not-present for agent simplicity.
+    const present = tokenPresent || widgetState === "success" ? false : classified.present;
+    const kind = present ? classified.kind : "none";
+
     return {
-      present: classified.present,
-      kind: classified.kind,
-      title,
-      url,
-      bodySnippet: snippet(bodyText),
-      ...(widget ? { widget } : {}),
-      frames,
+      kind,
+      widgetState,
+      tokenPresent,
+      hasChallengeFrame,
+      detection: {
+        present,
+        kind,
+        widgetState,
+        title,
+        url,
+        bodySnippet: snippet(bodyText),
+        tokenPresent,
+        ...(widget ? { widget } : {}),
+        frames: frameUrls.map((frameUrl) => ({ url: frameUrl })),
+      },
     };
+  }
+
+  async detectChallenge(): Promise<ChallengeDetection> {
+    const page = await this.page();
+    return (await this.observeChallenge(page)).detection;
   }
 
   async solveTurnstile(options: { timeoutMs?: number; maxClicks?: number } = {}): Promise<SolveTurnstileResult> {
@@ -537,85 +657,104 @@ export class ChromiumFishBrowser implements BrowserApi {
     const clicks: Array<{ x: number; y: number }> = [];
     const page = await this.page();
 
-    const snapshot = async () => {
-      const title = await page.title().catch(() => "");
-      const url = page.url();
-      const bodyText = await page.locator("body").innerText().catch(() => "");
-      return { title, url, bodyText };
+    const finish = async (
+      partial: Omit<SolveTurnstileResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"> & {
+        widgetState?: WidgetState;
+        tokenPresent?: boolean;
+      },
+    ): Promise<SolveTurnstileResult> => {
+      const observed = await this.observeChallenge(page);
+      const title = observed.detection.title;
+      const url = observed.detection.url;
+      const bodySnippet = observed.detection.bodySnippet;
+      return {
+        ...partial,
+        elapsedMs: Date.now() - started,
+        title,
+        url,
+        bodySnippet,
+        widgetState: partial.widgetState ?? observed.widgetState,
+        tokenPresent: partial.tokenPresent ?? observed.tokenPresent,
+        widget: partial.widget ?? observed.detection.widget,
+      };
     };
 
-    let initial = await this.detectChallenge();
-    if (!initial.present) {
-      const state = await snapshot();
-      return {
+    let observed = await this.observeChallenge(page);
+    // Late-mounted challenge frames: wait briefly before concluding already_clear.
+    if (!observed.detection.present) {
+      const lateDeadline = started + 5_000;
+      while (Date.now() < lateDeadline) {
+        await page.waitForTimeout(400);
+        observed = await this.observeChallenge(page);
+        if (observed.detection.present) break;
+      }
+    }
+    if (!observed.detection.present) {
+      return finish({
         ok: true,
         method: "already_clear",
         attempts: 0,
-        elapsedMs: Date.now() - started,
-        title: state.title,
-        url: state.url,
-        bodySnippet: snippet(state.bodyText),
         clicks,
-      };
+        widgetState: observed.widgetState,
+        tokenPresent: observed.tokenPresent,
+      });
     }
 
+    const kind = observed.kind;
+    let widget = observed.detection.widget;
+
     // Wait for the widget frame to finish mounting.
-    let widget = initial.widget;
     while (!widget && Date.now() - started < Math.min(15_000, timeoutMs)) {
       await page.waitForTimeout(350);
-      widget = await this.findTurnstileWidget(page);
-      initial = await this.detectChallenge();
-      if (!initial.present) {
-        const state = await snapshot();
-        return {
+      observed = await this.observeChallenge(page);
+      if (!observed.detection.present) {
+        return finish({
           ok: true,
           method: "already_clear",
           attempts: 0,
-          elapsedMs: Date.now() - started,
-          title: state.title,
-          url: state.url,
-          bodySnippet: snippet(state.bodyText),
           clicks,
-        };
+          widgetState: observed.widgetState,
+          tokenPresent: observed.tokenPresent,
+        });
       }
+      widget = observed.detection.widget;
     }
 
     if (!widget) {
-      const state = await snapshot();
-      return {
+      return finish({
         ok: false,
         method: "not_found",
         attempts: 0,
-        elapsedMs: Date.now() - started,
-        title: state.title,
-        url: state.url,
-        bodySnippet: snippet(state.bodyText),
         clicks,
         error: "未找到跨域 challenge 控件区域",
-      };
+      });
     }
+
+    widget = await this.ensureWidgetInViewport(page, widget);
 
     // Human-ish warm-up path near the widget.
     for (const point of warmUpPath(widget)) {
       if (Date.now() - started > timeoutMs) break;
+      const viewport = page.viewportSize();
+      if (viewport && (point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height)) {
+        continue;
+      }
       await this.moveMouseTo(page, point.x, point.y, 8 + Math.floor(Math.random() * 6));
       await page.waitForTimeout(60 + Math.floor(Math.random() * 120));
     }
 
-    const candidates = checkboxClickCandidates(widget);
     let attempts = 0;
 
     while (Date.now() - started < timeoutMs && attempts < maxClicks) {
-      // Refresh widget box — layout can shift after partial verification.
-      widget = (await this.findTurnstileWidget(page)) ?? widget;
-      const queue = attempts === 0
-        ? candidates
-        : checkboxClickCandidates(widget);
+      widget = await this.ensureWidgetInViewport(
+        page,
+        (await this.findTurnstileWidget(page)) ?? widget,
+      );
+      const queue = checkboxClickCandidates(widget);
       const target = queue[attempts % queue.length] ?? {
-        x: widget.x + 40,
+        x: widget.x + Math.min(40, widget.width * 0.15),
         y: widget.y + widget.height / 2,
       };
-      // Tiny jitter so repeated attempts are not pixel-identical.
       const x = target.x + (Math.random() - 0.5) * 4;
       const y = target.y + (Math.random() - 0.5) * 3;
       attempts += 1;
@@ -626,45 +765,109 @@ export class ChromiumFishBrowser implements BrowserApi {
       await page.waitForTimeout(50 + Math.floor(Math.random() * 80));
       await page.mouse.up();
 
-      // Poll briefly after each click for clearance.
-      const deadline = Math.min(Date.now() + 5_000, started + timeoutMs);
+      const deadline = Math.min(Date.now() + 5_500, started + timeoutMs);
       while (Date.now() < deadline) {
         await page.waitForTimeout(400);
-        const state = await snapshot();
-        if (!looksCleared({ ...state, hadChallenge: true })) continue;
-        // Confirm the page stays clear briefly (avoid interim "Loading…" flashes).
-        await page.waitForTimeout(700);
-        const confirmed = await snapshot();
-        if (looksCleared({ ...confirmed, hadChallenge: true })) {
-          return {
+        observed = await this.observeChallenge(page);
+        const bodyText = await page.locator("body").innerText().catch(() => "");
+        // After a click, CF often enters a "Verifying…" phase — wait it out without extra clicks.
+        if (
+          observed.widgetState === "verifying"
+          || /verifying you are human|this may take a few seconds/i.test(bodyText)
+        ) {
+          const verifyDeadline = Math.min(Date.now() + 12_000, started + timeoutMs);
+          while (Date.now() < verifyDeadline) {
+            await page.waitForTimeout(500);
+            observed = await this.observeChallenge(page);
+            const verifyBody = await page.locator("body").innerText().catch(() => "");
+            if (looksCleared({
+              title: observed.detection.title,
+              url: observed.detection.url,
+              bodyText: verifyBody,
+              hadChallenge: true,
+              kind,
+              tokenPresent: observed.tokenPresent,
+              widgetState: observed.widgetState,
+              hasChallengeFrame: observed.hasChallengeFrame,
+            })) {
+              return finish({
+                ok: true,
+                method: "click",
+                attempts,
+                clicks,
+                widget,
+                widgetState: observed.widgetState,
+                tokenPresent: observed.tokenPresent,
+              });
+            }
+            // Left verifying but still gated — break to allow another click.
+            if (
+              observed.widgetState !== "verifying"
+              && !/verifying you are human|this may take a few seconds/i.test(verifyBody)
+            ) {
+              break;
+            }
+          }
+        }
+        const state = {
+          title: observed.detection.title,
+          url: observed.detection.url,
+          bodyText,
+          hadChallenge: true,
+          kind,
+          tokenPresent: observed.tokenPresent,
+          widgetState: observed.widgetState,
+          hasChallengeFrame: observed.hasChallengeFrame,
+        };
+        if (!looksCleared(state)) continue;
+        await page.waitForTimeout(600);
+        observed = await this.observeChallenge(page);
+        const confirmed = {
+          title: observed.detection.title,
+          url: observed.detection.url,
+          bodyText: await page.locator("body").innerText().catch(() => ""),
+          hadChallenge: true,
+          kind,
+          tokenPresent: observed.tokenPresent,
+          widgetState: observed.widgetState,
+          hasChallengeFrame: observed.hasChallengeFrame,
+        };
+        if (looksCleared(confirmed)) {
+          return finish({
             ok: true,
             method: "click",
             attempts,
-            elapsedMs: Date.now() - started,
-            title: confirmed.title,
-            url: confirmed.url,
-            bodySnippet: snippet(confirmed.bodyText),
-            widget,
             clicks,
-          };
+            widget,
+            widgetState: observed.widgetState,
+            tokenPresent: observed.tokenPresent,
+          });
         }
       }
     }
 
-    const state = await snapshot();
-    const cleared = looksCleared({ ...state, hadChallenge: true });
-    return {
+    observed = await this.observeChallenge(page);
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    const cleared = looksCleared({
+      title: observed.detection.title,
+      url: observed.detection.url,
+      bodyText,
+      hadChallenge: true,
+      kind,
+      tokenPresent: observed.tokenPresent,
+      widgetState: observed.widgetState,
+      hasChallengeFrame: observed.hasChallengeFrame,
+    });
+    return finish({
       ok: cleared,
       method: cleared ? "click" : "timeout",
       attempts,
-      elapsedMs: Date.now() - started,
-      title: state.title,
-      url: state.url,
-      bodySnippet: snippet(state.bodyText),
-      widget,
       clicks,
-      ...(cleared ? {} : { error: "在超时时间内未能离开 interstitial 页面" }),
-    };
+      widget,
+      widgetState: observed.widgetState,
+      tokenPresent: observed.tokenPresent,
+      ...(cleared ? {} : { error: "在超时时间内未能确认 challenge 已清除" }),
+    });
   }
 
   async typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void> {

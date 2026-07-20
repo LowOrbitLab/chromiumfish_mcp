@@ -152,7 +152,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "detect_challenge",
     {
       description:
-        "检测当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 kind、widget 坐标框与相关 frame，便于文本代理决定下一步交互。",
+        "检测当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 present、kind、widgetState、tokenPresent、widget 坐标框与相关 frame。",
       inputSchema: {},
     },
     async () => text(await browser.detectChallenge()),
@@ -162,7 +162,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "solve_turnstile",
     {
       description:
-        "对跨域 challenge frame 内的标准 checkbox 控件做拟人坐标点击，并轮询页面是否离开 interstitial。不依赖视觉模型。结果以 JSON 的 ok 字段为准。",
+        "对跨域 challenge frame 内的标准 checkbox 控件做拟人坐标点击，并轮询直到确认清除（response token / widget 成功态 / 离开 interstitial）。不依赖视觉模型。结果以 JSON 的 ok 字段为准。",
       inputSchema: {
         timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
         maxClicks: z.number().int().min(1).max(30).default(12),

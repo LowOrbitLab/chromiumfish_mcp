@@ -2,6 +2,9 @@
 
 export type ChallengeKind = "none" | "interstitial" | "turnstile" | "managed" | "unknown";
 
+/** Best-effort widget interaction state for text-only agents. */
+export type WidgetState = "absent" | "checkbox" | "verifying" | "success" | "unknown";
+
 export interface WidgetBox {
   x: number;
   y: number;
@@ -13,9 +16,13 @@ export interface WidgetBox {
 export interface ChallengeDetection {
   present: boolean;
   kind: ChallengeKind;
+  /** Refined state when a framed widget or token field is observable. */
+  widgetState: WidgetState;
   title: string;
   url: string;
   bodySnippet: string;
+  /** True when a non-empty cf-turnstile-response (or similar) token is present. */
+  tokenPresent: boolean;
   widget?: WidgetBox;
   frames: Array<{ url: string }>;
 }
@@ -28,45 +35,23 @@ export interface SolveTurnstileResult {
   title: string;
   url: string;
   bodySnippet: string;
+  widgetState: WidgetState;
+  tokenPresent: boolean;
   widget?: WidgetBox;
   clicks: Array<{ x: number; y: number }>;
   error?: string;
 }
 
-const CF_FRAME_RE = /challenges\.cloudflare\.com|turnstile/i;
+/** Host used by Cloudflare challenge / Turnstile frames. */
+const CF_CHALLENGE_HOST_RE = /challenges\.cloudflare\.com/i;
 const INTERSTITIAL_TITLE_RE = /just a moment|checking your browser|performing security verification/i;
 const INTERSTITIAL_BODY_RE =
-  /verify you are human|performing security verification|checking your browser before accessing|needs to review the security/i;
-const TURNSTILE_BODY_RE = /verify you are human|cf-turnstile|turnstile/i;
+  /verify(?:ing)? you are human|performing security verification|checking your browser before accessing|needs to review the security|this may take a few seconds/i;
+/** Strong success markers on destination pages (not marketing copy alone). */
+const STRONG_SUCCESS_BODY_RE = /captcha is passed successfully|verification successful/i;
 
 export function isCloudflareFrameUrl(url: string): boolean {
-  return CF_FRAME_RE.test(url);
-}
-
-export function classifyChallenge(input: {
-  title: string;
-  url: string;
-  bodyText: string;
-  frameUrls: string[];
-}): { present: boolean; kind: ChallengeKind } {
-  const hasCfFrame = input.frameUrls.some((u) => isCloudflareFrameUrl(u));
-  const titleHit = INTERSTITIAL_TITLE_RE.test(input.title);
-  const bodyHit = INTERSTITIAL_BODY_RE.test(input.bodyText);
-  const urlHit = /__cf_chl|cf-browser-verification|cdn-cgi\/challenge/i.test(input.url);
-  const turnstileHit = TURNSTILE_BODY_RE.test(input.bodyText) || input.frameUrls.some((u) => /turnstile/i.test(u));
-
-  if (!hasCfFrame && !titleHit && !bodyHit && !urlHit) {
-    return { present: false, kind: "none" };
-  }
-
-  if (titleHit || urlHit) {
-    // Managed / interstitial gate in front of the real page.
-    if (turnstileHit || hasCfFrame) return { present: true, kind: "managed" };
-    return { present: true, kind: "interstitial" };
-  }
-
-  if (turnstileHit || hasCfFrame) return { present: true, kind: "turnstile" };
-  return { present: true, kind: "unknown" };
+  return CF_CHALLENGE_HOST_RE.test(url);
 }
 
 export function snippet(text: string, max = 280): string {
@@ -76,8 +61,50 @@ export function snippet(text: string, max = 280): string {
 }
 
 /**
- * Checkbox sits on the left of the 300x65 Turnstile widget.
- * Returns page-coordinate click candidates (deterministic order, small jitter applied by caller).
+ * Classify page-level challenge presence.
+ * Prefer real challenge frames over body keywords (docs pages often mention "turnstile").
+ */
+export function classifyChallenge(input: {
+  title: string;
+  url: string;
+  bodyText: string;
+  frameUrls: string[];
+  tokenPresent?: boolean;
+  widgetState?: WidgetState;
+}): { present: boolean; kind: ChallengeKind } {
+  if (input.tokenPresent || input.widgetState === "success") {
+    return { present: false, kind: "none" };
+  }
+
+  const hasCfFrame = input.frameUrls.some((u) => isCloudflareFrameUrl(u));
+  const titleHit = INTERSTITIAL_TITLE_RE.test(input.title);
+  const bodyHit = INTERSTITIAL_BODY_RE.test(input.bodyText);
+  const urlHit = /__cf_chl|cf-browser-verification|cdn-cgi\/challenge-platform/i.test(input.url);
+
+  // Docs / marketing pages that only mention Turnstile in copy should not trigger.
+  if (!hasCfFrame && !titleHit && !bodyHit && !urlHit) {
+    return { present: false, kind: "none" };
+  }
+
+  // Body-only "turnstile" mentions without a CF frame are ignored (handled above).
+  if (titleHit || urlHit) {
+    if (hasCfFrame || bodyHit) return { present: true, kind: "managed" };
+    return { present: true, kind: "interstitial" };
+  }
+
+  if (hasCfFrame) {
+    // Embedded widget on an otherwise normal page.
+    return { present: true, kind: "turnstile" };
+  }
+
+  // Interstitial copy without a mounted frame yet.
+  if (bodyHit) return { present: true, kind: "interstitial" };
+  return { present: false, kind: "none" };
+}
+
+/**
+ * Checkbox sits on the left of the ~300x65 widget.
+ * Offsets scale with box size so narrow/scaled widgets still hit the control.
  */
 export function checkboxClickCandidates(box: {
   x: number;
@@ -86,15 +113,15 @@ export function checkboxClickCandidates(box: {
   height: number;
 }): Array<{ x: number; y: number }> {
   const cy = box.y + box.height / 2;
-  const xs = [40, 28, 36, 44, 32, 48, 24, 52, 20];
-  const ys = [0, -2, 2, -4, 3, 0, 1, -1, 0];
-  return xs.map((dx, i) => ({
-    x: box.x + dx,
-    y: cy + (ys[i] ?? 0),
+  const base = clamp(box.width * 0.12, 18, 48);
+  const deltas = [0, -8, 6, -12, 10, -4, 14, -16, 4];
+  const yJitter = [0, -2, 2, -3, 3, 1, -1, 0, 2];
+  return deltas.map((d, i) => ({
+    x: box.x + clamp(base + d, 12, Math.max(16, box.width * 0.35)),
+    y: cy + (yJitter[i] ?? 0),
   }));
 }
 
-/** Warm-up path points near the widget before the real clicks. */
 export function warmUpPath(box: {
   x: number;
   y: number;
@@ -109,28 +136,74 @@ export function warmUpPath(box: {
   ];
 }
 
+export function inferWidgetState(input: {
+  tokenPresent: boolean;
+  hasChallengeFrame: boolean;
+  frameText?: string;
+  /** Main-document signals only — weak alone for embedded widgets. */
+  mainBodyText?: string;
+}): WidgetState {
+  if (input.tokenPresent) return "success";
+  if (!input.hasChallengeFrame) return "absent";
+
+  const frame = (input.frameText ?? "").toLowerCase();
+  if (/success/.test(frame)) return "success";
+  if (/verifying|checking|spin|this may take a few seconds/.test(frame)) return "verifying";
+  if (/verify you are human|verify/.test(frame)) return "checkbox";
+
+  // Frame present but opaque (closed shadow / empty accessible text).
+  return "unknown";
+}
+
+/**
+ * Whether the challenge flow is done.
+ * Embedded widgets require token or frame-level success — main body alone is not enough.
+ */
 export function looksCleared(input: {
   title: string;
   url: string;
   bodyText: string;
   hadChallenge: boolean;
+  kind?: ChallengeKind;
+  tokenPresent?: boolean;
+  widgetState?: WidgetState;
+  hasChallengeFrame?: boolean;
 }): boolean {
   if (!input.hadChallenge) return true;
+
+  if (input.tokenPresent || input.widgetState === "success") return true;
+
   if (INTERSTITIAL_TITLE_RE.test(input.title)) return false;
-  // Playwright/Chromium interim navigation titles are not clearance.
   if (/^loading\b/i.test(input.title.trim())) return false;
+
+  const kind = input.kind ?? "unknown";
+  const embedded = kind === "turnstile";
+
+  // Embedded Turnstile: never trust main-document "looks normal".
+  if (embedded) {
+    if (input.widgetState === "checkbox" || input.widgetState === "verifying") return false;
+    if (input.hasChallengeFrame && !input.tokenPresent) return false;
+    return false;
+  }
+
+  // Managed / full-page interstitial: leaving the gate is success.
   if (/__cf_chl_rt_tk=|cf-browser-verification/i.test(input.url) && INTERSTITIAL_BODY_RE.test(input.bodyText)) {
     return false;
   }
-  // Success markers used by public demos and common clearance patterns.
-  if (/captcha is passed successfully|verification successful|success!/i.test(input.bodyText)) {
-    return true;
-  }
-  // Still on the challenge interstitial copy.
+  if (STRONG_SUCCESS_BODY_RE.test(input.bodyText)) return true;
   if (INTERSTITIAL_BODY_RE.test(input.bodyText)) return false;
-  // Require some real page content after leaving the gate.
+
+  // Still hosting a challenge frame without a token → not clear.
+  if (input.hasChallengeFrame && !input.tokenPresent) return false;
+
   const body = input.bodyText.replace(/\s+/g, " ").trim();
   if (body.length < 40) return false;
   if (!input.title.trim()) return false;
-  return true;
+
+  // Title no longer interstitial and body is real content.
+  return !INTERSTITIAL_TITLE_RE.test(input.title);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
