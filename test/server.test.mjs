@@ -114,22 +114,22 @@ test("default tool set has a stable annotated contract", async (context) => {
   const tools = (await client.listTools()).tools;
   assert.deepEqual(tools.map((tool) => tool.name), [
     "list_pages",
-    "new_page",
+    "open_page",
     "select_page",
     "close_page",
     "navigate",
-    "go_back",
-    "go_forward",
+    "navigate_back",
+    "navigate_forward",
     "reload",
     "snapshot",
     "get_text",
-    "screenshot",
+    "take_screenshot",
     "click",
     "hover",
-    "mouse_click",
+    "click_at",
     "list_frames",
     "find_challenge",
-    "click_challenge",
+    "solve_challenge",
     "type_text",
     "select_option",
     "set_checked",
@@ -142,20 +142,20 @@ test("default tool set has a stable annotated contract", async (context) => {
   assert.equal(tools.find((tool) => tool.name === "close_page").annotations.destructiveHint, true);
 });
 
-test("click_challenge and mouse_click return structured results", async (context) => {
+test("solve_challenge and click_at return structured results", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
     await server.close();
   });
   const solved = await client.callTool({
-    name: "click_challenge",
+    name: "solve_challenge",
     arguments: { timeoutMs: 5000, maxClicks: 3 },
   });
   assert.match(solved.content[0].text, /already_clear/);
   assert.equal(solved.structuredContent.method, "already_clear");
   const clicked = await client.callTool({
-    name: "mouse_click",
+    name: "click_at",
     arguments: { x: 10, y: 20 },
   });
   assert.match(clicked.content[0].text, /"x":10/);
@@ -215,7 +215,7 @@ test("forwards bounded inspection, form, navigation, and typed wait arguments", 
     arguments: { target: "#terms", checked: true, frameId: "frame-2" },
   });
   assert.equal(checked.structuredContent.checked, true);
-  await client.callTool({ name: "go_forward", arguments: {} });
+  await client.callTool({ name: "navigate_forward", arguments: {} });
   await client.callTool({ name: "reload", arguments: {} });
   await client.callTool({
     name: "wait_for",
@@ -277,7 +277,7 @@ test("registers dangerous tools when explicitly enabled", async (context) => {
     await server.close();
   });
   const names = (await client.listTools()).tools.map((tool) => tool.name);
-  assert.ok(names.includes("eval_js"));
+  assert.ok(names.includes("evaluate"));
   assert.ok(names.includes("run_task"));
 });
 
