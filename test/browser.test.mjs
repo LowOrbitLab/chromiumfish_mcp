@@ -1,0 +1,221 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { ChromiumFishBrowser } from "../dist/browser.js";
+
+const config = {
+  headless: true,
+  windowSize: [1280, 720],
+  allowEval: false,
+  allowNativeAgent: false,
+  maxTextChars: 50_000,
+  allowedHosts: [],
+};
+
+function frame({ url, name = "", parent = null, text = "", box } = {}) {
+  return {
+    url: () => url ?? "about:blank",
+    name: () => name,
+    parentFrame: () => parent,
+    locator: () => ({
+      boundingBox: async () => box,
+      innerText: async () => text,
+    }),
+  };
+}
+
+test("listFrames returns stable frame IDs and blocks challenge DOM access", async () => {
+  const main = frame({ url: "https://example.com/", text: "Main" });
+  const child = frame({
+    url: "https://widgets.example.net/form",
+    name: "checkout",
+    parent: main,
+    text: "Card details",
+    box: { x: 10, y: 20, width: 300, height: 180 },
+  });
+  const challenge = frame({
+    url: "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/widget",
+    parent: main,
+  });
+  const page = {
+    frames: () => [main, child, challenge],
+    mainFrame: () => main,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const first = await browser.listFrames({ includeBox: true });
+  const second = await browser.listFrames({ includeBox: false });
+
+  assert.equal(first[0].frameId, second[0].frameId);
+  assert.equal(first[1].frameId, second[1].frameId);
+  assert.equal(first[1].parentFrameId, first[0].frameId);
+  assert.deepEqual(first[1].box, { x: 10, y: 20, width: 300, height: 180 });
+  assert.equal(await browser.getText(first[1].frameId), "Card details");
+  await assert.rejects(
+    browser.getText(first[2].frameId),
+    /DOM access to challenge frame/,
+  );
+});
+
+test("frame snapshot references support hover, selectOption, and setChecked", async () => {
+  const main = frame({ url: "https://example.com/" });
+  let checked = false;
+  let selectedOptions;
+  const moves = [];
+  const child = {
+    url: () => "https://widgets.example.net/form",
+    name: () => "form",
+    parentFrame: () => main,
+  };
+  const selectHandle = {
+    isVisible: async () => true,
+    evaluate: async (callback) => String(callback).includes("isConnected") ? true : ({
+      role: "select",
+      label: "Country",
+      href: "",
+      disabled: false,
+      type: "",
+      value: null,
+      passwordSet: false,
+      checked: null,
+      selected: ["us"],
+      options: [
+        { value: "us", label: "United States" },
+        { value: "ca", label: "Canada" },
+      ],
+      expanded: null,
+    }),
+    ownerFrame: async () => child,
+    dispose: async () => undefined,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => ({ x: 30, y: 40, width: 160, height: 30 }),
+    selectOption: async (options) => {
+      selectedOptions = options;
+      return ["ca"];
+    },
+  };
+  const checkboxHandle = {
+    isVisible: async () => true,
+    evaluate: async (callback) => String(callback).includes("isConnected") ? true : ({
+      role: "input",
+      label: "Accept terms",
+      href: "",
+      disabled: false,
+      type: "checkbox",
+      value: null,
+      passwordSet: false,
+      checked: false,
+      selected: [],
+      options: [],
+      expanded: null,
+    }),
+    ownerFrame: async () => child,
+    dispose: async () => undefined,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => ({ x: 30, y: 90, width: 20, height: 20 }),
+    isChecked: async () => checked,
+  };
+  child.locator = () => ({
+    elementHandles: async () => [selectHandle, checkboxHandle],
+    first: () => ({ elementHandle: async () => selectHandle }),
+  });
+  const page = {
+    frames: () => [main, child],
+    mainFrame: () => main,
+    mouse: {
+      move: async (x, y) => moves.push({ x, y }),
+      down: async () => undefined,
+      up: async () => {
+        checked = true;
+      },
+    },
+    waitForTimeout: async () => undefined,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+  const frames = await browser.listFrames({ includeBox: false });
+
+  const snapshot = await browser.snapshot(frames[1].frameId);
+  assert.match(snapshot, /selected=\["us"\]/);
+  assert.match(snapshot, /options=\[\{"value":"us","label":"United States"\}/);
+  assert.match(snapshot, /type=checkbox unchecked/);
+
+  await browser.hover("#country", frames[1].frameId);
+  assert.ok(moves.length >= 4);
+  assert.deepEqual(
+    await browser.selectOption("e1", ["Canada"], "label"),
+    ["ca"],
+  );
+  assert.deepEqual(selectedOptions, [{ label: "Canada" }]);
+  assert.equal(await browser.setChecked("e2", true), true);
+});
+
+test("goForward and reload wait for DOMContentLoaded", async () => {
+  const calls = [];
+  const page = {
+    goForward: async (options) => calls.push(["goForward", options]),
+    reload: async (options) => calls.push(["reload", options]),
+    title: async () => "Example",
+    url: () => "https://example.com/next",
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  assert.deepEqual(await browser.goForward(), {
+    title: "Example",
+    url: "https://example.com/next",
+  });
+  assert.deepEqual(await browser.reload(), {
+    title: "Example",
+    url: "https://example.com/next",
+  });
+  assert.deepEqual(calls, [
+    ["goForward", { waitUntil: "domcontentloaded" }],
+    ["reload", { waitUntil: "domcontentloaded" }],
+  ]);
+});
+
+test("waitFor supports element, text, URL, load-state, and time conditions", async () => {
+  const calls = [];
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: (selector) => ({
+      first: () => ({
+        waitFor: async (options) => calls.push(["element", selector, options]),
+      }),
+    }),
+    getByText: (value, options) => ({
+      first: () => ({
+        waitFor: async (waitOptions) => calls.push(["text", value, options, waitOptions]),
+      }),
+    }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    waitForURL: async (url, options) => calls.push(["url", url, options]),
+    waitForLoadState: async (state, options) => calls.push(["load", state, options]),
+    waitForTimeout: async (timeMs) => calls.push(["time", timeMs]),
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await browser.waitFor({ target: "#ready", state: "visible", timeoutMs: 1000 });
+  await browser.waitFor({ text: "Complete", textState: "hidden", timeoutMs: 2000 });
+  await browser.waitFor({ url: "**/dashboard", timeoutMs: 3000 });
+  await browser.waitFor({ loadState: "networkidle", timeoutMs: 4000 });
+  await browser.waitFor({ timeMs: 250, timeoutMs: 5000 });
+
+  assert.deepEqual(calls.map((entry) => entry[0]), ["element", "text", "url", "load", "time"]);
+  assert.equal(calls[0][2].state, "visible");
+  assert.equal(calls[1][3].state, "hidden");
+  assert.equal(calls[2][1], "**/dashboard");
+  assert.equal(calls[3][1], "networkidle");
+  assert.equal(calls[4][1], 250);
+  await assert.rejects(
+    browser.waitFor({ target: "#ready", text: "Ready", timeoutMs: 1000 }),
+    /requires exactly one/,
+  );
+});
