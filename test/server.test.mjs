@@ -27,7 +27,10 @@ function fakeBrowser() {
     screenshot: async () => Buffer.from("png"),
     click: async () => undefined,
     mouseClick: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
-    listFrames: async () => [{ url: "https://example.com/", name: "" }],
+    listFrames: async (options) => {
+      if (options?.includeBox === false) return [{ url: "https://example.com/", name: "" }];
+      return [{ url: "https://example.com/", name: "", box: { x: 0, y: 0, width: 100, height: 100 } }];
+    },
     detectChallenge: async () => ({
       present: false,
       kind: "none",
@@ -101,6 +104,24 @@ test("solve_turnstile 与 mouse_click 返回结构化结果", async (context) =>
     arguments: { x: 10, y: 20 },
   });
   assert.match(clicked.content[0].text, /"x": 10/);
+});
+
+test("list_frames 支持 includeBox", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const withBox = await client.callTool({
+    name: "list_frames",
+    arguments: { includeBox: true },
+  });
+  assert.match(withBox.content[0].text, /"width"/);
+  const noBox = await client.callTool({
+    name: "list_frames",
+    arguments: { includeBox: false },
+  });
+  assert.doesNotMatch(noBox.content[0].text, /"width"/);
 });
 
 test("显式配置后注册危险工具", async (context) => {

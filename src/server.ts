@@ -142,10 +142,12 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "list_frames",
     {
       description:
-        "列出当前页面的 frame/iframe，包含 URL 与（可得时）在页面上的 bounding box，便于定位跨域嵌入控件。",
-      inputSchema: {},
+        "列出当前页面的 frame/iframe，包含 URL；默认附带 bounding box。includeBox=false 可只返回 URL/name（更快）。",
+      inputSchema: {
+        includeBox: z.boolean().default(true),
+      },
     },
-    async () => text(await browser.listFrames()),
+    async ({ includeBox }) => text(await browser.listFrames({ includeBox })),
   );
 
   server.registerTool(

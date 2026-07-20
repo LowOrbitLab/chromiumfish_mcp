@@ -15,6 +15,7 @@ import {
   classifyChallenge,
   inferWidgetState,
   isCloudflareFrameUrl,
+  isVerifyingPhase,
   looksCleared,
   snippet,
   warmUpPath,
@@ -77,7 +78,7 @@ export interface BrowserApi {
   screenshot(fullPage: boolean): Promise<Buffer>;
   click(target: string): Promise<void>;
   mouseClick(x: number, y: number): Promise<MouseClickResult>;
-  listFrames(): Promise<FrameSummary[]>;
+  listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   detectChallenge(): Promise<ChallengeDetection>;
   solveTurnstile(options?: { timeoutMs?: number; maxClicks?: number }): Promise<SolveTurnstileResult>;
   typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void>;
@@ -145,6 +146,8 @@ export class ChromiumFishBrowser implements BrowserApi {
   private nextPageId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
+  /** Prevent concurrent solve_turnstile runs from fighting over the same mouse. */
+  private solveInFlight = false;
 
   constructor(private readonly config: ServerConfig) {}
 
@@ -380,41 +383,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return handle as InteractiveHandle;
   }
 
-  private async moveTo(page: Page, handle: InteractiveHandle): Promise<void> {
-    await handle.scrollIntoViewIfNeeded();
-    const box = await handle.boundingBox();
-    if (!box) throw new Error("目标当前不可点击");
-    const destination = {
-      x: box.x + box.width * (0.35 + Math.random() * 0.3),
-      y: box.y + box.height * (0.35 + Math.random() * 0.3),
-    };
-    const start = this.mousePositions.get(page) ?? { x: 0, y: 0 };
-    const control = {
-      x: (start.x + destination.x) / 2 + (Math.random() - 0.5) * 80,
-      y: (start.y + destination.y) / 2 + (Math.random() - 0.5) * 80,
-    };
-    const steps = 12;
-    for (let index = 1; index <= steps; index += 1) {
-      const t = index / steps;
-      const inverse = 1 - t;
-      await page.mouse.move(
-        inverse * inverse * start.x + 2 * inverse * t * control.x + t * t * destination.x,
-        inverse * inverse * start.y + 2 * inverse * t * control.y + t * t * destination.y,
-      );
-    }
-    this.mousePositions.set(page, destination);
-  }
-
-  async click(target: string): Promise<void> {
-    const page = await this.page();
-    const handle = await this.resolveTarget(page, target);
-    await this.moveTo(page, handle);
-    await page.mouse.down();
-    await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
-    await page.mouse.up();
-  }
-
-  private async moveMouseTo(page: Page, x: number, y: number, steps = 12): Promise<void> {
+  private async moveMouse(page: Page, x: number, y: number, steps = 12): Promise<void> {
     const start = this.mousePositions.get(page) ?? { x: 0, y: 0 };
     const control = {
       x: (start.x + x) / 2 + (Math.random() - 0.5) * 80,
@@ -432,6 +401,26 @@ export class ChromiumFishBrowser implements BrowserApi {
     this.mousePositions.set(page, { x, y });
   }
 
+  private async moveTo(page: Page, handle: InteractiveHandle): Promise<void> {
+    await handle.scrollIntoViewIfNeeded();
+    const box = await handle.boundingBox();
+    if (!box) throw new Error("目标当前不可点击");
+    const destination = {
+      x: box.x + box.width * (0.35 + Math.random() * 0.3),
+      y: box.y + box.height * (0.35 + Math.random() * 0.3),
+    };
+    await this.moveMouse(page, destination.x, destination.y, 12);
+  }
+
+  async click(target: string): Promise<void> {
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target);
+    await this.moveTo(page, handle);
+    await page.mouse.down();
+    await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
+    await page.mouse.up();
+  }
+
   async mouseClick(x: number, y: number): Promise<MouseClickResult> {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       throw new Error("mouse_click 需要有限数值坐标 x/y");
@@ -445,7 +434,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         );
       }
     }
-    await this.moveMouseTo(page, x, y, 14);
+    await this.moveMouse(page, x, y, 14);
     await page.waitForTimeout(40 + Math.floor(Math.random() * 90));
     await page.mouse.down();
     await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
@@ -458,9 +447,14 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
   }
 
-  private async frameBox(frame: Frame): Promise<WidgetBox | undefined> {
+  private async frameBox(
+    frame: Frame,
+    options: { scroll?: boolean } = {},
+  ): Promise<WidgetBox | undefined> {
     try {
-      await frame.locator("body").scrollIntoViewIfNeeded({ timeout: 800 }).catch(() => undefined);
+      if (options.scroll) {
+        await frame.locator("body").scrollIntoViewIfNeeded({ timeout: 800 }).catch(() => undefined);
+      }
       const box = await frame.locator("body").boundingBox({ timeout: 1200 });
       if (!box || box.width <= 0 || box.height <= 0) return undefined;
       return {
@@ -475,18 +469,18 @@ export class ChromiumFishBrowser implements BrowserApi {
     }
   }
 
-  async listFrames(): Promise<FrameSummary[]> {
+  async listFrames(options: { includeBox?: boolean } = {}): Promise<FrameSummary[]> {
+    const includeBox = options.includeBox !== false;
     const page = await this.page();
     const frames = page.frames();
-    const boxes = await Promise.all(frames.map(async (frame) => {
-      // Skip expensive box lookup for empty about:blank children when many exist.
-      if (frame === page.mainFrame()) {
-        const box = await this.frameBox(frame);
-        return { frame, box };
-      }
-      const box = await this.frameBox(frame);
-      return { frame, box };
-    }));
+    if (!includeBox) {
+      return frames.map((frame) => ({ url: frame.url(), name: frame.name() }));
+    }
+    // Bounding boxes only — do not scroll frames during listing (avoids layout thrash).
+    const boxes = await Promise.all(frames.map(async (frame) => ({
+      frame,
+      box: await this.frameBox(frame, { scroll: false }),
+    })));
     return boxes.map(({ frame, box }) => ({
       url: frame.url(),
       name: frame.name(),
@@ -548,7 +542,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     ];
     let fallback: WidgetBox | undefined;
     for (const frame of ordered) {
-      const box = await this.frameBox(frame);
+      const box = await this.frameBox(frame, { scroll: false });
       if (!box) continue;
       // Interactive Turnstile widget is typically ~300x65; ignore full-page frames.
       if (box.width >= 200 && box.width <= 420 && box.height >= 50 && box.height <= 120) {
@@ -575,14 +569,12 @@ export class ChromiumFishBrowser implements BrowserApi {
     // Scroll the challenge frame body into view, then re-measure.
     for (const frame of page.frames()) {
       if (frame.url() !== widget.frameUrl && !isCloudflareFrameUrl(frame.url())) continue;
-      await frame.locator("body").scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
+      await this.frameBox(frame, { scroll: true });
     }
     // Also nudge main page scroll toward widget center.
     await page.evaluate(({ x, y }) => {
-      const cx = x;
-      const cy = y;
-      const targetY = window.scrollY + cy - window.innerHeight / 2;
-      window.scrollTo({ top: Math.max(0, targetY), left: 0, behavior: "instant" as ScrollBehavior });
+      const targetY = window.scrollY + y - window.innerHeight / 2;
+      window.scrollTo(0, Math.max(0, targetY));
     }, { x: widget.x + widget.width / 2, y: widget.y + widget.height / 2 }).catch(() => undefined);
 
     await page.waitForTimeout(120);
@@ -651,11 +643,46 @@ export class ChromiumFishBrowser implements BrowserApi {
   }
 
   async solveTurnstile(options: { timeoutMs?: number; maxClicks?: number } = {}): Promise<SolveTurnstileResult> {
+    if (this.solveInFlight) {
+      const page = await this.page();
+      const title = await page.title().catch(() => "");
+      const url = page.url();
+      const bodySnippet = snippet(await page.locator("body").innerText().catch(() => ""));
+      return {
+        ok: false,
+        method: "busy",
+        attempts: 0,
+        elapsedMs: 0,
+        title,
+        url,
+        bodySnippet,
+        widgetState: "unknown",
+        tokenPresent: false,
+        clicks: [],
+        reason: "busy",
+        error: "solve_turnstile 已在执行中，请等待当前调用结束",
+      };
+    }
+
+    this.solveInFlight = true;
+    try {
+      return await this.solveTurnstileLocked(options);
+    } finally {
+      this.solveInFlight = false;
+    }
+  }
+
+  private async solveTurnstileLocked(
+    options: { timeoutMs?: number; maxClicks?: number } = {},
+  ): Promise<SolveTurnstileResult> {
     const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 45_000, 3_000), 180_000);
     const maxClicks = Math.min(Math.max(options.maxClicks ?? 12, 1), 30);
     const started = Date.now();
     const clicks: Array<{ x: number; y: number }> = [];
     const page = await this.page();
+    /** How many times we entered verifying and exited still uncleared. */
+    let stuckVerifyingRounds = 0;
+    const maxStuckVerifyingRounds = 2;
 
     const finish = async (
       partial: Omit<SolveTurnstileResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"> & {
@@ -664,19 +691,77 @@ export class ChromiumFishBrowser implements BrowserApi {
       },
     ): Promise<SolveTurnstileResult> => {
       const observed = await this.observeChallenge(page);
-      const title = observed.detection.title;
-      const url = observed.detection.url;
-      const bodySnippet = observed.detection.bodySnippet;
       return {
         ...partial,
         elapsedMs: Date.now() - started,
-        title,
-        url,
-        bodySnippet,
+        title: observed.detection.title,
+        url: observed.detection.url,
+        bodySnippet: observed.detection.bodySnippet,
         widgetState: partial.widgetState ?? observed.widgetState,
         tokenPresent: partial.tokenPresent ?? observed.tokenPresent,
         widget: partial.widget ?? observed.detection.widget,
       };
+    };
+
+    const clearanceInput = (
+      observed: Awaited<ReturnType<ChromiumFishBrowser["observeChallenge"]>>,
+      bodyText: string,
+      kind: ChallengeKind,
+    ) => ({
+      title: observed.detection.title,
+      url: observed.detection.url,
+      bodyText,
+      hadChallenge: true as const,
+      kind,
+      tokenPresent: observed.tokenPresent,
+      widgetState: observed.widgetState,
+      hasChallengeFrame: observed.hasChallengeFrame,
+    });
+
+    /** Poll without clicking. Returns cleared | still_verifying | ready_for_click. */
+    const waitWithoutClicking = async (
+      kind: ChallengeKind,
+      budgetMs: number,
+    ): Promise<"cleared" | "still_verifying" | "ready_for_click"> => {
+      const deadline = Math.min(Date.now() + budgetMs, started + timeoutMs);
+      let sawVerifying = false;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(450);
+        const observed = await this.observeChallenge(page);
+        const bodyText = await page.locator("body").innerText().catch(() => "");
+        if (looksCleared(clearanceInput(observed, bodyText, kind))) {
+          // Confirm briefly.
+          await page.waitForTimeout(500);
+          const confirmed = await this.observeChallenge(page);
+          const confirmedBody = await page.locator("body").innerText().catch(() => "");
+          if (looksCleared(clearanceInput(confirmed, confirmedBody, kind))) {
+            return "cleared";
+          }
+        }
+        if (isVerifyingPhase({
+          widgetState: observed.widgetState,
+          bodyText,
+          title: observed.detection.title,
+        })) {
+          sawVerifying = true;
+          continue;
+        }
+        // Not verifying and not cleared → another click may help.
+        if (sawVerifying) return "ready_for_click";
+        // Never entered verifying in this wait window.
+        if (Date.now() >= deadline) break;
+      }
+      const end = await this.observeChallenge(page);
+      const endBody = await page.locator("body").innerText().catch(() => "");
+      if (looksCleared(clearanceInput(end, endBody, kind))) return "cleared";
+      if (isVerifyingPhase({
+        widgetState: end.widgetState,
+        bodyText: endBody,
+        title: end.detection.title,
+      })) {
+        return "still_verifying";
+      }
+      return sawVerifying ? "still_verifying" : "ready_for_click";
     };
 
     let observed = await this.observeChallenge(page);
@@ -726,6 +811,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         method: "not_found",
         attempts: 0,
         clicks,
+        reason: "not_found",
         error: "未找到跨域 challenge 控件区域",
       });
     }
@@ -739,13 +825,52 @@ export class ChromiumFishBrowser implements BrowserApi {
       if (viewport && (point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height)) {
         continue;
       }
-      await this.moveMouseTo(page, point.x, point.y, 8 + Math.floor(Math.random() * 6));
+      await this.moveMouse(page, point.x, point.y, 8 + Math.floor(Math.random() * 6));
       await page.waitForTimeout(60 + Math.floor(Math.random() * 120));
     }
 
     let attempts = 0;
 
     while (Date.now() - started < timeoutMs && attempts < maxClicks) {
+      // If already verifying, do NOT click — only wait.
+      observed = await this.observeChallenge(page);
+      let bodyText = await page.locator("body").innerText().catch(() => "");
+      if (isVerifyingPhase({
+        widgetState: observed.widgetState,
+        bodyText,
+        title: observed.detection.title,
+      })) {
+        const waitResult = await waitWithoutClicking(kind, 15_000);
+        if (waitResult === "cleared") {
+          observed = await this.observeChallenge(page);
+          return finish({
+            ok: true,
+            method: "click",
+            attempts,
+            clicks,
+            widget,
+            widgetState: observed.widgetState,
+            tokenPresent: observed.tokenPresent,
+          });
+        }
+        if (waitResult === "still_verifying") {
+          stuckVerifyingRounds += 1;
+          if (stuckVerifyingRounds >= maxStuckVerifyingRounds) {
+            return finish({
+              ok: false,
+              method: "timeout",
+              attempts,
+              clicks,
+              widget,
+              reason: "stuck_verifying",
+              error: "页面停留在 Verifying 状态过久，已停止继续点击",
+            });
+          }
+          // One more careful click after a stuck verify round.
+        }
+        // ready_for_click → fall through to click
+      }
+
       widget = await this.ensureWidgetInViewport(
         page,
         (await this.findTurnstileWidget(page)) ?? widget,
@@ -759,88 +884,37 @@ export class ChromiumFishBrowser implements BrowserApi {
       const y = target.y + (Math.random() - 0.5) * 3;
       attempts += 1;
       clicks.push({ x, y });
-      await this.moveMouseTo(page, x, y, 16);
+      await this.moveMouse(page, x, y, 16);
       await page.waitForTimeout(100 + Math.floor(Math.random() * 180));
       await page.mouse.down();
       await page.waitForTimeout(50 + Math.floor(Math.random() * 80));
       await page.mouse.up();
 
-      const deadline = Math.min(Date.now() + 5_500, started + timeoutMs);
-      while (Date.now() < deadline) {
-        await page.waitForTimeout(400);
+      // After each click: long no-click wait (verifying-aware).
+      const waitResult = await waitWithoutClicking(kind, 14_000);
+      if (waitResult === "cleared") {
         observed = await this.observeChallenge(page);
-        const bodyText = await page.locator("body").innerText().catch(() => "");
-        // After a click, CF often enters a "Verifying…" phase — wait it out without extra clicks.
-        if (
-          observed.widgetState === "verifying"
-          || /verifying you are human|this may take a few seconds/i.test(bodyText)
-        ) {
-          const verifyDeadline = Math.min(Date.now() + 12_000, started + timeoutMs);
-          while (Date.now() < verifyDeadline) {
-            await page.waitForTimeout(500);
-            observed = await this.observeChallenge(page);
-            const verifyBody = await page.locator("body").innerText().catch(() => "");
-            if (looksCleared({
-              title: observed.detection.title,
-              url: observed.detection.url,
-              bodyText: verifyBody,
-              hadChallenge: true,
-              kind,
-              tokenPresent: observed.tokenPresent,
-              widgetState: observed.widgetState,
-              hasChallengeFrame: observed.hasChallengeFrame,
-            })) {
-              return finish({
-                ok: true,
-                method: "click",
-                attempts,
-                clicks,
-                widget,
-                widgetState: observed.widgetState,
-                tokenPresent: observed.tokenPresent,
-              });
-            }
-            // Left verifying but still gated — break to allow another click.
-            if (
-              observed.widgetState !== "verifying"
-              && !/verifying you are human|this may take a few seconds/i.test(verifyBody)
-            ) {
-              break;
-            }
-          }
-        }
-        const state = {
-          title: observed.detection.title,
-          url: observed.detection.url,
-          bodyText,
-          hadChallenge: true,
-          kind,
-          tokenPresent: observed.tokenPresent,
+        return finish({
+          ok: true,
+          method: "click",
+          attempts,
+          clicks,
+          widget,
           widgetState: observed.widgetState,
-          hasChallengeFrame: observed.hasChallengeFrame,
-        };
-        if (!looksCleared(state)) continue;
-        await page.waitForTimeout(600);
-        observed = await this.observeChallenge(page);
-        const confirmed = {
-          title: observed.detection.title,
-          url: observed.detection.url,
-          bodyText: await page.locator("body").innerText().catch(() => ""),
-          hadChallenge: true,
-          kind,
           tokenPresent: observed.tokenPresent,
-          widgetState: observed.widgetState,
-          hasChallengeFrame: observed.hasChallengeFrame,
-        };
-        if (looksCleared(confirmed)) {
+        });
+      }
+      if (waitResult === "still_verifying") {
+        stuckVerifyingRounds += 1;
+        if (stuckVerifyingRounds >= maxStuckVerifyingRounds) {
           return finish({
-            ok: true,
-            method: "click",
+            ok: false,
+            method: "timeout",
             attempts,
             clicks,
             widget,
-            widgetState: observed.widgetState,
-            tokenPresent: observed.tokenPresent,
+            reason: "stuck_verifying",
+            error: "点击后页面停留在 Verifying 状态过久，已停止继续点击",
           });
         }
       }
@@ -848,25 +922,35 @@ export class ChromiumFishBrowser implements BrowserApi {
 
     observed = await this.observeChallenge(page);
     const bodyText = await page.locator("body").innerText().catch(() => "");
-    const cleared = looksCleared({
-      title: observed.detection.title,
-      url: observed.detection.url,
-      bodyText,
-      hadChallenge: true,
-      kind,
-      tokenPresent: observed.tokenPresent,
+    const cleared = looksCleared(clearanceInput(observed, bodyText, kind));
+    if (cleared) {
+      return finish({
+        ok: true,
+        method: "click",
+        attempts,
+        clicks,
+        widget,
+        widgetState: observed.widgetState,
+        tokenPresent: observed.tokenPresent,
+      });
+    }
+    const stuck = isVerifyingPhase({
       widgetState: observed.widgetState,
-      hasChallengeFrame: observed.hasChallengeFrame,
+      bodyText,
+      title: observed.detection.title,
     });
     return finish({
-      ok: cleared,
-      method: cleared ? "click" : "timeout",
+      ok: false,
+      method: "timeout",
       attempts,
       clicks,
       widget,
       widgetState: observed.widgetState,
       tokenPresent: observed.tokenPresent,
-      ...(cleared ? {} : { error: "在超时时间内未能确认 challenge 已清除" }),
+      reason: stuck ? "stuck_verifying" : "timeout",
+      error: stuck
+        ? "页面停留在 Verifying 状态过久，已停止继续点击"
+        : "在超时时间内未能确认 challenge 已清除",
     });
   }
 

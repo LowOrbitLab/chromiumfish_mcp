@@ -5,6 +5,7 @@ import {
   classifyChallenge,
   inferWidgetState,
   isCloudflareFrameUrl,
+  isVerifyingPhase,
   looksCleared,
   snippet,
   warmUpPath,
@@ -193,6 +194,12 @@ test("looksCleared for managed interstitial still uses page navigation signals",
     }),
     true,
   );
+});
+
+test("isVerifyingPhase detects verifying copy", () => {
+  assert.equal(isVerifyingPhase({ bodyText: "Verifying you are human. This may take a few seconds." }), true);
+  assert.equal(isVerifyingPhase({ widgetState: "verifying" }), true);
+  assert.equal(isVerifyingPhase({ bodyText: "Welcome to the app" }), false);
 });
 
 test("snippet trims whitespace and length", () => {

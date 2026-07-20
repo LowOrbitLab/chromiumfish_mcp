@@ -29,7 +29,7 @@ export interface ChallengeDetection {
 
 export interface SolveTurnstileResult {
   ok: boolean;
-  method: "already_clear" | "click" | "not_found" | "timeout";
+  method: "already_clear" | "click" | "not_found" | "timeout" | "busy";
   attempts: number;
   elapsedMs: number;
   title: string;
@@ -39,6 +39,8 @@ export interface SolveTurnstileResult {
   tokenPresent: boolean;
   widget?: WidgetBox;
   clicks: Array<{ x: number; y: number }>;
+  /** Machine-readable failure detail when ok is false. */
+  reason?: "not_found" | "stuck_verifying" | "timeout" | "busy";
   error?: string;
 }
 
@@ -47,6 +49,9 @@ const CF_CHALLENGE_HOST_RE = /challenges\.cloudflare\.com/i;
 const INTERSTITIAL_TITLE_RE = /just a moment|checking your browser|performing security verification/i;
 const INTERSTITIAL_BODY_RE =
   /verify(?:ing)? you are human|performing security verification|checking your browser before accessing|needs to review the security|this may take a few seconds/i;
+/** Post-click verifying copy on managed interstitials. */
+export const VERIFYING_BODY_RE =
+  /verifying you are human|this may take a few seconds|checking your browser/i;
 /** Strong success markers on destination pages (not marketing copy alone). */
 const STRONG_SUCCESS_BODY_RE = /captcha is passed successfully|verification successful/i;
 
@@ -136,6 +141,20 @@ export function warmUpPath(box: {
   ];
 }
 
+export function isVerifyingPhase(input: {
+  widgetState?: WidgetState;
+  bodyText?: string;
+  title?: string;
+}): boolean {
+  if (input.widgetState === "verifying") return true;
+  if (input.bodyText && VERIFYING_BODY_RE.test(input.bodyText)) return true;
+  if (input.title && /checking your browser|just a moment/i.test(input.title)
+    && input.bodyText && /verifying|few seconds/i.test(input.bodyText)) {
+    return true;
+  }
+  return false;
+}
+
 export function inferWidgetState(input: {
   tokenPresent: boolean;
   hasChallengeFrame: boolean;
@@ -144,7 +163,11 @@ export function inferWidgetState(input: {
   mainBodyText?: string;
 }): WidgetState {
   if (input.tokenPresent) return "success";
-  if (!input.hasChallengeFrame) return "absent";
+  if (!input.hasChallengeFrame) {
+    // Managed interstitial may drop the frame while still verifying on the main document.
+    if (input.mainBodyText && VERIFYING_BODY_RE.test(input.mainBodyText)) return "verifying";
+    return "absent";
+  }
 
   const frame = (input.frameText ?? "").toLowerCase();
   if (/success/.test(frame)) return "success";
@@ -152,6 +175,7 @@ export function inferWidgetState(input: {
   if (/verify you are human|verify/.test(frame)) return "checkbox";
 
   // Frame present but opaque (closed shadow / empty accessible text).
+  if (input.mainBodyText && VERIFYING_BODY_RE.test(input.mainBodyText)) return "verifying";
   return "unknown";
 }
 
