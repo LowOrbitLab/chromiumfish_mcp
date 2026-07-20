@@ -1,0 +1,13 @@
+chromiumfish_mcp
+Copyright (c) 2026 LowOrbitLab
+
+This project is an independent MCP wrapper for ChromiumFish and includes or
+adapts concepts from ChromiumFish:
+
+  https://github.com/arman-bd/chromiumfish
+  Copyright (c) 2026 Arman Hossain
+  Licensed under the MIT License.
+
+ChromiumFish distributes builds of the Chromium project, which is licensed
+under the BSD 3-Clause License and includes third-party components under their
+respective licenses. ChromiumFish is independent from Google LLC.
