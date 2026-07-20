@@ -11,6 +11,7 @@ This project uses the official ChromiumFish npm package. It does not include Chr
 - Multi-page management: create, select, list, and close pages.
 - Snapshot references such as `e1` and `e2` for reliable interaction with the current page state.
 - Navigation, text extraction, screenshots, clicking, typing, key presses, scrolling, and waits.
+- Coordinate clicks, frame listing, and helpers for interacting with cross-origin framed widgets that `snapshot` cannot see.
 - ChromiumFish persona seeds, proxies, window sizes, browser versions, and time zones.
 - `eval_js` and the native browser agent are disabled by default and require explicit opt-in.
 - Optional navigation host allowlists and text output limits.
@@ -86,8 +87,23 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 - `snapshot`: list visible interactive elements and create temporary references.
 - `get_text`, `screenshot`: retrieve page content.
 - `click`, `type_text`, `press_key`, `scroll`, `wait_for`: interact with the page.
+- `mouse_click`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
+- `list_frames`: list frames/iframes with URLs and bounding boxes when available.
+- `detect_challenge`: detect common interstitial / framed-challenge page states for text-only agents.
+- `solve_turnstile`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until the interstitial clears.
 - `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
+
+### Cross-origin framed widgets
+
+Some embedded controls live in cross-origin iframes and never appear in `snapshot`. For those cases:
+
+1. `navigate` to the target URL
+2. `detect_challenge` — inspect `present`, `kind`, and `widget`
+3. `solve_turnstile` — automatic clicks near the widget checkbox region + clearance polling
+4. Or `list_frames` + `mouse_click` for manual coordinate control
+
+`solve_turnstile` returns JSON with `ok`, `method`, `attempts`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Results depend on page structure and environment.
 
 A `snapshot` call returns output similar to this:
 

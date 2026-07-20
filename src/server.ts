@@ -126,6 +126,52 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
+    "mouse_click",
+    {
+      description:
+        "按页面坐标点击（CSS 像素，原点在视口左上角）。适用于 snapshot 无法枚举的跨域 iframe 内控件。",
+      inputSchema: {
+        x: z.number().finite(),
+        y: z.number().finite(),
+      },
+    },
+    async ({ x, y }) => text(await browser.mouseClick(x, y)),
+  );
+
+  server.registerTool(
+    "list_frames",
+    {
+      description:
+        "列出当前页面的 frame/iframe，包含 URL 与（可得时）在页面上的 bounding box，便于定位跨域嵌入控件。",
+      inputSchema: {},
+    },
+    async () => text(await browser.listFrames()),
+  );
+
+  server.registerTool(
+    "detect_challenge",
+    {
+      description:
+        "检测当前页是否出现常见的浏览器 interstitial / 跨域 challenge 嵌入控件。返回 kind、widget 坐标框与相关 frame，便于文本代理决定下一步交互。",
+      inputSchema: {},
+    },
+    async () => text(await browser.detectChallenge()),
+  );
+
+  server.registerTool(
+    "solve_turnstile",
+    {
+      description:
+        "对跨域 challenge frame 内的标准 checkbox 控件做拟人坐标点击，并轮询页面是否离开 interstitial。不依赖视觉模型。结果以 JSON 的 ok 字段为准。",
+      inputSchema: {
+        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+        maxClicks: z.number().int().min(1).max(30).default(12),
+      },
+    },
+    async ({ timeoutMs, maxClicks }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks })),
+  );
+
+  server.registerTool(
     "type_text",
     {
       description: "聚焦元素后输入文本，可先清空原值并在输入后按 Enter。",
