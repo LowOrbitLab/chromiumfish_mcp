@@ -160,37 +160,17 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async () => text(await browser.detectChallenge()),
   );
 
-  const clickChallengeInput = {
-    timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
-    maxClicks: z.number().int().min(1).max(30).default(6),
-  };
-  const clickChallengeHandler = async ({
-    timeoutMs,
-    maxClicks,
-  }: {
-    timeoutMs: number;
-    maxClicks: number;
-  }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks }));
-
   server.registerTool(
     "click_challenge",
     {
       description:
         "Performs a human-like coordinate click on the standard checkbox widget inside a cross-origin challenge frame, then polls until clearance is confirmed (response token / widget success state / interstitial left). Needs no vision model. The JSON ok field is authoritative.",
-      inputSchema: clickChallengeInput,
+      inputSchema: {
+        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+        maxClicks: z.number().int().min(1).max(30).default(6),
+      },
     },
-    clickChallengeHandler,
-  );
-
-  // Backward-compatible alias (same handler). Prefer click_challenge in new integrations.
-  server.registerTool(
-    "solve_turnstile",
-    {
-      description:
-        "Alias of click_challenge (kept for the old name). Clicks the cross-origin challenge checkbox by coordinates and confirms clearance. New integrations should prefer click_challenge.",
-      inputSchema: clickChallengeInput,
-    },
-    clickChallengeHandler,
+    async ({ timeoutMs, maxClicks }) => text(await browser.clickChallenge({ timeoutMs, maxClicks })),
   );
 
   server.registerTool(

@@ -22,12 +22,12 @@ import {
   warmUpPath,
   type ChallengeDetection,
   type ChallengeKind,
-  type SolveTurnstileResult,
+  type ClickChallengeResult,
   type WidgetBox,
   type WidgetState,
 } from "./turnstile.js";
 
-export type { ChallengeDetection, ChallengeKind, SolveTurnstileResult, WidgetBox, WidgetState };
+export type { ChallengeDetection, ChallengeKind, ClickChallengeResult, WidgetBox, WidgetState };
 
 export interface PageSummary {
   id: string;
@@ -81,7 +81,7 @@ export interface BrowserApi {
   mouseClick(x: number, y: number): Promise<MouseClickResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   detectChallenge(): Promise<ChallengeDetection>;
-  solveTurnstile(options?: { timeoutMs?: number; maxClicks?: number }): Promise<SolveTurnstileResult>;
+  clickChallenge(options?: { timeoutMs?: number; maxClicks?: number }): Promise<ClickChallengeResult>;
   typeText(target: string, text: string, clear: boolean, submit: boolean): Promise<void>;
   pressKey(key: string): Promise<void>;
   scroll(deltaX: number, deltaY: number): Promise<void>;
@@ -147,8 +147,8 @@ export class ChromiumFishBrowser implements BrowserApi {
   private nextPageId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
-  /** Prevent concurrent click_challenge / solve_turnstile runs from fighting over the same mouse. */
-  private solveInFlight = false;
+  /** Prevent concurrent click_challenge runs from fighting over the same mouse. */
+  private clickChallengeInFlight = false;
 
   constructor(private readonly config: ServerConfig) {}
 
@@ -629,8 +629,8 @@ export class ChromiumFishBrowser implements BrowserApi {
     return (await this.observeChallenge(page)).detection;
   }
 
-  async solveTurnstile(options: { timeoutMs?: number; maxClicks?: number } = {}): Promise<SolveTurnstileResult> {
-    if (this.solveInFlight) {
+  async clickChallenge(options: { timeoutMs?: number; maxClicks?: number } = {}): Promise<ClickChallengeResult> {
+    if (this.clickChallengeInFlight) {
       const page = await this.page();
       const title = await page.title().catch(() => "");
       const url = page.url();
@@ -651,17 +651,17 @@ export class ChromiumFishBrowser implements BrowserApi {
       };
     }
 
-    this.solveInFlight = true;
+    this.clickChallengeInFlight = true;
     try {
-      return await this.solveTurnstileLocked(options);
+      return await this.clickChallengeLocked(options);
     } finally {
-      this.solveInFlight = false;
+      this.clickChallengeInFlight = false;
     }
   }
 
-  private async solveTurnstileLocked(
+  private async clickChallengeLocked(
     options: { timeoutMs?: number; maxClicks?: number } = {},
-  ): Promise<SolveTurnstileResult> {
+  ): Promise<ClickChallengeResult> {
     const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 45_000, 3_000), 180_000);
     const maxClicks = Math.min(Math.max(options.maxClicks ?? 12, 1), 30);
     const started = Date.now();
@@ -672,11 +672,11 @@ export class ChromiumFishBrowser implements BrowserApi {
     const maxStuckVerifyingRounds = 2;
 
     const finish = async (
-      partial: Omit<SolveTurnstileResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"> & {
+      partial: Omit<ClickChallengeResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"> & {
         widgetState?: WidgetState;
         tokenPresent?: boolean;
       },
-    ): Promise<SolveTurnstileResult> => {
+    ): Promise<ClickChallengeResult> => {
       const observed = await this.observeChallenge(page);
       return {
         ...partial,

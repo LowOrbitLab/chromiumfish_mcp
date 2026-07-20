@@ -91,7 +91,6 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 - `list_frames`: list frames/iframes with URLs; bounding boxes included by default (`includeBox: false` for a faster URL-only listing).
 - `detect_challenge`: detect common interstitial / framed-challenge page states for text-only agents (`present`, `kind`, `widgetState`, `tokenPresent`, `widget`).
 - `click_challenge`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
-- `solve_turnstile`: **alias of `click_challenge`** (kept for compatibility).
 - `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
