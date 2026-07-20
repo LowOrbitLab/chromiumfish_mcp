@@ -13,7 +13,7 @@ This project uses the official ChromiumFish npm package. It does not include Chr
 - Navigation, text extraction, screenshots, clicking, typing, key presses, scrolling, and waits.
 - Coordinate clicks, frame listing, and helpers for interacting with cross-origin framed widgets that `snapshot` cannot see.
 - ChromiumFish persona seeds, proxies, window sizes, browser versions, and time zones.
-- `eval_js` and the native browser agent are disabled by default and require explicit opt-in.
+- `evaluate` and the native browser agent are disabled by default and require explicit opt-in.
 - Optional navigation host allowlists and text output limits.
 
 ## Requirements
@@ -82,16 +82,16 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 ## Tools
 
 - `list_pages`: report lazy startup state and list open pages without starting the browser.
-- `new_page`, `select_page`, `close_page`: manage browser pages using stable `pageId` values.
-- `navigate`, `go_back`, `go_forward`, `reload`: navigate and use page history.
+- `open_page`, `select_page`, `close_page`: manage browser pages using stable `pageId` values.
+- `navigate`, `navigate_back`, `navigate_forward`, `reload`: navigate and use page history.
 - `snapshot`: list visible interactive elements, form state, and temporary references in the main document or a frame.
-- `get_text`, `screenshot`: retrieve page or frame content.
+- `get_text`, `take_screenshot`: retrieve page or frame content.
 - `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for`: interact with the page.
-- `mouse_click`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
+- `click_at`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
 - `list_frames`: list frames/iframes with stable IDs, parent relationships, URLs, and optional bounding boxes.
 - `find_challenge`: detect common interstitial / framed-challenge page states for text-only agents (`present`, `kind`, `widgetState`, `tokenPresent`, `widget`).
-- `click_challenge`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
-- `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
+- `solve_challenge`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / widget state / interstitial exit). Concurrent calls return `method: "busy"`.
+- `evaluate`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
 ### Frames and form controls
@@ -102,7 +102,7 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 
 `get_text` reads the first matching `selector` in a page or frame. It returns at most 20,000 characters by default, bounded by both the per-call `maxChars` value and the server's `--max-text-chars` setting.
 
-`screenshot` rejects captures larger than 25 million pixels or 20,000 pixels on either axis. Reduce `--window-size` or use a viewport capture when a full-page image exceeds that budget.
+`take_screenshot` rejects captures larger than 25 million pixels or 20,000 pixels on either axis. Reduce `--window-size` or use a viewport capture when a full-page image exceeds that budget.
 
 `wait_for` accepts a typed `condition` object. Supported kinds are `element`, `text`, `url`, `load`, and `time`. Element and text states default to `visible`; URL values support Playwright glob patterns such as `**/dashboard`.
 
@@ -119,10 +119,10 @@ Ordinary frames can be inspected by `frameId`, including cross-origin applicatio
 
 1. `navigate` to the target URL
 2. `find_challenge` -- inspect `present`, `kind`, and `widget`
-3. `click_challenge` -- automatic clicks near the widget checkbox region + clearance polling
-4. Or `list_frames` + `mouse_click` for manual coordinate control
+3. `solve_challenge` -- automatic clicks near the widget checkbox region + clearance polling
+4. Or `list_frames` + `click_at` for manual coordinate control
 
-`click_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
+`solve_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
 
 Do **not** read challenge-frame document text or probe `cf-turnstile-response` / `cf-chl-widget*` inputs while still on the gate page; that can collapse interactive clearance rates.
 
@@ -171,7 +171,7 @@ Then start the server with `--allow-native-agent`. This mode forwards the creden
 ## Security Boundaries
 
 - The server supports stdio only. Do not expose the Chromium DevTools endpoint to the public internet.
-- `eval_js` is disabled by default because it can read or modify any data available to the page.
+- `evaluate` is disabled by default because it can read or modify any data available to the page.
 - Use `--allowed-host example.com` to restrict top-level HTTP/HTTPS navigation to a host and its subdomains. This covers redirects, link clicks, form submissions, and popups; third-party subframes and page assets remain available.
 - MCP clients can click and type, which may cause external side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
 - Each MCP process maintains an independent browser context. This server is not designed as a shared multi-tenant service.

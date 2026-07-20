@@ -74,7 +74,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "new_page",
+    "open_page",
     {
       description: "Create and select a new page, optionally opening an HTTP/HTTPS URL.",
       inputSchema: { url: z.string().url().optional() },
@@ -114,7 +114,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "go_back",
+    "navigate_back",
     {
       description: "Navigate the current page to its previous history entry.",
       inputSchema: {},
@@ -124,7 +124,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "go_forward",
+    "navigate_forward",
     {
       description: "Navigate the current page to its next history entry.",
       inputSchema: {},
@@ -182,7 +182,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "screenshot",
+    "take_screenshot",
     {
       description: "Capture the current viewport or the full page as a PNG image.",
       inputSchema: { fullPage: z.boolean().default(false) },
@@ -230,7 +230,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "mouse_click",
+    "click_at",
     {
       description:
         "Click page coordinates in CSS pixels from the viewport's top-left corner. Useful for controls inside cross-origin iframes that snapshot cannot enumerate.",
@@ -270,7 +270,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
-    "click_challenge",
+    "solve_challenge",
     {
       description:
         "Use human-like coordinate clicks on a standard checkbox inside a cross-origin challenge frame, then poll until clearance is confirmed by a response token, widget success state, or interstitial exit. Does not require a vision model; use the JSON ok field as the result.",
@@ -384,7 +384,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
 
   if (config.allowEval) {
     server.registerTool(
-      "eval_js",
+      "evaluate",
       {
         description: "Execute arbitrary JavaScript in the current page. This high-risk tool is registered only when --allow-eval is enabled.",
         inputSchema: { expression: z.string().min(1) },

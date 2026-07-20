@@ -205,7 +205,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   private nextFrameId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
-  /** Prevent concurrent click_challenge runs from fighting over the same mouse. */
+  /** Prevent concurrent solve_challenge runs from fighting over the same mouse. */
   private clickChallengeInFlight = false;
 
   constructor(private readonly config: ServerConfig) {}
@@ -318,7 +318,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (!frame) throw new Error(`Frame ${frameId} not found in the current page`);
     if (frameId && isCloudflareFrameUrl(frame.url())) {
       throw new Error(
-        `DOM access to challenge frame ${frameId} is disabled; use find_challenge and click_challenge`,
+        `DOM access to challenge frame ${frameId} is disabled; use find_challenge and solve_challenge`,
       );
     }
     return frame;
@@ -760,7 +760,7 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   async mouseClick(x: number, y: number): Promise<MouseClickResult> {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      throw new Error("mouse_click requires finite numeric x/y coordinates");
+      throw new Error("click_at requires finite numeric x/y coordinates");
     }
     const page = await this.page();
     const viewport = page.viewportSize();
@@ -991,7 +991,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         tokenPresent: false,
         clicks: [],
         reason: "busy",
-        error: "click_challenge is already running; wait for the current call to finish",
+        error: "solve_challenge is already running; wait for the current call to finish",
       };
     }
 
