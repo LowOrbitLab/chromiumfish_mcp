@@ -126,6 +126,74 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
+    "mouse_click",
+    {
+      description:
+        "Clicks at page coordinates (CSS pixels, origin at the viewport's top-left). Use for controls inside cross-origin iframes that snapshot cannot enumerate.",
+      inputSchema: {
+        x: z.number().finite(),
+        y: z.number().finite(),
+      },
+    },
+    async ({ x, y }) => text(await browser.mouseClick(x, y)),
+  );
+
+  server.registerTool(
+    "list_frames",
+    {
+      description:
+        "Lists the frames/iframes of the current page with their URL; includes the bounding box by default. includeBox=false returns only URL/name (faster).",
+      inputSchema: {
+        includeBox: z.boolean().default(true),
+      },
+    },
+    async ({ includeBox }) => text(await browser.listFrames({ includeBox })),
+  );
+
+  server.registerTool(
+    "detect_challenge",
+    {
+      description:
+        "Detects a common browser interstitial or cross-origin challenge widget on the current page. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
+      inputSchema: {},
+    },
+    async () => text(await browser.detectChallenge()),
+  );
+
+  const clickChallengeInput = {
+    timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
+    maxClicks: z.number().int().min(1).max(30).default(6),
+  };
+  const clickChallengeHandler = async ({
+    timeoutMs,
+    maxClicks,
+  }: {
+    timeoutMs: number;
+    maxClicks: number;
+  }) => text(await browser.solveTurnstile({ timeoutMs, maxClicks }));
+
+  server.registerTool(
+    "click_challenge",
+    {
+      description:
+        "Performs a human-like coordinate click on the standard checkbox widget inside a cross-origin challenge frame, then polls until clearance is confirmed (response token / widget success state / interstitial left). Needs no vision model. The JSON ok field is authoritative.",
+      inputSchema: clickChallengeInput,
+    },
+    clickChallengeHandler,
+  );
+
+  // Backward-compatible alias (same handler). Prefer click_challenge in new integrations.
+  server.registerTool(
+    "solve_turnstile",
+    {
+      description:
+        "Alias of click_challenge (kept for the old name). Clicks the cross-origin challenge checkbox by coordinates and confirms clearance. New integrations should prefer click_challenge.",
+      inputSchema: clickChallengeInput,
+    },
+    clickChallengeHandler,
+  );
+
+  server.registerTool(
     "type_text",
     {
       description: "Focuses an element and types text, optionally clearing the existing value first and pressing Enter afterwards.",
