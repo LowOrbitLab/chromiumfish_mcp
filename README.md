@@ -2,7 +2,7 @@
 
 `chromiumfish_mcp` is an independent Model Context Protocol (MCP) server for [ChromiumFish](https://github.com/arman-bd/chromiumfish). It lets Claude Code, Claude Desktop, Cursor, and other MCP clients control a ChromiumFish browser through structured tools.
 
-This project uses the official ChromiumFish npm package. It does not include Chromium source code or browser binaries. On the first browser tool call, the upstream SDK downloads the matching browser build and caches it by version.
+This project uses the official ChromiumFish npm package. It does not include Chromium source code or browser binaries. On the first tool call that needs an active page, the upstream SDK downloads the matching browser build and caches it by version.
 
 ## Features
 
@@ -81,8 +81,8 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 
 ## Tools
 
-- `browser_status`: report lazy startup state, page count, and the current page.
-- `list_pages`, `new_page`, `select_page`, `close_page`: manage browser pages.
+- `list_pages`: report lazy startup state and list open pages without starting the browser.
+- `new_page`, `select_page`, `close_page`: manage browser pages using stable `pageId` values.
 - `navigate`, `go_back`, `go_forward`, `reload`: navigate and use page history.
 - `snapshot`: list visible interactive elements, form state, and temporary references in the main document or a frame.
 - `get_text`, `screenshot`: retrieve page or frame content.
@@ -96,11 +96,22 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 
 ### Frames and form controls
 
-`list_frames` returns a stable `frameId` for each frame in the current page. Pass that ID to `snapshot` or `get_text` to inspect the frame. Element references created by a frame snapshot work with `click`, `hover`, `type_text`, `select_option`, `set_checked`, and `wait_for`; when using a CSS selector instead of a reference, pass the same `frameId` to the action. Refresh `list_frames` after navigation because detached child frames receive new IDs.
+`list_frames` returns a stable `frameId` for each frame in the current page. Bounding boxes are omitted by default; set `includeBox: true` only for coordinate interaction. Pass a frame ID to `snapshot` or `get_text` to inspect that frame. Element references created by a frame snapshot work with `click`, `hover`, `type_text`, `select_option`, `set_checked`, and `wait_for`; when using a CSS selector instead of a reference, pass the same `frameId` to the action. Refresh `list_frames` after navigation because detached child frames receive new IDs.
 
-`snapshot` reports relevant state such as input type and value, checked/unchecked, selected values, up to 20 dropdown options, expanded/collapsed, and disabled. Password values are never returned. Use `select_option` with `matchBy: "value"` or `matchBy: "label"`, and use `set_checked` instead of toggling a checkbox blindly.
+`snapshot` reports relevant state such as input type and value, checked/unchecked, selected values, up to 20 dropdown options, expanded/collapsed, and disabled. Password values are never returned. Output defaults to 100 visible elements and 20,000 characters; use `scope`, `maxElements`, and `maxChars` to tune it. A truncation marker means more matching elements may exist. Use `select_option` with `matchBy: "value"` or `matchBy: "label"`, and use `set_checked` instead of toggling a checkbox blindly. Radios support `checked: true` only; select another radio to change the choice.
 
-`wait_for` accepts exactly one condition per call: `target`, `text`, `url`, `loadState`, or `timeMs`. Element state defaults to `visible`; text can wait for `visible` or `hidden`; URL values support Playwright glob patterns such as `**/dashboard`.
+`get_text` reads the first matching `selector` in a page or frame. It returns at most 20,000 characters by default, bounded by both the per-call `maxChars` value and the server's `--max-text-chars` setting.
+
+`screenshot` rejects captures larger than 25 million pixels or 20,000 pixels on either axis. Reduce `--window-size` or use a viewport capture when a full-page image exceeds that budget.
+
+`wait_for` accepts a typed `condition` object. Supported kinds are `element`, `text`, `url`, `load`, and `time`. Element and text states default to `visible`; URL values support Playwright glob patterns such as `**/dashboard`.
+
+```json
+{
+  "condition": { "kind": "text", "text": "Complete", "state": "visible" },
+  "timeoutMs": 30000
+}
+```
 
 ### Cross-origin challenge widgets
 
@@ -137,8 +148,8 @@ Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. Element r
 --window-size WIDTHxHEIGHT Set the browser window size
 --timezone ZONE            Use an IANA time zone or auto
 --proxy URL                Route browser traffic through a proxy
---allowed-host HOST        Allow navigation to a host and its subdomains; repeatable
---max-text-chars N         Limit the number of characters returned by get_text
+--allowed-host HOST        Allow top-level navigation to a host and its subdomains; repeatable
+--max-text-chars N         Set the hard limit for text and snapshot output
 --allow-eval               Enable arbitrary JavaScript execution
 --allow-native-agent       Enable the native ChromiumFish browser agent
 ```
@@ -161,7 +172,7 @@ Then start the server with `--allow-native-agent`. This mode forwards the creden
 
 - The server supports stdio only. Do not expose the Chromium DevTools endpoint to the public internet.
 - `eval_js` is disabled by default because it can read or modify any data available to the page.
-- Use `--allowed-host example.com` to limit navigation to a host and its subdomains.
+- Use `--allowed-host example.com` to restrict top-level HTTP/HTTPS navigation to a host and its subdomains. This covers redirects, link clicks, form submissions, and popups; third-party subframes and page assets remain available.
 - MCP clients can click and type, which may cause external side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
 - Each MCP process maintains an independent browser context. This server is not designed as a shared multi-tenant service.
 

@@ -18,10 +18,106 @@ function frame({ url, name = "", parent = null, text = "", box } = {}) {
     parentFrame: () => parent,
     locator: () => ({
       boundingBox: async () => box,
-      innerText: async () => text,
+      first: () => ({ innerText: async () => text }),
     }),
   };
 }
+
+test("listPages reports state without starting the browser and uses pageId", async () => {
+  const browser = new ChromiumFishBrowser(config);
+  assert.deepEqual(await browser.listPages(), { running: false, pages: [] });
+
+  const page = {
+    isClosed: () => false,
+    title: async () => "Example",
+    url: () => "https://example.com/",
+  };
+  browser.browser = { isConnected: () => true };
+  browser.context = { pages: () => [page] };
+  browser.currentPage = page;
+
+  const result = await browser.listPages();
+  assert.equal(result.running, true);
+  assert.equal(result.pages[0].pageId, "page-1");
+  assert.equal(result.pages[0].current, true);
+});
+
+test("closePage selects and reports a remaining page", async () => {
+  let firstClosed = false;
+  let secondFocused = false;
+  const first = {
+    isClosed: () => firstClosed,
+    title: async () => "First",
+    url: () => "https://example.com/first",
+    close: async () => {
+      firstClosed = true;
+    },
+  };
+  const second = {
+    isClosed: () => false,
+    title: async () => "Second",
+    url: () => "https://example.com/second",
+    bringToFront: async () => {
+      secondFocused = true;
+    },
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.browser = { isConnected: () => true };
+  browser.context = { pages: () => [first, second] };
+  browser.currentPage = first;
+  const before = await browser.listPages();
+
+  const result = await browser.closePage(before.pages[0].pageId);
+  assert.equal(secondFocused, true);
+  assert.equal(result.pages.length, 1);
+  assert.equal(result.pages[0].pageId, "page-2");
+  assert.equal(result.pages[0].current, true);
+});
+
+test("navigation guard blocks disallowed top-level requests only", async () => {
+  const browser = new ChromiumFishBrowser({ ...config, allowedHosts: ["example.com"] });
+  let handler;
+  await browser.installNavigationGuard({
+    route: async (pattern, callback) => {
+      assert.equal(pattern, "**/*");
+      handler = callback;
+    },
+  });
+
+  function mockRoute(url, { navigation = true, topLevel = true, frameError = false } = {}) {
+    const actions = [];
+    return {
+      actions,
+      request: () => ({
+        isNavigationRequest: () => navigation,
+        url: () => url,
+        frame: () => {
+          if (frameError) throw new Error("Frame unavailable");
+          return { parentFrame: () => topLevel ? null : {} };
+        },
+      }),
+      continue: async () => actions.push("continue"),
+      abort: async (reason) => actions.push(["abort", reason]),
+    };
+  }
+
+  const allowed = mockRoute("https://app.example.com/dashboard");
+  const blocked = mockRoute("https://example.net/redirected");
+  const subframe = mockRoute("https://example.net/widget", { topLevel: false });
+  const asset = mockRoute("https://example.net/app.js", { navigation: false });
+  const unknownFrame = mockRoute("https://example.net/unknown", { frameError: true });
+  await handler(allowed);
+  await handler(blocked);
+  await handler(subframe);
+  await handler(asset);
+  await handler(unknownFrame);
+
+  assert.deepEqual(allowed.actions, ["continue"]);
+  assert.deepEqual(blocked.actions, [["abort", "blockedbyclient"]]);
+  assert.deepEqual(subframe.actions, ["continue"]);
+  assert.deepEqual(asset.actions, ["continue"]);
+  assert.deepEqual(unknownFrame.actions, [["abort", "blockedbyclient"]]);
+});
 
 test("listFrames returns stable frame IDs and blocks challenge DOM access", async () => {
   const main = frame({ url: "https://example.com/", text: "Main" });
@@ -50,11 +146,51 @@ test("listFrames returns stable frame IDs and blocks challenge DOM access", asyn
   assert.equal(first[1].frameId, second[1].frameId);
   assert.equal(first[1].parentFrameId, first[0].frameId);
   assert.deepEqual(first[1].box, { x: 10, y: 20, width: 300, height: 180 });
-  assert.equal(await browser.getText(first[1].frameId), "Card details");
+  assert.equal(await browser.getText({ frameId: first[1].frameId }), "Card details");
   await assert.rejects(
-    browser.getText(first[2].frameId),
+    browser.getText({ frameId: first[2].frameId }),
     /DOM access to challenge frame/,
   );
+});
+
+test("getText surfaces explicit selector errors", async () => {
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({
+      first: () => ({
+        innerText: async () => {
+          throw new Error("Invalid selector");
+        },
+      }),
+    }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await assert.rejects(
+    browser.getText({ selector: "[broken" }),
+    /Invalid selector/,
+  );
+});
+
+test("getText enforces the returned character budget", async () => {
+  const main = frame({ url: "https://example.com/", text: "x".repeat(1000) });
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const result = await browser.getText({ maxChars: 100 });
+  assert.equal(result.length, 100);
+  assert.match(result, /Content truncated/);
 });
 
 test("frame snapshot references support hover, selectOption, and setChecked", async () => {
@@ -79,10 +215,12 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
       passwordSet: false,
       checked: null,
       selected: ["us"],
+      selectedCount: 1,
       options: [
         { value: "us", label: "United States" },
         { value: "ca", label: "Canada" },
       ],
+      optionCount: 2,
       expanded: null,
     }),
     ownerFrame: async () => child,
@@ -96,19 +234,26 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   };
   const checkboxHandle = {
     isVisible: async () => true,
-    evaluate: async (callback) => String(callback).includes("isConnected") ? true : ({
-      role: "input",
-      label: "Accept terms",
-      href: "",
-      disabled: false,
-      type: "checkbox",
-      value: null,
-      passwordSet: false,
-      checked: false,
-      selected: [],
-      options: [],
-      expanded: null,
-    }),
+    evaluate: async (callback) => {
+      const source = String(callback);
+      if (source.includes("isConnected")) return true;
+      if (source.includes("return element.type.toLowerCase")) return "checkbox";
+      return {
+        role: "input",
+        label: "Accept terms",
+        href: "",
+        disabled: false,
+        type: "checkbox",
+        value: null,
+        passwordSet: false,
+        checked: false,
+        selected: [],
+        selectedCount: 0,
+        options: [],
+        optionCount: 0,
+        expanded: null,
+      };
+    },
     ownerFrame: async () => child,
     dispose: async () => undefined,
     scrollIntoViewIfNeeded: async () => undefined,
@@ -135,7 +280,7 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   browser.page = async () => page;
   const frames = await browser.listFrames({ includeBox: false });
 
-  const snapshot = await browser.snapshot(frames[1].frameId);
+  const snapshot = await browser.snapshot({ frameId: frames[1].frameId });
   assert.match(snapshot, /selected=\["us"\]/);
   assert.match(snapshot, /options=\[\{"value":"us","label":"United States"\}/);
   assert.match(snapshot, /type=checkbox unchecked/);
@@ -148,6 +293,127 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   );
   assert.deepEqual(selectedOptions, [{ label: "Canada" }]);
   assert.equal(await browser.setChecked("e2", true), true);
+});
+
+test("snapshot scans past hidden elements, reports truncation, and releases unused handles", async () => {
+  const disposed = [];
+  const makeHandle = (id, visible, label = "") => ({
+    isVisible: async () => visible,
+    evaluate: async () => ({
+      role: "button",
+      label,
+      href: "",
+      disabled: false,
+      type: "",
+      value: null,
+      passwordSet: false,
+      checked: null,
+      selected: [],
+      selectedCount: 0,
+      options: [],
+      optionCount: 0,
+      expanded: null,
+    }),
+    dispose: async () => disposed.push(id),
+  });
+  let handles = [
+    ...Array.from({ length: 251 }, (_, index) => makeHandle(index, false)),
+    makeHandle(251, true, "Late visible control"),
+    makeHandle(252, true, "Overflow control"),
+  ];
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ elementHandles: async () => handles }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const result = await browser.snapshot({ maxElements: 1, maxChars: 5000 });
+  assert.match(result, /Late visible control/);
+  assert.match(result, /Snapshot truncated after 1 elements/);
+  assert.equal(disposed.length, 252);
+
+  handles = [];
+  await browser.snapshot({ maxElements: 1, maxChars: 5000 });
+  assert.equal(disposed.length, 253);
+});
+
+test("setChecked rejects unchecking a radio", async () => {
+  const handle = {
+    evaluate: async (callback) => String(callback).includes("isConnected") ? true : "radio",
+    isChecked: async () => true,
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await assert.rejects(
+    browser.setChecked("#choice", false),
+    /cannot be unchecked directly/,
+  );
+});
+
+test("screenshots reject oversized documents and viewports", async () => {
+  let captured = false;
+  const page = {
+    evaluate: async () => ({
+      scale: 1,
+      scrollWidth: 10_000,
+      scrollHeight: 10_000,
+      innerWidth: 10_000,
+      innerHeight: 10_000,
+    }),
+    viewportSize: () => ({ width: 10_000, height: 10_000 }),
+    screenshot: async () => {
+      captured = true;
+      return Buffer.from("png");
+    },
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await assert.rejects(browser.screenshot(true), /too large/);
+  await assert.rejects(browser.screenshot(false), /too large/);
+  assert.equal(captured, false);
+});
+
+test("screenshot budget accounts for the device scale factor", async () => {
+  let captured = false;
+  const page = {
+    evaluate: async () => ({
+      scale: 2,
+      scrollWidth: 4_000,
+      scrollHeight: 4_000,
+      innerWidth: 4_000,
+      innerHeight: 4_000,
+    }),
+    viewportSize: () => ({ width: 4_000, height: 4_000 }),
+    screenshot: async () => {
+      captured = true;
+      return Buffer.from("png");
+    },
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  // 4000x4000 CSS px is 16M pixels, but at scale 2 the PNG is 8000x8000 = 64M px.
+  await assert.rejects(browser.screenshot(true), /8000x8000/);
+  assert.equal(captured, false);
 });
 
 test("goForward and reload wait for DOMContentLoaded", async () => {
@@ -187,8 +453,16 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
       }),
     }),
     getByText: (value, options) => ({
-      first: () => ({
-        waitFor: async (waitOptions) => calls.push(["text", value, options, waitOptions]),
+      filter: (filterOptions) => ({
+        first: () => ({
+          waitFor: async (waitOptions) => calls.push([
+            "text",
+            value,
+            options,
+            filterOptions,
+            waitOptions,
+          ]),
+        }),
       }),
     }),
   };
@@ -202,20 +476,32 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
 
-  await browser.waitFor({ target: "#ready", state: "visible", timeoutMs: 1000 });
-  await browser.waitFor({ text: "Complete", textState: "hidden", timeoutMs: 2000 });
-  await browser.waitFor({ url: "**/dashboard", timeoutMs: 3000 });
-  await browser.waitFor({ loadState: "networkidle", timeoutMs: 4000 });
-  await browser.waitFor({ timeMs: 250, timeoutMs: 5000 });
+  await browser.waitFor({
+    condition: { kind: "element", target: "#ready", state: "visible" },
+    timeoutMs: 1000,
+  });
+  await browser.waitFor({
+    condition: { kind: "text", text: "Complete", state: "hidden" },
+    timeoutMs: 2000,
+  });
+  await browser.waitFor({
+    condition: { kind: "url", url: "**/dashboard" },
+    timeoutMs: 3000,
+  });
+  await browser.waitFor({
+    condition: { kind: "load", state: "networkidle" },
+    timeoutMs: 4000,
+  });
+  await browser.waitFor({
+    condition: { kind: "time", timeMs: 250 },
+    timeoutMs: 5000,
+  });
 
   assert.deepEqual(calls.map((entry) => entry[0]), ["element", "text", "url", "load", "time"]);
   assert.equal(calls[0][2].state, "visible");
-  assert.equal(calls[1][3].state, "hidden");
+  assert.deepEqual(calls[1][3], { visible: true });
+  assert.equal(calls[1][4].state, "detached");
   assert.equal(calls[2][1], "**/dashboard");
   assert.equal(calls[3][1], "networkidle");
   assert.equal(calls[4][1], 250);
-  await assert.rejects(
-    browser.waitFor({ target: "#ready", text: "Ready", timeoutMs: 1000 }),
-    /requires exactly one/,
-  );
 });

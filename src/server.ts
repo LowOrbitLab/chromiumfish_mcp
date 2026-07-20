@@ -7,29 +7,70 @@ import { VERSION } from "./config.js";
 const text = (value: unknown) => ({
   content: [{
     type: "text" as const,
-    text: typeof value === "string" ? value : JSON.stringify(value, null, 2),
+    text: typeof value === "string" ? value : JSON.stringify(value),
   }],
 });
+
+const structured = <T extends object>(value: T) => ({
+  ...text(value),
+  structuredContent: value as Record<string, unknown>,
+});
+
+const READ_ONLY = {
+  readOnlyHint: true,
+} as const;
+
+const MUTATING = {
+  destructiveHint: false,
+} as const;
+
+const IDEMPOTENT_MUTATION = {
+  ...MUTATING,
+  idempotentHint: true,
+} as const;
+
+const DESTRUCTIVE = {
+  destructiveHint: true,
+} as const;
+
+const waitConditionSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("element"),
+    target: z.string().min(1),
+    state: z.enum(["attached", "detached", "visible", "hidden"]).default("visible"),
+    frameId: z.string().min(1).optional(),
+  }),
+  z.object({
+    kind: z.literal("text"),
+    text: z.string().min(1),
+    state: z.enum(["visible", "hidden"]).default("visible"),
+    frameId: z.string().min(1).optional(),
+  }),
+  z.object({
+    kind: z.literal("url"),
+    url: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal("load"),
+    state: z.enum(["load", "domcontentloaded", "networkidle"]),
+  }),
+  z.object({
+    kind: z.literal("time"),
+    timeMs: z.number().int().min(0).max(120_000),
+  }),
+]);
 
 export function createServer(browser: BrowserApi, config: ServerConfig): McpServer {
   const server = new McpServer({ name: "chromiumfish_mcp", version: VERSION });
 
   server.registerTool(
-    "browser_status",
-    {
-      description: "Report whether the browser is running, the page count, and the current page. Does not start the browser just to inspect status.",
-      inputSchema: {},
-    },
-    async () => text(await browser.status()),
-  );
-
-  server.registerTool(
     "list_pages",
     {
-      description: "List all browser pages with their pageId, title, URL, and current-page marker.",
+      description: "Report browser running state and list open pages without starting the browser.",
       inputSchema: {},
+      annotations: READ_ONLY,
     },
-    async () => text(await browser.listPages()),
+    async () => structured(await browser.listPages()),
   );
 
   server.registerTool(
@@ -37,8 +78,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Create and select a new page, optionally opening an HTTP/HTTPS URL.",
       inputSchema: { url: z.string().url().optional() },
+      annotations: MUTATING,
     },
-    async ({ url }) => text(await browser.newPage(url)),
+    async ({ url }) => structured(await browser.newPage(url)),
   );
 
   server.registerTool(
@@ -46,8 +88,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Select the current page by a pageId returned from list_pages.",
       inputSchema: { pageId: z.string().min(1) },
+      annotations: IDEMPOTENT_MUTATION,
     },
-    async ({ pageId }) => text(await browser.selectPage(pageId)),
+    async ({ pageId }) => structured(await browser.selectPage(pageId)),
   );
 
   server.registerTool(
@@ -55,11 +98,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Close the specified page, or the current page when pageId is omitted.",
       inputSchema: { pageId: z.string().min(1).optional() },
+      annotations: DESTRUCTIVE,
     },
-    async ({ pageId }) => {
-      await browser.closePage(pageId);
-      return text("Page closed");
-    },
+    async ({ pageId }) => structured(await browser.closePage(pageId)),
   );
 
   server.registerTool(
@@ -67,8 +108,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Open an HTTP/HTTPS URL in the current page and wait for DOMContentLoaded.",
       inputSchema: { url: z.string().url() },
+      annotations: MUTATING,
     },
-    async ({ url }) => text(await browser.navigate(url)),
+    async ({ url }) => structured(await browser.navigate(url)),
   );
 
   server.registerTool(
@@ -76,8 +118,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Navigate the current page to its previous history entry.",
       inputSchema: {},
+      annotations: MUTATING,
     },
-    async () => text(await browser.goBack()),
+    async () => structured(await browser.goBack()),
   );
 
   server.registerTool(
@@ -85,8 +128,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Navigate the current page to its next history entry.",
       inputSchema: {},
+      annotations: MUTATING,
     },
-    async () => text(await browser.goForward()),
+    async () => structured(await browser.goForward()),
   );
 
   server.registerTool(
@@ -94,26 +138,47 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Reload the current page and wait for DOMContentLoaded.",
       inputSchema: {},
+      annotations: MUTATING,
     },
-    async () => text(await browser.reload()),
+    async () => structured(await browser.reload()),
   );
 
   server.registerTool(
     "snapshot",
     {
-      description: "List visible interactive elements in the main document or a frame. Pass references such as e1 and e2 to interaction tools; take a new snapshot after the page changes.",
-      inputSchema: { frameId: z.string().min(1).optional() },
+      description: "List visible interactive elements in the main document or a frame, with bounded output and temporary references.",
+      inputSchema: {
+        frameId: z.string().min(1).optional(),
+        scope: z.string().min(1).optional(),
+        maxElements: z.number().int().min(1).max(250).default(100),
+        maxChars: z.number().int().min(5_000).max(50_000).default(20_000),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ frameId }) => text(await browser.snapshot(frameId)),
+    async ({ frameId, scope, maxElements, maxChars }) => text(await browser.snapshot({
+      frameId,
+      scope,
+      maxElements,
+      maxChars,
+    })),
   );
 
   server.registerTool(
     "get_text",
     {
-      description: "Read visible text from the main document or a frame, limited by --max-text-chars.",
-      inputSchema: { frameId: z.string().min(1).optional() },
+      description: "Read visible text from the first matching region in the main document or a frame, bounded by maxChars and --max-text-chars.",
+      inputSchema: {
+        frameId: z.string().min(1).optional(),
+        selector: z.string().min(1).optional(),
+        maxChars: z.number().int().min(100).max(100_000).default(20_000),
+      },
+      annotations: READ_ONLY,
     },
-    async ({ frameId }) => text(await browser.getText(frameId)),
+    async ({ frameId, selector, maxChars }) => text(await browser.getText({
+      frameId,
+      selector,
+      maxChars,
+    })),
   );
 
   server.registerTool(
@@ -121,6 +186,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Capture the current viewport or the full page as a PNG image.",
       inputSchema: { fullPage: z.boolean().default(false) },
+      annotations: READ_ONLY,
     },
     async ({ fullPage }) => ({
       content: [{
@@ -139,10 +205,11 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         target: z.string().min(1),
         frameId: z.string().min(1).optional(),
       },
+      annotations: MUTATING,
     },
     async ({ target, frameId }) => {
       await browser.click(target, frameId);
-      return text(`Clicked ${target}`);
+      return structured({ ok: true, target });
     },
   );
 
@@ -154,10 +221,11 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         target: z.string().min(1),
         frameId: z.string().min(1).optional(),
       },
+      annotations: IDEMPOTENT_MUTATION,
     },
     async ({ target, frameId }) => {
       await browser.hover(target, frameId);
-      return text(`Hovered over ${target}`);
+      return structured({ ok: true, target });
     },
   );
 
@@ -170,20 +238,24 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         x: z.number().finite(),
         y: z.number().finite(),
       },
+      annotations: MUTATING,
     },
-    async ({ x, y }) => text(await browser.mouseClick(x, y)),
+    async ({ x, y }) => structured(await browser.mouseClick(x, y)),
   );
 
   server.registerTool(
     "list_frames",
     {
       description:
-        "List frames and iframes with stable frameId values, parent relationships, URLs, and names. Bounding boxes are included by default; set includeBox=false for faster results.",
+        "List frames and iframes with stable frameId values, parent relationships, URLs, and names. Request bounding boxes only when coordinate interaction needs them.",
       inputSchema: {
-        includeBox: z.boolean().default(true),
+        includeBox: z.boolean().default(false),
       },
+      annotations: READ_ONLY,
     },
-    async ({ includeBox }) => text(await browser.listFrames({ includeBox })),
+    async ({ includeBox }) => structured({
+      frames: await browser.listFrames({ includeBox }),
+    }),
   );
 
   server.registerTool(
@@ -192,8 +264,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       description:
         "Detect common browser interstitials and embedded cross-origin challenge controls. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
       inputSchema: {},
+      annotations: READ_ONLY,
     },
-    async () => text(await browser.findChallenge()),
+    async () => structured(await browser.findChallenge()),
   );
 
   server.registerTool(
@@ -205,8 +278,11 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
         maxClicks: z.number().int().min(1).max(30).default(6),
       },
+      annotations: MUTATING,
     },
-    async ({ timeoutMs, maxClicks }) => text(await browser.clickChallenge({ timeoutMs, maxClicks })),
+    async ({ timeoutMs, maxClicks }) => structured(
+      await browser.clickChallenge({ timeoutMs, maxClicks }),
+    ),
   );
 
   server.registerTool(
@@ -220,10 +296,11 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         submit: z.boolean().default(false),
         frameId: z.string().min(1).optional(),
       },
+      annotations: MUTATING,
     },
     async ({ target, text: value, clear, submit, frameId }) => {
       await browser.typeText(target, value, clear, submit, frameId);
-      return text(`Entered text in ${target}${submit ? " and pressed Enter" : ""}`);
+      return structured({ ok: true, target, submitted: submit });
     },
   );
 
@@ -237,8 +314,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         matchBy: z.enum(["value", "label"]).default("value"),
         frameId: z.string().min(1).optional(),
       },
+      annotations: IDEMPOTENT_MUTATION,
     },
-    async ({ target, values, matchBy, frameId }) => text({
+    async ({ target, values, matchBy, frameId }) => structured({
       selectedValues: await browser.selectOption(target, values, matchBy, frameId),
     }),
   );
@@ -246,14 +324,15 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "set_checked",
     {
-      description: "Set a checkbox or radio element to a deterministic checked state.",
+      description: "Set a checkbox state, or select a radio element with checked=true. Radios cannot be unchecked directly.",
       inputSchema: {
         target: z.string().min(1),
         checked: z.boolean(),
         frameId: z.string().min(1).optional(),
       },
+      annotations: IDEMPOTENT_MUTATION,
     },
-    async ({ target, checked, frameId }) => text({
+    async ({ target, checked, frameId }) => structured({
       checked: await browser.setChecked(target, checked, frameId),
     }),
   );
@@ -263,10 +342,11 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     {
       description: "Press a key in the current page, such as Enter, Escape, ArrowDown, or Control+A.",
       inputSchema: { key: z.string().min(1).max(100) },
+      annotations: MUTATING,
     },
     async ({ key }) => {
       await browser.pressKey(key);
-      return text(`Pressed ${key}`);
+      return structured({ ok: true, key });
     },
   );
 
@@ -278,42 +358,27 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         deltaX: z.number().finite().default(0),
         deltaY: z.number().finite(),
       },
+      annotations: MUTATING,
     },
     async ({ deltaX, deltaY }) => {
       await browser.scroll(deltaX, deltaY);
-      return text("Scroll complete");
+      return structured({ ok: true, deltaX, deltaY });
     },
   );
 
   server.registerTool(
     "wait_for",
     {
-      description: "Wait for exactly one condition: an element state, text visibility, URL glob, page load state, or duration.",
+      description: "Wait for one typed condition: element, text, URL glob, page load state, or duration.",
       inputSchema: {
-        target: z.string().min(1).optional(),
-        state: z.enum(["attached", "detached", "visible", "hidden"]).optional(),
-        text: z.string().min(1).optional(),
-        textState: z.enum(["visible", "hidden"]).optional(),
-        url: z.string().min(1).optional(),
-        loadState: z.enum(["load", "domcontentloaded", "networkidle"]).optional(),
-        timeMs: z.number().int().min(0).max(120_000).optional(),
-        frameId: z.string().min(1).optional(),
+        condition: waitConditionSchema,
         timeoutMs: z.number().int().min(100).max(120_000).default(30_000),
       },
+      annotations: READ_ONLY,
     },
-    async ({ target, state, text: expectedText, textState, url, loadState, timeMs, frameId, timeoutMs }) => {
-      await browser.waitFor({
-        target,
-        state,
-        text: expectedText,
-        textState,
-        url,
-        loadState,
-        timeMs,
-        frameId,
-        timeoutMs,
-      });
-      return text("Wait condition satisfied");
+    async ({ condition, timeoutMs }) => {
+      await browser.waitFor({ condition, timeoutMs });
+      return structured({ ok: true, kind: condition.kind });
     },
   );
 
@@ -323,6 +388,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       {
         description: "Execute arbitrary JavaScript in the current page. This high-risk tool is registered only when --allow-eval is enabled.",
         inputSchema: { expression: z.string().min(1) },
+        annotations: DESTRUCTIVE,
       },
       async ({ expression }) => text(await browser.evalJs(expression)),
     );
@@ -338,8 +404,9 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
           url: z.string().url().optional(),
           maxSteps: z.number().int().min(1).max(100).default(25),
         },
+        annotations: DESTRUCTIVE,
       },
-      async ({ task, url, maxSteps }) => text(await browser.runTask(task, url, maxSteps)),
+      async ({ task, url, maxSteps }) => structured(await browser.runTask(task, url, maxSteps)),
     );
   }
 
