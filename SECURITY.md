@@ -1,15 +1,15 @@
-# 安全策略
+# Security Policy
 
-## 报告漏洞
+## Reporting a Vulnerability
 
-请通过 GitHub Security Advisory 私下报告可能泄露浏览器数据、代理凭据或 API Key 的漏洞。不要在公开 Issue 中提交真实凭据、Cookie、访问令牌或可利用的目标地址。
+Privately report vulnerabilities that could expose browser data, proxy credentials, or API keys through a GitHub Security Advisory. Never post real credentials, cookies, access tokens, or exploitable target URLs in a public issue.
 
-## 使用边界
+## Usage Boundaries
 
-- 只在授权测试、隐私研究和合法自动化场景中使用本项目。
-- 不要将 Chromium DevTools 端口或本 MCP 服务直接暴露到公网。
-- 默认保持 `eval_js` 和浏览器内置代理关闭。
-- 使用单独的低权限浏览器账号和可撤销凭据。
-- 自动化执行购买、发布、删除或权限变更之前，应要求人工确认。
+- Use this project only for authorized testing, privacy research, and lawful automation.
+- Do not expose the Chromium DevTools port or this MCP server directly to the public internet.
+- Keep `eval_js` and the native browser agent disabled by default.
+- Use a separate, least-privilege browser account with revocable credentials.
+- Require human confirmation before automating purchases, publishing, deletion, or permission changes.
 
-目前只为最新发布版本提供安全更新。
+Security updates are currently provided only for the latest release.

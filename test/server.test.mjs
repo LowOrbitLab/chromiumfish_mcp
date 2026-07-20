@@ -22,8 +22,8 @@ function fakeBrowser() {
     closePage: async () => undefined,
     navigate: async (url) => ({ title: "Example", url }),
     goBack: async () => ({ title: "", url: "about:blank" }),
-    snapshot: async () => "[e1] button \"提交\"",
-    getText: async () => "页面正文",
+    snapshot: async () => "[e1] button \"Submit\"",
+    getText: async () => "Page body",
     screenshot: async () => Buffer.from("png"),
     click: async () => undefined,
     mouseClick: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
@@ -58,7 +58,7 @@ function fakeBrowser() {
     scroll: async () => undefined,
     waitFor: async () => undefined,
     evalJs: async () => 42,
-    runTask: async () => ({ success: true, finalText: "完成", steps: 1 }),
+    runTask: async () => ({ success: true, finalText: "Completed", steps: 1 }),
     close: async () => undefined,
   };
 }
@@ -71,7 +71,7 @@ async function connectedClient(overrides = {}) {
   return { client, server };
 }
 
-test("默认工具集不包含危险工具", async (context) => {
+test("default tool set excludes dangerous tools", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
@@ -89,7 +89,7 @@ test("默认工具集不包含危险工具", async (context) => {
   assert.equal(names.includes("run_task"), false);
 });
 
-test("click_challenge 与 mouse_click 返回结构化结果", async (context) => {
+test("click_challenge and mouse_click return structured results", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
@@ -107,7 +107,7 @@ test("click_challenge 与 mouse_click 返回结构化结果", async (context) =>
   assert.match(clicked.content[0].text, /"x": 10/);
 });
 
-test("list_frames 支持 includeBox", async (context) => {
+test("list_frames supports includeBox", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
@@ -125,7 +125,7 @@ test("list_frames 支持 includeBox", async (context) => {
   assert.doesNotMatch(noBox.content[0].text, /"width"/);
 });
 
-test("显式配置后注册危险工具", async (context) => {
+test("registers dangerous tools when explicitly enabled", async (context) => {
   const { client, server } = await connectedClient({ allowEval: true, allowNativeAgent: true });
   context.after(async () => {
     await client.close();
@@ -136,7 +136,7 @@ test("显式配置后注册危险工具", async (context) => {
   assert.ok(names.includes("run_task"));
 });
 
-test("工具调用返回浏览器结果", async (context) => {
+test("tool calls return browser results", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
