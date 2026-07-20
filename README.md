@@ -1,51 +1,51 @@
 # chromiumfish_mcp
 
-`chromiumfish_mcp` 是面向 [ChromiumFish](https://github.com/arman-bd/chromiumfish) 的独立 Model Context Protocol（MCP）服务器。它让 Claude Code、Claude Desktop、Cursor 以及其他 MCP 客户端能够通过结构化工具控制 ChromiumFish 浏览器。
+`chromiumfish_mcp` is an independent Model Context Protocol (MCP) server for [ChromiumFish](https://github.com/arman-bd/chromiumfish). It lets Claude Code, Claude Desktop, Cursor, and other MCP clients control a ChromiumFish browser through structured tools.
 
-本项目复用 ChromiumFish 官方 npm 包，不包含 Chromium 源码或浏览器二进制。浏览器会在首次调用浏览器工具时由上游 SDK 下载并按版本缓存。
+This project uses the official ChromiumFish npm package. It does not include Chromium source code or browser binaries. On the first browser tool call, the upstream SDK downloads the matching browser build and caches it by version.
 
-## 特性
+## Features
 
-- MCP stdio 传输，适合本地桌面和开发工具。
-- 浏览器按需启动，MCP 客户端断开时自动清理。
-- 多页面管理：新建、切换、列出和关闭页面。
-- 快照元素引用：使用 `e1`、`e2` 操作当前快照中的元素。
-- 导航、正文、截图、点击、输入、按键、滚动和等待工具。
-- 支持 ChromiumFish 人格种子、代理、窗口尺寸和时区。
-- `eval_js` 与浏览器内置代理默认不注册，必须显式启用。
-- 可配置导航主机白名单与文本输出上限。
+- MCP over stdio for local desktop clients and development tools.
+- Lazy browser startup and automatic cleanup when the MCP client disconnects.
+- Multi-page management: create, select, list, and close pages.
+- Snapshot references such as `e1` and `e2` for reliable interaction with the current page state.
+- Navigation, text extraction, screenshots, clicking, typing, key presses, scrolling, and waits.
+- ChromiumFish persona seeds, proxies, window sizes, browser versions, and time zones.
+- `eval_js` and the native browser agent are disabled by default and require explicit opt-in.
+- Optional navigation host allowlists and text output limits.
 
-## 环境要求
+## Requirements
 
-- Node.js 20 或更高版本。
-- ChromiumFish 当前支持的操作系统与硬件架构。
-- 首次启动需要联网下载 ChromiumFish 浏览器构建。
+- Node.js 20 or later.
+- An operating system and architecture supported by ChromiumFish.
+- Network access for the initial ChromiumFish browser download.
 
-自动下载取决于 ChromiumFish 上游 Release 是否提供当前平台的构建资产。如果没有对应资产，可以自行构建 ChromiumFish，并通过 `--chrome-path` 或 `CHROME_BIN` 指向可执行文件。
+Automatic download depends on the upstream ChromiumFish release containing an asset for your platform. If no matching asset is available, build ChromiumFish locally and use `--chrome-path` or `CHROME_BIN` to point to the executable.
 
-## 安装
+## Installation
 
-从 GitHub 安装：
+Install directly from GitHub:
 
 ```bash
 npm install --global github:LowOrbitLab/chromiumfish_mcp
 ```
 
-安装后可以运行：
+Then start the server:
 
 ```bash
 chromiumfish_mcp --persona-seed alice
 ```
 
-也可以不全局安装：
+You can also run it without a global installation:
 
 ```bash
 npx --yes github:LowOrbitLab/chromiumfish_mcp --persona-seed alice
 ```
 
-## MCP 客户端配置
+## MCP Client Configuration
 
-使用全局安装的命令：
+Using the globally installed command:
 
 ```json
 {
@@ -58,7 +58,7 @@ npx --yes github:LowOrbitLab/chromiumfish_mcp --persona-seed alice
 }
 ```
 
-直接从 GitHub 运行：
+Running directly from GitHub:
 
 ```json
 {
@@ -76,50 +76,50 @@ npx --yes github:LowOrbitLab/chromiumfish_mcp --persona-seed alice
 }
 ```
 
-Windows 客户端如果无法解析 `npx`，可以将 `command` 改为 `npx.cmd`。
+On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`.
 
-## 工具
+## Tools
 
-- `browser_status`：查询懒启动状态。
-- `list_pages`、`new_page`、`select_page`、`close_page`：管理页面。
-- `navigate`、`go_back`：导航与历史记录。
-- `snapshot`：读取可交互元素并生成临时引用。
-- `get_text`、`screenshot`：获取页面内容。
-- `click`、`type_text`、`press_key`、`scroll`、`wait_for`：执行页面操作。
-- `eval_js`：任意 JavaScript，仅在 `--allow-eval` 下提供。
-- `run_task`：ChromiumFish 浏览器内置代理，仅在 `--allow-native-agent` 下提供。
+- `browser_status`: report lazy startup state, page count, and the current page.
+- `list_pages`, `new_page`, `select_page`, `close_page`: manage browser pages.
+- `navigate`, `go_back`: navigate and use page history.
+- `snapshot`: list visible interactive elements and create temporary references.
+- `get_text`, `screenshot`: retrieve page content.
+- `click`, `type_text`, `press_key`, `scroll`, `wait_for`: interact with the page.
+- `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
+- `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
-调用 `snapshot` 后会得到如下结果：
-
-```text
-[e1] input "搜索"
-[e2] button "提交"
-[e3] link "文档" -> https://example.com/docs
-```
-
-将 `e1` 传给 `type_text`，或将 `e2` 传给 `click`。元素引用只属于当前页面的最近一次快照；页面变化后应重新调用 `snapshot`。
-
-## 启动选项
+A `snapshot` call returns output similar to this:
 
 ```text
---persona-seed VALUE       固定浏览器指纹人格
---chrome-path PATH         使用本地 ChromiumFish 可执行文件
---browser-version VERSION  指定上游浏览器构建版本
---headed                  显示浏览器窗口
---window-size WIDTHxHEIGHT 窗口尺寸
---timezone ZONE           IANA 时区或 auto
---proxy URL               浏览器代理
---allowed-host HOST       导航主机白名单，可重复传入
---max-text-chars N        页面正文最大字符数
---allow-eval              启用任意 JavaScript
---allow-native-agent      启用浏览器内置代理
+[e1] input "Search"
+[e2] button "Submit"
+[e3] link "Documentation" -> https://example.com/docs
 ```
 
-代理凭据可以写在代理 URL 中，但这会使凭据出现在 MCP 客户端配置里。不要提交包含代理密码、Cookie 或 API Key 的配置文件。
+Pass `e1` to `type_text` or `e2` to `click`. Element references belong to the latest snapshot of the current page. Request a new snapshot after the page changes.
 
-## 浏览器内置代理
+## Command-Line Options
 
-MCP 客户端本身已经可以组合细粒度浏览器工具，因此通常不需要 `run_task`。确实需要 ChromiumFish 的浏览器内置代理时，通过环境变量提供 OpenAI 兼容接口：
+```text
+--persona-seed VALUE       Use a stable browser fingerprint persona
+--chrome-path PATH         Use a local ChromiumFish executable
+--browser-version VERSION  Select an upstream ChromiumFish build version
+--headed                   Show the browser window
+--window-size WIDTHxHEIGHT Set the browser window size
+--timezone ZONE            Use an IANA time zone or auto
+--proxy URL                Route browser traffic through a proxy
+--allowed-host HOST        Allow navigation to a host and its subdomains; repeatable
+--max-text-chars N         Limit the number of characters returned by get_text
+--allow-eval               Enable arbitrary JavaScript execution
+--allow-native-agent       Enable the native ChromiumFish browser agent
+```
+
+Proxy credentials can be embedded in the proxy URL, but doing so exposes them in the MCP client configuration. Never commit configuration files containing proxy passwords, cookies, or API keys.
+
+## Native Browser Agent
+
+An MCP client can normally complete workflows by composing the granular browser tools, so `run_task` is usually unnecessary. To use ChromiumFish's native browser agent, configure an OpenAI-compatible endpoint through these environment variables:
 
 ```text
 OPENAI_API_KEY
@@ -127,17 +127,17 @@ OPENAI_API_BASE
 OPENAI_API_MODEL
 ```
 
-然后加入 `--allow-native-agent`。该模式会把密钥转交给本地 ChromiumFish 浏览器进程，并启用无人值守操作能力，只应在受信任环境使用。
+Then start the server with `--allow-native-agent`. This mode forwards the credentials to the local ChromiumFish browser process and enables unattended browser actions. Use it only in a trusted environment.
 
-## 安全边界
+## Security Boundaries
 
-- 服务仅提供 stdio，不应直接暴露 Chromium DevTools 端口到公网。
-- `eval_js` 默认关闭，因为它可以读取或修改页面中的任何数据。
-- 使用 `--allowed-host example.com` 可以限制导航范围，子域名也会被允许。
-- MCP 客户端能够点击和输入，可能产生外部副作用；涉及购买、发布或删除数据时应保留人工确认。
-- 每个 MCP 进程维护独立浏览器上下文，不面向多租户共享。
+- The server supports stdio only. Do not expose the Chromium DevTools endpoint to the public internet.
+- `eval_js` is disabled by default because it can read or modify any data available to the page.
+- Use `--allowed-host example.com` to limit navigation to a host and its subdomains.
+- MCP clients can click and type, which may cause external side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
+- Each MCP process maintains an independent browser context. This server is not designed as a shared multi-tenant service.
 
-## 本地开发
+## Local Development
 
 ```bash
 npm ci
@@ -145,8 +145,8 @@ npm test
 node dist/index.js --help
 ```
 
-单元测试通过内存 MCP 传输验证工具发现、危险工具开关和调用结果，不会下载或启动浏览器。
+The test suite uses an in-memory MCP transport to verify tool discovery, dangerous-tool opt-in, and tool results. It does not download or launch a browser.
 
-## 许可证与归属
+## License and Attribution
 
-本项目使用 MIT 许可证。ChromiumFish 相关代码和名称归其原项目贡献者所有；详情见 [NOTICE](NOTICE)。本项目是独立封装，不代表 ChromiumFish 官方发布。
+This project is licensed under the MIT License. ChromiumFish code and trademarks belong to their respective project contributors; see [NOTICE](NOTICE) for attribution. This is an independent wrapper and is not an official ChromiumFish release.
