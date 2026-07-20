@@ -33,7 +33,19 @@ const DESTRUCTIVE = {
   destructiveHint: true,
 } as const;
 
-const waitConditionSchema = z.discriminatedUnion("kind", [
+// Some MCP clients (or the model driving them) serialize nested object arguments
+// to a JSON string. Accept either a native object or its JSON-string form so
+// wait_for works across clients; a compliant object passes through unchanged.
+function parseMaybeJson(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+const waitConditionSchema = z.preprocess(parseMaybeJson, z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("element"),
     target: z.string().min(1),
@@ -58,7 +70,7 @@ const waitConditionSchema = z.discriminatedUnion("kind", [
     kind: z.literal("time"),
     timeMs: z.number().int().min(0).max(120_000),
   }),
-]);
+]));
 
 export function createServer(browser: BrowserApi, config: ServerConfig): McpServer {
   const server = new McpServer({ name: "chromiumfish_mcp", version: VERSION });
