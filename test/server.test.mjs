@@ -17,11 +17,10 @@ function fakeBrowser() {
   const calls = [];
   return {
     calls,
-    status: async () => ({ running: false, pages: 0 }),
-    listPages: async () => [],
-    newPage: async () => ({ id: "page-1", current: true, title: "", url: "about:blank" }),
-    selectPage: async (pageId) => ({ id: pageId, current: true, title: "Example", url: "https://example.com/" }),
-    closePage: async () => undefined,
+    listPages: async () => ({ running: false, pages: [] }),
+    newPage: async () => ({ pageId: "page-1", current: true, title: "", url: "about:blank" }),
+    selectPage: async (pageId) => ({ pageId, current: true, title: "Example", url: "https://example.com/" }),
+    closePage: async () => ({ running: true, pages: [] }),
     navigate: async (url) => ({ title: "Example", url }),
     goBack: async () => ({ title: "", url: "about:blank" }),
     goForward: async () => {
@@ -32,12 +31,12 @@ function fakeBrowser() {
       calls.push(["reload"]);
       return { title: "Example", url: "https://example.com/" };
     },
-    snapshot: async (frameId) => {
-      calls.push(["snapshot", frameId]);
+    snapshot: async (options) => {
+      calls.push(["snapshot", options]);
       return "[e1] button \"Submit\"";
     },
-    getText: async (frameId) => {
-      calls.push(["getText", frameId]);
+    getText: async (options) => {
+      calls.push(["getText", options]);
       return "Page body";
     },
     screenshot: async () => Buffer.from("png"),
@@ -106,27 +105,41 @@ async function connectedClient(overrides = {}) {
   return { browser, client, server };
 }
 
-test("default tool set excludes dangerous tools", async (context) => {
+test("default tool set has a stable annotated contract", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
     await server.close();
   });
-  const names = (await client.listTools()).tools.map((tool) => tool.name);
-  assert.ok(names.includes("snapshot"));
-  assert.ok(names.includes("list_pages"));
-  assert.ok(names.includes("click_challenge"));
-  assert.equal(names.includes("solve_turnstile"), false);
-  assert.ok(names.includes("mouse_click"));
-  assert.ok(names.includes("list_frames"));
-  assert.ok(names.includes("find_challenge"));
-  assert.ok(names.includes("go_forward"));
-  assert.ok(names.includes("reload"));
-  assert.ok(names.includes("hover"));
-  assert.ok(names.includes("select_option"));
-  assert.ok(names.includes("set_checked"));
-  assert.equal(names.includes("eval_js"), false);
-  assert.equal(names.includes("run_task"), false);
+  const tools = (await client.listTools()).tools;
+  assert.deepEqual(tools.map((tool) => tool.name), [
+    "list_pages",
+    "new_page",
+    "select_page",
+    "close_page",
+    "navigate",
+    "go_back",
+    "go_forward",
+    "reload",
+    "snapshot",
+    "get_text",
+    "screenshot",
+    "click",
+    "hover",
+    "mouse_click",
+    "list_frames",
+    "find_challenge",
+    "click_challenge",
+    "type_text",
+    "select_option",
+    "set_checked",
+    "press_key",
+    "scroll",
+    "wait_for",
+  ]);
+  assert.ok(tools.every((tool) => tool.annotations));
+  assert.equal(tools.find((tool) => tool.name === "list_pages").annotations.readOnlyHint, true);
+  assert.equal(tools.find((tool) => tool.name === "close_page").annotations.destructiveHint, true);
 });
 
 test("click_challenge and mouse_click return structured results", async (context) => {
@@ -140,11 +153,13 @@ test("click_challenge and mouse_click return structured results", async (context
     arguments: { timeoutMs: 5000, maxClicks: 3 },
   });
   assert.match(solved.content[0].text, /already_clear/);
+  assert.equal(solved.structuredContent.method, "already_clear");
   const clicked = await client.callTool({
     name: "mouse_click",
     arguments: { x: 10, y: 20 },
   });
-  assert.match(clicked.content[0].text, /"x": 10/);
+  assert.match(clicked.content[0].text, /"x":10/);
+  assert.equal(clicked.structuredContent.x, 10);
 });
 
 test("list_frames supports includeBox", async (context) => {
@@ -158,23 +173,29 @@ test("list_frames supports includeBox", async (context) => {
     arguments: { includeBox: true },
   });
   assert.match(withBox.content[0].text, /"width"/);
-  assert.match(withBox.content[0].text, /"frameId": "frame-1"/);
+  assert.equal(withBox.structuredContent.frames[0].frameId, "frame-1");
   const noBox = await client.callTool({
     name: "list_frames",
-    arguments: { includeBox: false },
+    arguments: {},
   });
   assert.doesNotMatch(noBox.content[0].text, /"width"/);
 });
 
-test("forwards frame, form, navigation, and wait arguments", async (context) => {
+test("forwards bounded inspection, form, navigation, and typed wait arguments", async (context) => {
   const { browser, client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
     await server.close();
   });
 
-  await client.callTool({ name: "snapshot", arguments: { frameId: "frame-2" } });
-  await client.callTool({ name: "get_text", arguments: { frameId: "frame-2" } });
+  await client.callTool({
+    name: "snapshot",
+    arguments: { frameId: "frame-2", scope: "#dialog", maxElements: 25, maxChars: 8000 },
+  });
+  await client.callTool({
+    name: "get_text",
+    arguments: { frameId: "frame-2", selector: "main", maxChars: 5000 },
+  });
   await client.callTool({
     name: "hover",
     arguments: { target: "#menu", frameId: "frame-2" },
@@ -188,26 +209,38 @@ test("forwards frame, form, navigation, and wait arguments", async (context) => 
       frameId: "frame-2",
     },
   });
-  assert.match(selected.content[0].text, /United States/);
+  assert.deepEqual(selected.structuredContent.selectedValues, ["United States"]);
   const checked = await client.callTool({
     name: "set_checked",
     arguments: { target: "#terms", checked: true, frameId: "frame-2" },
   });
-  assert.match(checked.content[0].text, /"checked": true/);
+  assert.equal(checked.structuredContent.checked, true);
   await client.callTool({ name: "go_forward", arguments: {} });
   await client.callTool({ name: "reload", arguments: {} });
   await client.callTool({
     name: "wait_for",
     arguments: {
-      text: "Complete",
-      textState: "visible",
-      frameId: "frame-2",
+      condition: {
+        kind: "text",
+        text: "Complete",
+        state: "visible",
+        frameId: "frame-2",
+      },
       timeoutMs: 5000,
     },
   });
 
-  assert.deepEqual(browser.calls[0], ["snapshot", "frame-2"]);
-  assert.deepEqual(browser.calls[1], ["getText", "frame-2"]);
+  assert.deepEqual(browser.calls[0], ["snapshot", {
+    frameId: "frame-2",
+    scope: "#dialog",
+    maxElements: 25,
+    maxChars: 8000,
+  }]);
+  assert.deepEqual(browser.calls[1], ["getText", {
+    frameId: "frame-2",
+    selector: "main",
+    maxChars: 5000,
+  }]);
   assert.deepEqual(browser.calls[2], ["hover", "#menu", "frame-2"]);
   assert.deepEqual(browser.calls[3], [
     "selectOption",
@@ -220,8 +253,21 @@ test("forwards frame, form, navigation, and wait arguments", async (context) => 
   assert.deepEqual(browser.calls[5], ["goForward"]);
   assert.deepEqual(browser.calls[6], ["reload"]);
   assert.equal(browser.calls[7][0], "waitFor");
-  assert.equal(browser.calls[7][1].text, "Complete");
-  assert.equal(browser.calls[7][1].frameId, "frame-2");
+  assert.equal(browser.calls[7][1].condition.text, "Complete");
+  assert.equal(browser.calls[7][1].condition.frameId, "frame-2");
+});
+
+test("wait_for rejects legacy flat conditions at the MCP boundary", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const result = await client.callTool({
+    name: "wait_for",
+    arguments: { text: "Complete", timeoutMs: 5000 },
+  });
+  assert.equal(result.isError, true);
 });
 
 test("registers dangerous tools when explicitly enabled", async (context) => {
@@ -246,4 +292,5 @@ test("tool calls return browser results", async (context) => {
     arguments: { url: "https://example.com/" },
   });
   assert.match(result.content[0].text, /Example/);
+  assert.equal(result.structuredContent.url, "https://example.com/");
 });
