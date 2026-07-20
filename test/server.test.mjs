@@ -31,9 +31,11 @@ function fakeBrowser() {
     detectChallenge: async () => ({
       present: false,
       kind: "none",
+      widgetState: "absent",
       title: "Example",
       url: "https://example.com/",
       bodySnippet: "Example Domain",
+      tokenPresent: false,
       frames: [{ url: "https://example.com/" }],
     }),
     solveTurnstile: async () => ({
@@ -44,6 +46,8 @@ function fakeBrowser() {
       title: "Example",
       url: "https://example.com/",
       bodySnippet: "Example Domain",
+      widgetState: "absent",
+      tokenPresent: false,
       clicks: [],
     }),
     typeText: async () => undefined,

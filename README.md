@@ -89,8 +89,8 @@ On Windows, use `npx.cmd` as the command if your MCP client cannot resolve `npx`
 - `click`, `type_text`, `press_key`, `scroll`, `wait_for`: interact with the page.
 - `mouse_click`: click at absolute page coordinates (for cross-origin widgets invisible to `snapshot`).
 - `list_frames`: list frames/iframes with URLs and bounding boxes when available.
-- `detect_challenge`: detect common interstitial / framed-challenge page states for text-only agents.
-- `solve_turnstile`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until the interstitial clears.
+- `detect_challenge`: detect common interstitial / framed-challenge page states for text-only agents (`present`, `kind`, `widgetState`, `tokenPresent`, `widget`).
+- `solve_turnstile`: humanized coordinate clicks on standard checkbox widgets inside cross-origin challenge frames, then poll until clearance is confirmed (token / frame success / interstitial exit).
 - `eval_js`: execute arbitrary JavaScript; available only with `--allow-eval`.
 - `run_task`: use the native ChromiumFish browser agent; available only with `--allow-native-agent`.
 
@@ -103,7 +103,7 @@ Some embedded controls live in cross-origin iframes and never appear in `snapsho
 3. `solve_turnstile` — automatic clicks near the widget checkbox region + clearance polling
 4. Or `list_frames` + `mouse_click` for manual coordinate control
 
-`solve_turnstile` returns JSON with `ok`, `method`, `attempts`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Results depend on page structure and environment.
+`solve_turnstile` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
 
 A `snapshot` call returns output similar to this:
 

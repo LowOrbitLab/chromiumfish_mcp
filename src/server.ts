@@ -152,7 +152,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "detect_challenge",
     {
       description:
-        "Detects a common browser interstitial or cross-origin challenge widget on the current page. Returns kind, the widget box, and related frames so a text-only agent can decide the next interaction.",
+        "Detects a common browser interstitial or cross-origin challenge widget on the current page. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
       inputSchema: {},
     },
     async () => text(await browser.detectChallenge()),
@@ -162,7 +162,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "solve_turnstile",
     {
       description:
-        "Performs a human-like coordinate click on the standard checkbox widget inside a cross-origin challenge frame, then polls whether the page left the interstitial. Needs no vision model. The JSON ok field is authoritative.",
+        "Performs a human-like coordinate click on the standard checkbox widget inside a cross-origin challenge frame, then polls until clearance is confirmed (response token / widget success state / interstitial left). Needs no vision model. The JSON ok field is authoritative.",
       inputSchema: {
         timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
         maxClicks: z.number().int().min(1).max(30).default(12),

@@ -2,15 +2,16 @@
  * Live integration smoke for framed-widget coordinate interaction.
  * Not part of npm test (network + browser + environment-dependent pages).
  *
- * Usage: node scripts/live-solve-turnstile.mjs [runs=3]
+ * Usage:
+ *   CHROME_BIN=/path/to/chrome node scripts/live-solve-turnstile.mjs [runs=3]
+ *   LIVE_TEST_URL=https://... node scripts/live-solve-turnstile.mjs
  */
 import { ChromiumFishBrowser } from "../dist/browser.js";
 
 const URL = process.env.LIVE_TEST_URL
   || "https://2captcha.com/demo/cloudflare-turnstile-challenge";
 const runs = Math.max(1, Number(process.argv[2] || 3));
-const chromePath = process.env.CHROME_BIN
-  || "/root/.cache/chromiumfish/149.0.7827.115/linux-x64/chromiumfish-linux-x64/chrome";
+const chromePath = process.env.CHROME_BIN || undefined;
 
 const results = [];
 
@@ -22,7 +23,7 @@ for (let i = 1; i <= runs; i += 1) {
     allowNativeAgent: false,
     maxTextChars: 50_000,
     allowedHosts: [],
-    chromePath,
+    ...(chromePath ? { chromePath } : {}),
     personaSeed: `frame-widget-test-${i}-${Date.now()}`,
   });
   const started = Date.now();
@@ -34,6 +35,8 @@ for (let i = 1; i <= runs; i += 1) {
     console.log("detect:", JSON.stringify({
       present: detected.present,
       kind: detected.kind,
+      widgetState: detected.widgetState,
+      tokenPresent: detected.tokenPresent,
       title: detected.title,
       widget: detected.widget,
     }));
@@ -44,6 +47,8 @@ for (let i = 1; i <= runs; i += 1) {
       attempts: solved.attempts,
       elapsedMs: solved.elapsedMs,
       title: solved.title,
+      widgetState: solved.widgetState,
+      tokenPresent: solved.tokenPresent,
       bodySnippet: solved.bodySnippet?.slice(0, 160),
       error: solved.error,
       clicks: solved.clicks?.length,
@@ -55,7 +60,8 @@ for (let i = 1; i <= runs; i += 1) {
       attempts: solved.attempts,
       elapsedMs: solved.elapsedMs,
       title: solved.title,
-      bodySnippet: solved.bodySnippet?.slice(0, 120),
+      widgetState: solved.widgetState,
+      tokenPresent: solved.tokenPresent,
       detectPresent: detected.present,
       ms: Date.now() - started,
     });
