@@ -30,7 +30,7 @@ import {
 export type { ChallengeDetection, ChallengeKind, ClickChallengeResult, WidgetBox, WidgetState };
 
 export interface PageSummary {
-  id: string;
+  pageId: string;
   current: boolean;
   title: string;
   url: string;
@@ -41,10 +41,9 @@ export interface NavigationResult {
   url: string;
 }
 
-export interface BrowserStatus {
+export interface PageListResult {
   running: boolean;
-  pages: number;
-  currentPageId?: string;
+  pages: PageSummary[];
 }
 
 export interface NativeTaskResult {
@@ -72,30 +71,42 @@ export type ElementState = "attached" | "detached" | "visible" | "hidden";
 export type LoadState = "load" | "domcontentloaded" | "networkidle";
 export type SelectOptionMatch = "value" | "label";
 
-export interface WaitForOptions {
-  target?: string;
-  state?: ElementState;
-  text?: string;
-  textState?: "visible" | "hidden";
-  url?: string;
-  loadState?: LoadState;
-  timeMs?: number;
+export interface SnapshotOptions {
   frameId?: string;
+  scope?: string;
+  maxElements?: number;
+  maxChars?: number;
+}
+
+export interface GetTextOptions {
+  frameId?: string;
+  selector?: string;
+  maxChars?: number;
+}
+
+export type WaitForCondition =
+  | { kind: "element"; target: string; state?: ElementState; frameId?: string }
+  | { kind: "text"; text: string; state?: "visible" | "hidden"; frameId?: string }
+  | { kind: "url"; url: string }
+  | { kind: "load"; state: LoadState }
+  | { kind: "time"; timeMs: number };
+
+export interface WaitForOptions {
+  condition: WaitForCondition;
   timeoutMs: number;
 }
 
 export interface BrowserApi {
-  status(): Promise<BrowserStatus>;
-  listPages(): Promise<PageSummary[]>;
+  listPages(): Promise<PageListResult>;
   newPage(url?: string): Promise<PageSummary>;
   selectPage(pageId: string): Promise<PageSummary>;
-  closePage(pageId?: string): Promise<void>;
+  closePage(pageId?: string): Promise<PageListResult>;
   navigate(url: string): Promise<NavigationResult>;
   goBack(): Promise<NavigationResult>;
   goForward(): Promise<NavigationResult>;
   reload(): Promise<NavigationResult>;
-  snapshot(frameId?: string): Promise<string>;
-  getText(frameId?: string): Promise<string>;
+  snapshot(options?: SnapshotOptions): Promise<string>;
+  getText(options?: GetTextOptions): Promise<string>;
   screenshot(fullPage: boolean): Promise<Buffer>;
   click(target: string, frameId?: string): Promise<void>;
   hover(target: string, frameId?: string): Promise<void>;
@@ -135,14 +146,29 @@ const INTERACTIVE_SELECTOR = [
   "[contenteditable=true]",
 ].join(",");
 
+const DEFAULT_SNAPSHOT_ELEMENTS = 100;
+const MAX_SNAPSHOT_ELEMENTS = 250;
+const DEFAULT_SNAPSHOT_CHARS = 20_000;
+const MIN_SNAPSHOT_CHARS = 5_000;
+const HANDLE_BATCH_SIZE = 32;
+const MAX_SCREENSHOT_PIXELS = 25_000_000;
+const MAX_SCREENSHOT_DIMENSION = 20_000;
+
 function clip(value: string, max: number): string {
   if (value.length <= max) return value;
-  return `${value.slice(0, max)}\n\n[Content truncated; ${value.length} characters total]`;
+  const suffix = `\n\n[Content truncated; ${value.length} characters total]`;
+  const contentLength = Math.max(0, max - suffix.length);
+  return `${value.slice(0, contentLength)}${suffix.slice(0, max - contentLength)}`;
+}
+
+function clampInteger(value: number | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(Math.trunc(value), min), max);
 }
 
 function jsonValue(value: unknown): string {
   if (typeof value === "string") return value;
-  const encoded = JSON.stringify(value, null, 2);
+  const encoded = JSON.stringify(value);
   return encoded ?? String(value);
 }
 
@@ -181,17 +207,6 @@ export class ChromiumFishBrowser implements BrowserApi {
   private clickChallengeInFlight = false;
 
   constructor(private readonly config: ServerConfig) {}
-
-  async status(): Promise<BrowserStatus> {
-    const pages = this.context?.pages().filter((page) => !page.isClosed()) ?? [];
-    return {
-      running: Boolean(this.browser?.isConnected()),
-      pages: pages.length,
-      ...(this.currentPage && !this.currentPage.isClosed()
-        ? { currentPageId: this.pageId(this.currentPage) }
-        : {}),
-    };
-  }
 
   private nativeAgentArgs(): string[] {
     if (!this.config.allowNativeAgent) return [];
@@ -244,9 +259,38 @@ export class ChromiumFishBrowser implements BrowserApi {
         height: this.config.windowSize[1],
       },
     });
-    this.currentPage = await this.context.newPage();
-    this.trackPage(this.currentPage);
+    await this.installNavigationGuard(this.context);
     return this.context;
+  }
+
+  private async installNavigationGuard(context: BrowserContext): Promise<void> {
+    if (this.config.allowedHosts.length === 0) return;
+    await context.route("**/*", async (route) => {
+      const request = route.request();
+      if (!request.isNavigationRequest()) {
+        await route.continue();
+        return;
+      }
+
+      let topLevel = false;
+      try {
+        topLevel = request.frame().parentFrame() === null;
+      } catch {
+        await route.abort("blockedbyclient");
+        return;
+      }
+      if (!topLevel) {
+        await route.continue();
+        return;
+      }
+
+      try {
+        assertNavigationUrl(request.url(), this.config.allowedHosts);
+        await route.continue();
+      } catch {
+        await route.abort("blockedbyclient");
+      }
+    });
   }
 
   private trackPage(page: Page): void {
@@ -294,7 +338,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       title = "";
     }
     return {
-      id: this.pageId(page),
+      pageId: this.pageId(page),
       current: page === this.currentPage,
       title,
       url: page.url(),
@@ -315,9 +359,14 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.currentPage;
   }
 
-  async listPages(): Promise<PageSummary[]> {
-    const context = await this.ensureContext();
-    return Promise.all(context.pages().filter((page) => !page.isClosed()).map((page) => this.pageSummary(page)));
+  async listPages(): Promise<PageListResult> {
+    if (!this.context || !this.browser?.isConnected()) {
+      return { running: false, pages: [] };
+    }
+    const pages = await Promise.all(
+      this.context.pages().filter((page) => !page.isClosed()).map((page) => this.pageSummary(page)),
+    );
+    return { running: true, pages };
   }
 
   async newPage(rawUrl?: string): Promise<PageSummary> {
@@ -333,7 +382,8 @@ export class ChromiumFishBrowser implements BrowserApi {
   }
 
   async selectPage(pageId: string): Promise<PageSummary> {
-    const context = await this.ensureContext();
+    const context = this.context;
+    if (!context || !this.browser?.isConnected()) throw new Error("Browser is not running");
     const page = context.pages().find((candidate) => this.pageId(candidate) === pageId && !candidate.isClosed());
     if (!page) throw new Error(`Page ${pageId} not found`);
     this.currentPage = page;
@@ -341,14 +391,22 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.pageSummary(page);
   }
 
-  async closePage(pageId?: string): Promise<void> {
+  async closePage(pageId?: string): Promise<PageListResult> {
+    const context = this.context;
+    if (!context || !this.browser?.isConnected()) throw new Error("Browser is not running");
     const page = pageId
-      ? (await this.ensureContext()).pages().find((candidate) => this.pageId(candidate) === pageId)
-      : await this.page();
+      ? context.pages().find((candidate) => this.pageId(candidate) === pageId)
+      : this.currentPage && !this.currentPage.isClosed()
+        ? this.currentPage
+        : context.pages().find((candidate) => !candidate.isClosed());
     if (!page || page.isClosed()) throw new Error(`Page ${pageId ?? "current"} not found`);
     await this.clearRefs(page);
     await page.close();
-    if (this.currentPage === page) this.currentPage = undefined;
+    if (this.currentPage === page) {
+      this.currentPage = context.pages().filter((candidate) => !candidate.isClosed()).at(-1);
+      await this.currentPage?.bringToFront().catch(() => undefined);
+    }
+    return this.listPages();
   }
 
   async navigate(rawUrl: string): Promise<NavigationResult> {
@@ -387,107 +445,208 @@ export class ChromiumFishBrowser implements BrowserApi {
     await Promise.all([...refs.values()].map((handle) => handle.dispose().catch(() => undefined)));
   }
 
-  async snapshot(frameId?: string): Promise<string> {
-    const page = await this.page();
-    await this.clearRefs(page);
-    const frame = this.resolveFrame(page, frameId);
-    const handles = await frame.locator(INTERACTIVE_SELECTOR).elementHandles();
-    const refs = new Map<string, InteractiveHandle>();
-    const lines: string[] = [];
-
-    for (const handle of handles.slice(0, 250) as InteractiveHandle[]) {
-      if (!(await handle.isVisible().catch(() => false))) {
-        await handle.dispose().catch(() => undefined);
-        continue;
-      }
-      const info = await handle.evaluate((element) => {
-        const html = element as HTMLElement;
-        const input = element instanceof HTMLInputElement ? element : undefined;
-        const textarea = element instanceof HTMLTextAreaElement ? element : undefined;
-        const select = element instanceof HTMLSelectElement ? element : undefined;
-        const labels = input?.labels ?? textarea?.labels ?? select?.labels;
-        const type = input?.type.toLowerCase() ?? "";
-        const label = html.getAttribute("aria-label")
-          || labels?.[0]?.textContent
-          || (["button", "submit", "reset"].includes(type) ? input?.value : "")
-          || input?.placeholder
-          || textarea?.placeholder
-          || html.innerText
-          || html.getAttribute("title")
-          || "";
-        const ariaChecked = html.getAttribute("aria-checked");
-        const ariaExpanded = html.getAttribute("aria-expanded");
-        const checked = input && ["checkbox", "radio"].includes(type)
-          ? input.checked
-          : ariaChecked === "true"
-            ? true
-            : ariaChecked === "false"
-              ? false
-              : null;
-        const value = input && !["password", "checkbox", "radio", "file", "button", "submit", "reset"].includes(type)
-          ? input.value
-          : textarea
-            ? textarea.value
-            : null;
-        return {
-          role: html.getAttribute("role") || html.tagName.toLowerCase(),
-          label: label.trim().replace(/\s+/g, " ").slice(0, 120),
-          href: element instanceof HTMLAnchorElement ? element.href : "",
-          disabled: "disabled" in html && Boolean((html as HTMLButtonElement).disabled),
-          type,
-          value: value?.slice(0, 120) ?? null,
-          passwordSet: type === "password" && Boolean(input?.value),
-          checked,
-          selected: select
-            ? Array.from(select.selectedOptions).map((option) => option.value).slice(0, 20)
-            : [],
-          options: select
-            ? Array.from(select.options).slice(0, 20).map((option) => ({
-              value: option.value,
-              label: option.label.trim().replace(/\s+/g, " ").slice(0, 80),
-            }))
-            : [],
-          expanded: ariaExpanded === "true"
-            ? true
-            : ariaExpanded === "false"
-              ? false
-              : null,
-        };
-      }).catch(() => null);
-      if (!info) {
-        await handle.dispose().catch(() => undefined);
-        continue;
-      }
-      const ref = `e${refs.size + 1}`;
-      refs.set(ref, handle);
-      const suffix = [
-        info.type ? `type=${info.type}` : "",
-        info.disabled ? "disabled" : "",
-        info.checked === true ? "checked" : info.checked === false ? "unchecked" : "",
-        info.expanded === true ? "expanded" : info.expanded === false ? "collapsed" : "",
-        info.value !== null ? `value=${JSON.stringify(info.value)}` : "",
-        info.passwordSet ? "value=<redacted>" : "",
-        info.selected.length > 0 ? `selected=${JSON.stringify(info.selected)}` : "",
-        info.options.length > 0 ? `options=${JSON.stringify(info.options)}` : "",
-        info.href ? `-> ${info.href}` : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
-      lines.push(`[${ref}] ${info.role} "${info.label}"${suffix ? ` ${suffix}` : ""}`);
+  private async disposeHandles(handles: InteractiveHandle[]): Promise<void> {
+    for (let index = 0; index < handles.length; index += HANDLE_BATCH_SIZE) {
+      await Promise.all(
+        handles.slice(index, index + HANDLE_BATCH_SIZE)
+          .map((handle) => handle.dispose().catch(() => undefined)),
+      );
     }
-    this.refs.set(page, refs);
-    return lines.length > 0 ? lines.join("\n") : "(No visible interactive elements)";
   }
 
-  async getText(frameId?: string): Promise<string> {
+  async snapshot(options: SnapshotOptions = {}): Promise<string> {
     const page = await this.page();
-    const frame = this.resolveFrame(page, frameId);
-    const text = await frame.locator("body").innerText().catch(() => "");
-    return clip(text, this.config.maxTextChars);
+    await this.clearRefs(page);
+    const frame = this.resolveFrame(page, options.frameId);
+    const locator = options.scope
+      ? frame.locator(options.scope).locator(INTERACTIVE_SELECTOR)
+      : frame.locator(INTERACTIVE_SELECTOR);
+    const handles = await locator.elementHandles() as InteractiveHandle[];
+    const maxElements = clampInteger(
+      options.maxElements,
+      DEFAULT_SNAPSHOT_ELEMENTS,
+      1,
+      MAX_SNAPSHOT_ELEMENTS,
+    );
+    const requestedMaxChars = clampInteger(
+      options.maxChars,
+      DEFAULT_SNAPSHOT_CHARS,
+      MIN_SNAPSHOT_CHARS,
+      this.config.maxTextChars,
+    );
+    const maxChars = Math.min(requestedMaxChars, this.config.maxTextChars);
+    const refs = new Map<string, InteractiveHandle>();
+    const retained = new Set<InteractiveHandle>();
+    const lines: string[] = [];
+    let outputChars = 0;
+    let truncated = false;
+    let completed = false;
+
+    try {
+      outer: for (let start = 0; start < handles.length; start += HANDLE_BATCH_SIZE) {
+        const batch = handles.slice(start, start + HANDLE_BATCH_SIZE);
+        const visible = await Promise.all(
+          batch.map((handle) => handle.isVisible().catch(() => false)),
+        );
+        for (let offset = 0; offset < batch.length; offset += 1) {
+          if (!visible[offset]) continue;
+          if (refs.size >= maxElements) {
+            truncated = true;
+            break outer;
+          }
+
+          const handle = batch[offset];
+          if (!handle) continue;
+          const info = await handle.evaluate((element) => {
+            const html = element as HTMLElement;
+            const input = element instanceof HTMLInputElement ? element : undefined;
+            const textarea = element instanceof HTMLTextAreaElement ? element : undefined;
+            const select = element instanceof HTMLSelectElement ? element : undefined;
+            const labels = input?.labels ?? textarea?.labels ?? select?.labels;
+            const type = input?.type.toLowerCase() ?? "";
+            const label = html.getAttribute("aria-label")
+              || labels?.[0]?.textContent
+              || (["button", "submit", "reset"].includes(type) ? input?.value : "")
+              || input?.placeholder
+              || textarea?.placeholder
+              || html.innerText
+              || html.getAttribute("title")
+              || "";
+            const ariaChecked = html.getAttribute("aria-checked");
+            const ariaExpanded = html.getAttribute("aria-expanded");
+            const checked = input && ["checkbox", "radio"].includes(type)
+              ? input.checked
+              : ariaChecked === "true"
+                ? true
+                : ariaChecked === "false"
+                  ? false
+                  : null;
+            const value = input && !["password", "checkbox", "radio", "file", "button", "submit", "reset"].includes(type)
+              ? input.value
+              : textarea
+                ? textarea.value
+                : null;
+            return {
+              role: (html.getAttribute("role") || html.tagName.toLowerCase()).slice(0, 40),
+              label: label.trim().replace(/\s+/g, " ").slice(0, 120),
+              href: element instanceof HTMLAnchorElement ? element.href.slice(0, 300) : "",
+              disabled: html.getAttribute("aria-disabled") === "true"
+                || ("disabled" in html && Boolean((html as HTMLButtonElement).disabled)),
+              type,
+              value: value?.slice(0, 120) ?? null,
+              passwordSet: type === "password" && Boolean(input?.value),
+              checked,
+              selected: select
+                ? Array.from(select.selectedOptions).map((option) => option.value.slice(0, 120)).slice(0, 20)
+                : [],
+              selectedCount: select?.selectedOptions.length ?? 0,
+              options: select
+                ? Array.from(select.options).slice(0, 20).map((option) => ({
+                  value: option.value.slice(0, 120),
+                  label: option.label.trim().replace(/\s+/g, " ").slice(0, 80),
+                }))
+                : [],
+              optionCount: select?.options.length ?? 0,
+              expanded: ariaExpanded === "true"
+                ? true
+                : ariaExpanded === "false"
+                  ? false
+                  : null,
+            };
+          }).catch(() => null);
+          if (!info) continue;
+
+          const ref = `e${refs.size + 1}`;
+          const suffix = [
+            info.type ? `type=${info.type}` : "",
+            info.disabled ? "disabled" : "",
+            info.checked === true ? "checked" : info.checked === false ? "unchecked" : "",
+            info.expanded === true ? "expanded" : info.expanded === false ? "collapsed" : "",
+            info.value !== null ? `value=${JSON.stringify(info.value)}` : "",
+            info.passwordSet ? "value=<redacted>" : "",
+            info.selected.length > 0 ? `selected=${JSON.stringify(info.selected)}` : "",
+            info.selectedCount > info.selected.length
+              ? `selectedShown=${info.selected.length}/${info.selectedCount}`
+              : "",
+            info.options.length > 0 ? `options=${JSON.stringify(info.options)}` : "",
+            info.optionCount > info.options.length
+              ? `optionsShown=${info.options.length}/${info.optionCount}`
+              : "",
+            info.href ? `-> ${info.href}` : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          let line = `[${ref}] ${info.role} ${JSON.stringify(info.label)}${suffix ? ` ${suffix}` : ""}`;
+          const separatorChars = lines.length > 0 ? 1 : 0;
+          if (line.length + separatorChars > maxChars && lines.length === 0) {
+            line = `${line.slice(0, Math.max(0, maxChars - 18))} [line truncated]`;
+            truncated = true;
+          } else if (outputChars + separatorChars + line.length > maxChars) {
+            truncated = true;
+            break outer;
+          }
+
+          refs.set(ref, handle);
+          retained.add(handle);
+          lines.push(line);
+          outputChars += separatorChars + line.length;
+          if (truncated) break outer;
+        }
+      }
+
+      this.refs.set(page, refs);
+      completed = true;
+      if (truncated) {
+        lines.push(
+          `[Snapshot truncated after ${refs.size} elements; narrow scope or adjust maxElements/maxChars]`,
+        );
+      }
+      return lines.length > 0 ? clip(lines.join("\n"), maxChars) : "(No visible interactive elements)";
+    } finally {
+      await this.disposeHandles(
+        handles.filter((handle) => !completed || !retained.has(handle)),
+      );
+    }
+  }
+
+  async getText(options: GetTextOptions = {}): Promise<string> {
+    const page = await this.page();
+    const frame = this.resolveFrame(page, options.frameId);
+    const locator = frame.locator(options.selector ?? "body").first();
+    const text = options.selector
+      ? await locator.innerText()
+      : await locator.innerText().catch(() => "");
+    const defaultMax = Math.min(DEFAULT_SNAPSHOT_CHARS, this.config.maxTextChars);
+    const maxChars = Math.min(
+      clampInteger(options.maxChars, defaultMax, 100, this.config.maxTextChars),
+      this.config.maxTextChars,
+    );
+    return clip(text, maxChars);
   }
 
   async screenshot(fullPage: boolean): Promise<Buffer> {
-    return (await this.page()).screenshot({ type: "png", fullPage });
+    const page = await this.page();
+    const dimensions = fullPage
+      ? await page.evaluate(() => ({
+        width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0),
+        height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0),
+      }))
+      : page.viewportSize() ?? await page.evaluate(() => ({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }));
+    const pixels = dimensions.width * dimensions.height;
+    if (
+      dimensions.width > MAX_SCREENSHOT_DIMENSION
+      || dimensions.height > MAX_SCREENSHOT_DIMENSION
+      || pixels > MAX_SCREENSHOT_PIXELS
+    ) {
+      const advice = fullPage ? "capture the viewport or reduce --window-size" : "reduce --window-size";
+      throw new Error(
+        `${fullPage ? "Full-page" : "Viewport"} screenshot is too large (${dimensions.width}x${dimensions.height}); ${advice}`,
+      );
+    }
+    return page.screenshot({ type: "png", fullPage });
   }
 
   private async resolveTarget(page: Page, target: string, frameId?: string): Promise<InteractiveHandle> {
@@ -573,6 +732,13 @@ export class ChromiumFishBrowser implements BrowserApi {
   async setChecked(target: string, checked: boolean, frameId?: string): Promise<boolean> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
+    const kind = await handle.evaluate((element) => {
+      if (element instanceof HTMLInputElement) return element.type.toLowerCase();
+      return element.getAttribute("role")?.toLowerCase() ?? "";
+    });
+    if (kind === "radio" && !checked) {
+      throw new Error(`Radio target ${target} cannot be unchecked directly; select another radio option instead`);
+    }
     let actual = await handle.isChecked();
     if (actual !== checked) {
       await this.clickHandle(page, handle);
@@ -633,7 +799,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   }
 
   async listFrames(options: { includeBox?: boolean } = {}): Promise<FrameSummary[]> {
-    const includeBox = options.includeBox !== false;
+    const includeBox = options.includeBox === true;
     const page = await this.page();
     const frames = page.frames();
     const summary = (frame: Frame): Omit<FrameSummary, "box"> => {
@@ -1151,39 +1317,21 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   async waitFor(options: WaitForOptions): Promise<void> {
     const page = await this.page();
-    const conditionCount = [
-      options.target !== undefined,
-      options.text !== undefined,
-      options.url !== undefined,
-      options.loadState !== undefined,
-      options.timeMs !== undefined,
-    ].filter(Boolean).length;
-    if (conditionCount !== 1) {
-      throw new Error("wait_for requires exactly one of target, text, url, loadState, or timeMs");
-    }
-    if (options.state && options.target === undefined) {
-      throw new Error("wait_for state requires target");
-    }
-    if (options.textState && options.text === undefined) {
-      throw new Error("wait_for textState requires text");
-    }
-    if (options.frameId && options.target === undefined && options.text === undefined) {
-      throw new Error("wait_for frameId is valid only with target or text");
-    }
+    const condition = options.condition;
 
-    if (options.target !== undefined) {
-      const state = options.state ?? "visible";
-      if (!/^e\d+$/.test(options.target)) {
-        const frame = this.resolveFrame(page, options.frameId);
-        await frame.locator(options.target).first().waitFor({ state, timeout: options.timeoutMs });
+    if (condition.kind === "element") {
+      const state = condition.state ?? "visible";
+      if (!/^e\d+$/.test(condition.target)) {
+        const frame = this.resolveFrame(page, condition.frameId);
+        await frame.locator(condition.target).first().waitFor({ state, timeout: options.timeoutMs });
         return;
       }
-      const handle = this.refs.get(page)?.get(options.target);
-      if (!handle) throw new Error(`Unknown element reference ${options.target}; call snapshot again`);
+      const handle = this.refs.get(page)?.get(condition.target);
+      if (!handle) throw new Error(`Unknown element reference ${condition.target}; call snapshot again`);
       const ownerFrame = await handle.ownerFrame();
-      if (!ownerFrame) throw new Error(`Target ${options.target} is no longer attached to a frame`);
-      if (options.frameId && ownerFrame !== this.resolveFrame(page, options.frameId)) {
-        throw new Error(`Target ${options.target} does not belong to frame ${options.frameId}`);
+      if (!ownerFrame) throw new Error(`Target ${condition.target} is no longer attached to a frame`);
+      if (condition.frameId && ownerFrame !== this.resolveFrame(page, condition.frameId)) {
+        throw new Error(`Target ${condition.target} does not belong to frame ${condition.frameId}`);
       }
       await ownerFrame.waitForFunction(
         ({ element, desired }) => {
@@ -1201,29 +1349,30 @@ export class ChromiumFishBrowser implements BrowserApi {
       return;
     }
 
-    if (options.text !== undefined) {
-      const frame = this.resolveFrame(page, options.frameId);
-      await frame.getByText(options.text, { exact: false }).first().waitFor({
-        state: options.textState ?? "visible",
+    if (condition.kind === "text") {
+      const frame = this.resolveFrame(page, condition.frameId);
+      const visibleMatches = frame.getByText(condition.text, { exact: false }).filter({ visible: true });
+      await visibleMatches.first().waitFor({
+        state: (condition.state ?? "visible") === "visible" ? "attached" : "detached",
         timeout: options.timeoutMs,
       });
       return;
     }
 
-    if (options.url !== undefined) {
-      await page.waitForURL(options.url, {
+    if (condition.kind === "url") {
+      await page.waitForURL(condition.url, {
         timeout: options.timeoutMs,
         waitUntil: "domcontentloaded",
       });
       return;
     }
 
-    if (options.loadState !== undefined) {
-      await page.waitForLoadState(options.loadState, { timeout: options.timeoutMs });
+    if (condition.kind === "load") {
+      await page.waitForLoadState(condition.state, { timeout: options.timeoutMs });
       return;
     }
 
-    await page.waitForTimeout(options.timeMs!);
+    await page.waitForTimeout(condition.timeMs);
   }
 
   async evalJs(expression: string): Promise<unknown> {

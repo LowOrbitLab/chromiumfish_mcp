@@ -152,7 +152,7 @@ Options:
   --timezone ZONE            Use an IANA time zone or auto
   --proxy URL                Route browser traffic through a proxy
   --allowed-host HOST        Allow navigation to a host; repeatable
-  --max-text-chars N         Limit page text output (default: 50000)
+  --max-text-chars N         Set the text and snapshot hard limit (default: 50000)
   --allow-eval               Enable the arbitrary JavaScript execution tool
   --allow-native-agent       Enable the native browser agent tool
   --help                     Show help
