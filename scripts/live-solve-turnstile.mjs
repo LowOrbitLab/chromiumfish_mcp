@@ -40,7 +40,7 @@ for (let i = 1; i <= runs; i += 1) {
       title: detected.title,
       widget: detected.widget,
     }));
-    const solved = await browser.clickChallenge({ timeoutMs: 60_000, maxClicks: 14 });
+    const solved = await browser.solveChallenge({ timeoutMs: 60_000, maxClicks: 14 });
     console.log("solve:", JSON.stringify({
       ok: solved.ok,
       method: solved.method,
