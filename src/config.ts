@@ -72,6 +72,7 @@ export function parseCli(argv: string[]): ParsedCli {
   if (process.env.CHROME_BIN) config.chromePath = process.env.CHROME_BIN;
   let help = false;
   let version = false;
+  let timezoneArg: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -110,7 +111,7 @@ export function parseCli(argv: string[]): ParsedCli {
         index += 1;
         break;
       case "--timezone":
-        config.timezone = readValue(argv, index, arg);
+        timezoneArg = readValue(argv, index, arg);
         index += 1;
         break;
       case "--proxy":
@@ -135,6 +136,13 @@ export function parseCli(argv: string[]): ParsedCli {
     }
   }
 
+  if (timezoneArg === undefined) {
+    // Local executables cannot resolve "auto", so they keep the host time zone by default.
+    if (!config.chromePath) config.timezone = "auto";
+  } else if (timezoneArg !== "system") {
+    config.timezone = timezoneArg;
+  }
+
   return { config, help, version };
 }
 
@@ -149,7 +157,7 @@ Options:
   --browser-version VERSION  Select an upstream browser build
   --headed                   Show the browser window (default: headless)
   --window-size WIDTHxHEIGHT Set the window size (default: 1920x1080)
-  --timezone ZONE            Use an IANA time zone or auto
+  --timezone ZONE            Use an IANA time zone, auto, or system (default: auto)
   --proxy URL                Route browser traffic through a proxy
   --allowed-host HOST        Allow navigation to a host; repeatable
   --max-text-chars N         Set the text and snapshot hard limit (default: 50000)

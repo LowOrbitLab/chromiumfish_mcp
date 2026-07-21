@@ -228,7 +228,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         throw new Error(`ChromiumFish executable does not exist: ${this.config.chromePath}`);
       }
       if (this.config.timezone === "auto") {
-        throw new Error("--chrome-path does not support --timezone auto; specify an IANA time zone");
+        throw new Error("--chrome-path does not support --timezone auto; specify an IANA time zone or system");
       }
       const env = this.config.timezone
         ? { ...(process.env as Record<string, string>), TZ: this.config.timezone }

@@ -61,7 +61,7 @@ Snapshot references, frame-aware interaction, waiting, and the cross-origin chal
 --browser-version VERSION  Select an upstream ChromiumFish build version
 --headed                   Show the browser window
 --window-size WIDTHxHEIGHT Set the browser window size
---timezone ZONE            Use an IANA time zone or auto
+--timezone ZONE            Use an IANA time zone, auto, or system (default: auto)
 --proxy URL                Route browser traffic through a proxy
 --allowed-host HOST        Allow top-level navigation to a host and its subdomains; repeatable
 --max-text-chars N         Set the hard limit for text and snapshot output
