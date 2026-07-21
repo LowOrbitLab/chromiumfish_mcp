@@ -92,7 +92,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: { url: z.string().url().optional() },
       annotations: MUTATING,
     },
-    async ({ url }) => structured(await browser.newPage(url)),
+    async ({ url }) => structured(await browser.openPage(url)),
   );
 
   server.registerTool(
@@ -132,7 +132,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {},
       annotations: MUTATING,
     },
-    async () => structured(await browser.goBack()),
+    async () => structured(await browser.navigateBack()),
   );
 
   server.registerTool(
@@ -142,7 +142,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {},
       annotations: MUTATING,
     },
-    async () => structured(await browser.goForward()),
+    async () => structured(await browser.navigateForward()),
   );
 
   server.registerTool(
@@ -203,7 +203,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ fullPage }) => ({
       content: [{
         type: "image" as const,
-        data: (await browser.screenshot(fullPage)).toString("base64"),
+        data: (await browser.takeScreenshot(fullPage)).toString("base64"),
         mimeType: "image/png",
       }],
     }),
@@ -252,7 +252,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       },
       annotations: MUTATING,
     },
-    async ({ x, y }) => structured(await browser.mouseClick(x, y)),
+    async ({ x, y }) => structured(await browser.clickAt(x, y)),
   );
 
   server.registerTool(
@@ -293,7 +293,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       annotations: MUTATING,
     },
     async ({ timeoutMs, maxClicks }) => structured(
-      await browser.clickChallenge({ timeoutMs, maxClicks }),
+      await browser.solveChallenge({ timeoutMs, maxClicks }),
     ),
   );
 
@@ -402,7 +402,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         inputSchema: { expression: z.string().min(1) },
         annotations: DESTRUCTIVE,
       },
-      async ({ expression }) => text(await browser.evalJs(expression)),
+      async ({ expression }) => text(await browser.evaluate(expression)),
     );
   }
 
