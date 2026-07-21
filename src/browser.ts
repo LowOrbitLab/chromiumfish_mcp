@@ -164,8 +164,8 @@ function clip(value: string, max: number): string {
 }
 
 function clampInteger(value: number | undefined, fallback: number, min: number, max: number): number {
-  if (value === undefined || !Number.isFinite(value)) return fallback;
-  return Math.min(Math.max(Math.trunc(value), min), max);
+  const resolved = value === undefined || !Number.isFinite(value) ? fallback : value;
+  return Math.min(Math.max(Math.trunc(resolved), min), max);
 }
 
 function jsonValue(value: unknown): string {
@@ -436,7 +436,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const refs = this.refs.get(page);
     this.refs.delete(page);
     if (!refs) return;
-    await Promise.all([...refs.values()].map((handle) => handle.dispose().catch(() => undefined)));
+    await this.disposeHandles([...refs.values()]);
   }
 
   private async disposeHandles(handles: InteractiveHandle[]): Promise<void> {
@@ -462,13 +462,12 @@ export class ChromiumFishBrowser implements BrowserApi {
       1,
       MAX_SNAPSHOT_ELEMENTS,
     );
-    const requestedMaxChars = clampInteger(
+    const maxChars = clampInteger(
       options.maxChars,
       DEFAULT_SNAPSHOT_CHARS,
       MIN_SNAPSHOT_CHARS,
       this.config.maxTextChars,
     );
-    const maxChars = Math.min(requestedMaxChars, this.config.maxTextChars);
     const refs = new Map<string, InteractiveHandle>();
     const retained = new Set<InteractiveHandle>();
     const lines: string[] = [];
@@ -619,11 +618,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const text = options.selector
       ? await locator.innerText({ timeout: TEXT_LOCATOR_TIMEOUT_MS })
       : await locator.innerText({ timeout: TEXT_LOCATOR_TIMEOUT_MS }).catch(() => "");
-    const defaultMax = Math.min(DEFAULT_SNAPSHOT_CHARS, this.config.maxTextChars);
-    const maxChars = Math.min(
-      clampInteger(options.maxChars, defaultMax, 100, this.config.maxTextChars),
-      this.config.maxTextChars,
-    );
+    const maxChars = clampInteger(options.maxChars, DEFAULT_SNAPSHOT_CHARS, 100, this.config.maxTextChars);
     return clip(text, maxChars);
   }
 
@@ -832,11 +827,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     }));
   }
 
-  private async readTurnstileToken(page: Page): Promise<string> {
+  private async readTurnstileToken(page: Page, title: string): Promise<string> {
     // Avoid probing challenge-related inputs while still on a CF gate page.
     // A/B: evaluateAll on cf-turnstile-response / cf-chl-widget* before click => 0/3 pass;
     // same click path without the probe => 3/3 pass.
-    const title = await page.title().catch(() => "");
     if (/just a moment|\u5b89\u5168\u9a8c\u8bc1|checking your browser|performing security verification/i.test(title)) {
       return "";
     }
@@ -921,7 +915,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const bodyText = await this.readBody(page);
     const frameUrls = page.frames().map((frame) => frame.url());
     const hasChallengeFrame = frameUrls.some((frameUrl) => isCloudflareFrameUrl(frameUrl));
-    const token = await this.readTurnstileToken(page);
+    const token = await this.readTurnstileToken(page, title);
     const tokenPresent = token.length > 10;
     // Challenge-frame text is deliberately not read: probing challenges.cloudflare.com
     // frames before clearance collapses success rates, so widget state relies on token
