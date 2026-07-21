@@ -293,7 +293,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       annotations: MUTATING,
     },
     async ({ timeoutMs, maxClicks }) => structured(
-      await browser.clickChallenge({ timeoutMs, maxClicks }),
+      await browser.solveChallenge({ timeoutMs, maxClicks }),
     ),
   );
 

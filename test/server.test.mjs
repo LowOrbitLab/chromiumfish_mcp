@@ -72,18 +72,21 @@ function fakeBrowser() {
       tokenPresent: false,
       frames: [{ url: "https://example.com/" }],
     }),
-    clickChallenge: async () => ({
-      ok: true,
-      method: "already_clear",
-      attempts: 0,
-      elapsedMs: 1,
-      title: "Example",
-      url: "https://example.com/",
-      bodySnippet: "Example Domain",
-      widgetState: "absent",
-      tokenPresent: false,
-      clicks: [],
-    }),
+    solveChallenge: async (options) => {
+      calls.push(["solveChallenge", options]);
+      return {
+        ok: true,
+        method: "already_clear",
+        attempts: 0,
+        elapsedMs: 1,
+        title: "Example",
+        url: "https://example.com/",
+        bodySnippet: "Example Domain",
+        widgetState: "absent",
+        tokenPresent: false,
+        clicks: [],
+      };
+    },
     typeText: async (target, value, clear, submit, frameId) => {
       calls.push(["typeText", target, value, clear, submit, frameId]);
     },
@@ -143,7 +146,7 @@ test("default tool set has a stable annotated contract", async (context) => {
 });
 
 test("solve_challenge and click_at return structured results", async (context) => {
-  const { client, server } = await connectedClient();
+  const { browser, client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
     await server.close();
@@ -154,6 +157,7 @@ test("solve_challenge and click_at return structured results", async (context) =
   });
   assert.match(solved.content[0].text, /already_clear/);
   assert.equal(solved.structuredContent.method, "already_clear");
+  assert.deepEqual(browser.calls[0], ["solveChallenge", { timeoutMs: 5000, maxClicks: 3 }]);
   const clicked = await client.callTool({
     name: "click_at",
     arguments: { x: 10, y: 20 },
