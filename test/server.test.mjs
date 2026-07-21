@@ -13,6 +13,20 @@ const config = {
   allowedHosts: [],
 };
 
+const SNAPSHOT_TEXT = "[e1] button \"Submit\"";
+
+/** Mirror ChromiumFishBrowser's ActionResult contract, including the opt-in snapshot. */
+function acted(options, extra = {}) {
+  return {
+    ok: true,
+    url: "https://example.com/",
+    title: "Example",
+    navigated: false,
+    ...(options?.returnSnapshot ? { snapshot: SNAPSHOT_TEXT } : {}),
+    ...extra,
+  };
+}
+
 function fakeBrowser() {
   const calls = [];
   return {
@@ -21,14 +35,21 @@ function fakeBrowser() {
     openPage: async () => ({ pageId: "page-1", current: true, title: "", url: "about:blank" }),
     selectPage: async (pageId) => ({ pageId, current: true, title: "Example", url: "https://example.com/" }),
     closePage: async () => ({ running: true, pages: [] }),
-    navigate: async (url) => ({ title: "Example", url }),
+    navigate: async (url, options) => {
+      calls.push(["navigate", url, options]);
+      return {
+        title: "Example",
+        url,
+        ...(options?.returnSnapshot ? { snapshot: SNAPSHOT_TEXT } : {}),
+      };
+    },
     navigateBack: async () => ({ title: "", url: "about:blank" }),
-    navigateForward: async () => {
-      calls.push(["navigateForward"]);
+    navigateForward: async (options) => {
+      calls.push(["navigateForward", options]);
       return { title: "Forward", url: "https://example.com/forward" };
     },
-    reload: async () => {
-      calls.push(["reload"]);
+    reload: async (options) => {
+      calls.push(["reload", options]);
       return { title: "Example", url: "https://example.com/" };
     },
     snapshot: async (options) => {
@@ -40,17 +61,23 @@ function fakeBrowser() {
       return "Page body";
     },
     takeScreenshot: async () => Buffer.from("png"),
-    click: async (target, frameId) => calls.push(["click", target, frameId]),
-    hover: async (target, frameId) => calls.push(["hover", target, frameId]),
-    selectOption: async (target, values, matchBy, frameId) => {
-      calls.push(["selectOption", target, values, matchBy, frameId]);
-      return values;
+    click: async (target, frameId, options) => {
+      calls.push(["click", target, frameId, options]);
+      return acted(options, { navigated: true, newPages: ["page-2"] });
     },
-    setChecked: async (target, checked, frameId) => {
-      calls.push(["setChecked", target, checked, frameId]);
-      return checked;
+    hover: async (target, frameId, options) => {
+      calls.push(["hover", target, frameId, options]);
+      return acted(options);
     },
-    clickAt: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
+    selectOption: async (target, values, matchBy, frameId, options) => {
+      calls.push(["selectOption", target, values, matchBy, frameId, options]);
+      return acted(options, { selectedValues: values });
+    },
+    setChecked: async (target, checked, frameId, options) => {
+      calls.push(["setChecked", target, checked, frameId, options]);
+      return acted(options, { checked });
+    },
+    clickAt: async (x, y, options) => acted(options, { x, y }),
     listFrames: async (options) => {
       if (options?.includeBox === false) {
         return [{ frameId: "frame-1", url: "https://example.com/", name: "" }];
@@ -87,12 +114,16 @@ function fakeBrowser() {
         clicks: [],
       };
     },
-    typeText: async (target, value, clear, submit, frameId) => {
-      calls.push(["typeText", target, value, clear, submit, frameId]);
+    typeText: async (target, value, clear, submit, frameId, options) => {
+      calls.push(["typeText", target, value, clear, submit, frameId, options]);
+      return acted(options);
     },
-    pressKey: async () => undefined,
-    scroll: async () => undefined,
-    waitFor: async (options) => calls.push(["waitFor", options]),
+    pressKey: async (key, options) => acted(options),
+    scroll: async (deltaX, deltaY, options) => acted(options),
+    waitFor: async (options, actionOptions) => {
+      calls.push(["waitFor", options, actionOptions]);
+      return acted(actionOptions);
+    },
     evaluate: async () => 42,
     runTask: async () => ({ success: true, finalText: "Completed", steps: 1 }),
     close: async () => undefined,
@@ -245,17 +276,24 @@ test("forwards bounded inspection, form, navigation, and typed wait arguments", 
     selector: "main",
     maxChars: 5000,
   }]);
-  assert.deepEqual(browser.calls[2], ["hover", "#menu", "frame-2"]);
+  assert.deepEqual(browser.calls[2], ["hover", "#menu", "frame-2", { returnSnapshot: false }]);
   assert.deepEqual(browser.calls[3], [
     "selectOption",
     "#country",
     ["United States"],
     "label",
     "frame-2",
+    { returnSnapshot: false },
   ]);
-  assert.deepEqual(browser.calls[4], ["setChecked", "#terms", true, "frame-2"]);
-  assert.deepEqual(browser.calls[5], ["navigateForward"]);
-  assert.deepEqual(browser.calls[6], ["reload"]);
+  assert.deepEqual(browser.calls[4], [
+    "setChecked",
+    "#terms",
+    true,
+    "frame-2",
+    { returnSnapshot: false },
+  ]);
+  assert.deepEqual(browser.calls[5], ["navigateForward", { returnSnapshot: false }]);
+  assert.deepEqual(browser.calls[6], ["reload", { returnSnapshot: false }]);
   assert.equal(browser.calls[7][0], "waitFor");
   assert.equal(browser.calls[7][1].condition.text, "Complete");
   assert.equal(browser.calls[7][1].condition.frameId, "frame-2");
@@ -302,6 +340,81 @@ test("registers dangerous tools when explicitly enabled", async (context) => {
   const names = (await client.listTools()).tools.map((tool) => tool.name);
   assert.ok(names.includes("evaluate"));
   assert.ok(names.includes("run_task"));
+});
+
+test("initialize carries workflow instructions", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const instructions = client.getInstructions();
+  assert.match(instructions, /Element references/);
+  assert.match(instructions, /returnSnapshot/);
+  assert.match(instructions, /solve_challenge ok: false is terminal/);
+});
+
+test("actions report page state so callers can skip a follow-up snapshot", async (context) => {
+  const { client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const clicked = await client.callTool({
+    name: "click",
+    arguments: { target: "e1" },
+  });
+  assert.deepEqual(clicked.structuredContent, {
+    ok: true,
+    url: "https://example.com/",
+    title: "Example",
+    navigated: true,
+    newPages: ["page-2"],
+    target: "e1",
+  });
+  assert.equal(clicked.content.length, 1);
+
+  const typed = await client.callTool({
+    name: "type_text",
+    arguments: { target: "e2", text: "hello", submit: true },
+  });
+  assert.equal(typed.structuredContent.submitted, true);
+  assert.equal(typed.structuredContent.navigated, false);
+
+  const waited = await client.callTool({
+    name: "wait_for",
+    arguments: { condition: { kind: "load", state: "load" } },
+  });
+  assert.equal(waited.structuredContent.kind, "load");
+  assert.equal(waited.structuredContent.url, "https://example.com/");
+});
+
+test("returnSnapshot appends a plain-text block and stays out of structuredContent", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const clicked = await client.callTool({
+    name: "click",
+    arguments: { target: "e1", returnSnapshot: true },
+  });
+  assert.deepEqual(browser.calls[0], ["click", "e1", undefined, { returnSnapshot: true }]);
+  assert.equal(clicked.content.length, 2);
+  // Raw newlines, not a JSON-escaped blob inside the state object.
+  assert.equal(clicked.content[1].text, "[e1] button \"Submit\"");
+  assert.equal(clicked.structuredContent.snapshot, undefined);
+  assert.equal(clicked.structuredContent.navigated, true);
+
+  const navigated = await client.callTool({
+    name: "navigate",
+    arguments: { url: "https://example.com/", returnSnapshot: true },
+  });
+  assert.equal(navigated.content.length, 2);
+  assert.equal(navigated.content[1].text, "[e1] button \"Submit\"");
+  assert.equal(navigated.structuredContent.snapshot, undefined);
 });
 
 test("tool calls return browser results", async (context) => {

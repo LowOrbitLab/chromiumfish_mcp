@@ -4,19 +4,49 @@ Detailed usage notes for the browser tools. See the [README](../README.md) for i
 
 The browser starts lazily on the first tool call that needs a page, and is cleaned up automatically when the MCP client disconnects.
 
+## Action results
+
+`navigate`, `navigate_back`, `navigate_forward`, `reload`, `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for`, and `click_at` report the state they produced, so a follow-up `snapshot` or `get_text` is only needed when something actually changed:
+
+```json
+{ "ok": true, "url": "https://example.com/done", "title": "Done", "navigated": true, "newPages": ["page-2"], "target": "e4" }
+```
+
+- `navigated` is true when the URL changed within the action's settle window. Actions that start a navigation later than that report it on the next call, and same-URL navigations are not detected.
+- `newPages` lists pages the action opened, such as a `target="_blank"` link. The current page never switches automatically — use `select_page` to move to one.
+- A detected navigation invalidates element references, exactly as `navigate` does.
+
+Set `returnSnapshot: true` on any of those tools to receive the action result and a fresh snapshot in a single call. The snapshot arrives as a separate plain-text content block rather than a JSON-escaped string, and — like every snapshot — it renumbers element references.
+
 ## Snapshots and element references
 
 `snapshot` lists visible interactive elements and assigns temporary references (`e1`, `e2`, …). A call returns output like:
 
 ```text
-[e1] input "Search" type=text value=""
+[e1] textbox "Search" type=text value=""
 [e2] button "Submit"
-[e3] input "Remember me" type=checkbox unchecked
-[e4] select "Region" selected=["us"]
+[e3] checkbox "Remember me" type=checkbox unchecked
+[e4] combobox "Region" selected=["us"]
 [e5] link "Documentation" -> https://example.com/docs
 ```
 
 Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. References belong to the latest snapshot of the current page and selected frame — request a new snapshot after the page changes.
+
+Reference numbers are identifiers, not positions, and are **never reused**. Snapshots keep counting up rather than restarting at `e1`, so a reference held from an earlier snapshot fails with an explicit error instead of silently resolving to whatever element now occupies that slot. Nothing about document order can be inferred from the number.
+
+## Targeting without a reference
+
+Every `target` field also accepts a selector, which is the durable alternative when a page re-renders often:
+
+```json
+{ "target": "role=button[name=\"Submit\"]" }
+```
+
+The role and label are exactly what `snapshot` already printed, so this costs no extra output to use. Name matching is case-insensitive and matches a substring. CSS selectors work in the same field.
+
+Roles are reported as ARIA roles wherever HTML defines one — `link`, `button`, `textbox`, `checkbox`, `radio`, `combobox`, `listbox`, `searchbox`, `slider`, `spinbutton`. Elements HTML gives no role, such as password, file, and date inputs, print their tag name instead (`input`); those cannot be targeted with `role=`, so use a reference or a CSS selector.
+
+Resolving a target — reference or selector — is bounded at five seconds, so a selector that matches nothing fails quickly instead of stalling the call. Navigation keeps a separate thirty-second bound. Use `wait_for` when an element legitimately needs longer to appear.
 
 `snapshot` reports input type and value, checked/unchecked, selected values, up to 20 dropdown options, expanded/collapsed, and disabled. Password values are never returned. Output defaults to 100 visible elements and 20,000 characters; tune it with `scope`, `maxElements`, and `maxChars`. A truncation marker means more matching elements may exist. Use `select_option` with `matchBy: "value"` or `matchBy: "label"`, and use `set_checked` instead of toggling a checkbox blindly. Radios support `checked: true` only; select another radio to change the choice.
 
