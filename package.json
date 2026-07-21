@@ -1,6 +1,6 @@
 {
   "name": "chromiumfish_mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A secure, session-aware MCP server for ChromiumFish.",
   "type": "module",
   "main": "./dist/index.js",

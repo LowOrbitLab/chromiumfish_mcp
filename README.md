@@ -51,6 +51,8 @@ To run from GitHub instead of a global install, set `"command": "npx"` and prepe
 | `evaluate` | Run arbitrary JavaScript — requires `--allow-eval` |
 | `run_task` | Native ChromiumFish agent — requires `--allow-native-agent` |
 
+Every navigation and interaction tool reports the resulting `url`, `title`, `navigated`, and any `newPages`, so a client only needs a follow-up `snapshot` when the page actually changed; `returnSnapshot: true` returns the action result and a fresh snapshot in one call. Reference numbers are never reused, so one held across a snapshot fails with an error instead of acting on a different element; `snapshot` also reports ARIA roles, so `role=button[name="Submit"]` works in any `target` field as a re-render-proof alternative. The server ships MCP `instructions` describing this workflow, reference lifetime, and the challenge sequence.
+
 Snapshot references, frame-aware interaction, waiting, and the cross-origin challenge workflow are covered in **[docs/USAGE.md](docs/USAGE.md)**.
 
 ## Command-line options
