@@ -68,6 +68,8 @@ Action results
   wait_for, and click_at return the resulting url and title plus navigated and newPages.
   Read those instead of calling snapshot reflexively: re-snapshot only when navigated is
   true or the part of the DOM you need has changed.
+- navigate, navigate_back, navigate_forward, and reload always report navigated: true.
+  They invalidate refs even when the URL is unchanged, so always re-snapshot after one.
 - Pass returnSnapshot: true to get the action result and a fresh snapshot in one call.
 - newPages lists tabs the action opened. The current page never switches automatically;
   use select_page to move to one.

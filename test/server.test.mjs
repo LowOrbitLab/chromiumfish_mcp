@@ -35,22 +35,24 @@ function fakeBrowser() {
     openPage: async () => ({ pageId: "page-1", current: true, title: "", url: "about:blank" }),
     selectPage: async (pageId) => ({ pageId, current: true, title: "Example", url: "https://example.com/" }),
     closePage: async () => ({ running: true, pages: [] }),
+    // The navigation tools report the same shape as every other action, with
+    // navigated unconditionally true.
     navigate: async (url, options) => {
       calls.push(["navigate", url, options]);
-      return {
-        title: "Example",
-        url,
-        ...(options?.returnSnapshot ? { snapshot: SNAPSHOT_TEXT } : {}),
-      };
+      return acted(options, { url, navigated: true });
     },
-    navigateBack: async () => ({ title: "", url: "about:blank" }),
+    navigateBack: async () => acted(undefined, { url: "about:blank", title: "", navigated: true }),
     navigateForward: async (options) => {
       calls.push(["navigateForward", options]);
-      return { title: "Forward", url: "https://example.com/forward" };
+      return acted(options, {
+        url: "https://example.com/forward",
+        title: "Forward",
+        navigated: true,
+      });
     },
     reload: async (options) => {
       calls.push(["reload", options]);
-      return { title: "Example", url: "https://example.com/" };
+      return acted(options, { navigated: true });
     },
     snapshot: async (options) => {
       calls.push(["snapshot", options]);
@@ -388,6 +390,22 @@ test("actions report page state so callers can skip a follow-up snapshot", async
   });
   assert.equal(waited.structuredContent.kind, "load");
   assert.equal(waited.structuredContent.url, "https://example.com/");
+
+  // The navigation tools report the same fields. Omitting navigated here would read as
+  // falsy - "the page did not move" - immediately after a navigation that cleared refs.
+  const navigated = await client.callTool({
+    name: "navigate",
+    arguments: { url: "https://example.com/next" },
+  });
+  assert.deepEqual(navigated.structuredContent, {
+    ok: true,
+    url: "https://example.com/next",
+    title: "Example",
+    navigated: true,
+  });
+  const reloaded = await client.callTool({ name: "reload", arguments: {} });
+  assert.equal(reloaded.structuredContent.ok, true);
+  assert.equal(reloaded.structuredContent.navigated, true);
 });
 
 test("returnSnapshot appends a plain-text block and stays out of structuredContent", async (context) => {

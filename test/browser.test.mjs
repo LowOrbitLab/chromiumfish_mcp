@@ -333,6 +333,12 @@ test("actions report navigation, opened pages, and an opt-in snapshot", async ()
       first: () => ({ elementHandle: async () => handle }),
     }),
   };
+  const opened = {
+    isClosed: () => false,
+    once: () => undefined,
+    title: async () => "Opened",
+    url: () => "https://example.com/opened",
+  };
   const page = {
     isClosed: () => false,
     once: () => undefined,
@@ -342,6 +348,11 @@ test("actions report navigation, opened pages, and an opt-in snapshot", async ()
     title: async () => "Done",
     waitForTimeout: async () => undefined,
     waitForLoadState: async () => undefined,
+    goto: async () => {
+      // The load both moves the page and opens a tab.
+      currentUrl = "https://example.com/landing";
+      pages = [page, popup, opened];
+    },
     mouse: {
       move: async () => undefined,
       down: async () => undefined,
@@ -372,6 +383,15 @@ test("actions report navigation, opened pages, and an opt-in snapshot", async ()
   assert.equal(settled.navigated, false);
   assert.equal(settled.newPages, undefined);
   assert.equal(settled.snapshot, "(No visible interactive elements)");
+
+  // The navigation tools report the same shape. A missing navigated field would read as
+  // falsy - "the page did not move" - right after the call that invalidated every ref.
+  const moved = await browser.navigate("https://example.com/landing");
+  assert.equal(moved.ok, true);
+  assert.equal(moved.navigated, true);
+  assert.equal(moved.url, "https://example.com/landing");
+  assert.equal(moved.title, "Done");
+  assert.deepEqual(moved.newPages, ["page-3"]);
 });
 
 test("snapshot scans past hidden elements, reports truncation, and releases unused handles", async () => {
@@ -627,12 +647,16 @@ test("navigateForward and reload wait for DOMContentLoaded", async () => {
   browser.page = async () => page;
 
   assert.deepEqual(await browser.navigateForward(), {
+    ok: true,
     title: "Example",
     url: "https://example.com/next",
+    navigated: true,
   });
   assert.deepEqual(await browser.reload(), {
+    ok: true,
     title: "Example",
     url: "https://example.com/next",
+    navigated: true,
   });
   assert.deepEqual(calls, [
     ["goForward", { waitUntil: "domcontentloaded" }],
