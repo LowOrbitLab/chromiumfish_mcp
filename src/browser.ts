@@ -45,13 +45,6 @@ export interface PageSummary {
   url: string;
 }
 
-export interface NavigationResult {
-  title: string;
-  url: string;
-  /** Present only when returnSnapshot was requested. Invalidates earlier element refs. */
-  snapshot?: string;
-}
-
 /** Shared options for tools that change page state. */
 export interface ActionOptions {
   /**
@@ -70,7 +63,10 @@ export interface ActionResult {
   ok: true;
   url: string;
   title: string;
-  /** True when the URL changed within the action's settle window. */
+  /**
+   * True when the URL changed within the action's settle window. The navigation tools
+   * report it unconditionally, since they always invalidate refs.
+   */
   navigated: boolean;
   /** pageIds the action opened. The current page is never switched automatically. */
   newPages?: string[];
@@ -151,10 +147,10 @@ export interface BrowserApi {
   openPage(url?: string): Promise<PageSummary>;
   selectPage(pageId: string): Promise<PageSummary>;
   closePage(pageId?: string): Promise<PageListResult>;
-  navigate(url: string, options?: ActionOptions): Promise<NavigationResult>;
-  navigateBack(options?: ActionOptions): Promise<NavigationResult>;
-  navigateForward(options?: ActionOptions): Promise<NavigationResult>;
-  reload(options?: ActionOptions): Promise<NavigationResult>;
+  navigate(url: string, options?: ActionOptions): Promise<ActionResult>;
+  navigateBack(options?: ActionOptions): Promise<ActionResult>;
+  navigateForward(options?: ActionOptions): Promise<ActionResult>;
+  reload(options?: ActionOptions): Promise<ActionResult>;
   snapshot(options?: SnapshotOptions): Promise<string>;
   getText(options?: GetTextOptions): Promise<string>;
   takeScreenshot(fullPage: boolean): Promise<Buffer>;
@@ -489,8 +485,31 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.listPages();
   }
 
-  private async navigationResult(page: Page, options: ActionOptions = {}): Promise<NavigationResult> {
-    const result: NavigationResult = { title: await page.title(), url: page.url() };
+  /**
+   * Report a navigation in the same shape as actionResult, so a caller never has to
+   * branch on which tool it called. `navigated` is unconditional rather than a URL
+   * comparison: these tools always clear refs, so the question it answers - does the
+   * caller need a fresh snapshot - is always yes, and a same-URL goto or reload would
+   * otherwise report false while having invalidated every ref.
+   *
+   * Unlike actionResult this skips the settle window: goto, goBack, goForward, and
+   * reload already awaited domcontentloaded, so waiting again only adds latency.
+   */
+  private async navigationResult(
+    page: Page,
+    priorPages: Page[],
+    options: ActionOptions = {},
+  ): Promise<ActionResult> {
+    const opened = this.openPages().filter((candidate) => !priorPages.includes(candidate));
+    for (const candidate of opened) this.trackPage(candidate);
+
+    const result: ActionResult = {
+      ok: true,
+      url: page.url(),
+      title: await page.title().catch(() => ""),
+      navigated: true,
+    };
+    if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
     if (options.returnSnapshot) result.snapshot = await this.snapshot();
     return result;
   }
@@ -547,33 +566,39 @@ export class ChromiumFishBrowser implements BrowserApi {
     return result;
   }
 
-  async navigate(rawUrl: string, options?: ActionOptions): Promise<NavigationResult> {
+  async navigate(rawUrl: string, options?: ActionOptions): Promise<ActionResult> {
     const url = assertNavigationUrl(rawUrl, this.config.allowedHosts);
     const page = await this.page();
+    // Captured after page(), so the page a lazy browser start just created is not
+    // reported as one this navigation opened.
+    const priorPages = this.openPages();
     await this.clearRefs(page);
     await page.goto(url.href, { waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, options);
+    return this.navigationResult(page, priorPages, options);
   }
 
-  async navigateBack(options?: ActionOptions): Promise<NavigationResult> {
+  async navigateBack(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
+    const priorPages = this.openPages();
     await this.clearRefs(page);
     await page.goBack({ waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, options);
+    return this.navigationResult(page, priorPages, options);
   }
 
-  async navigateForward(options?: ActionOptions): Promise<NavigationResult> {
+  async navigateForward(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
+    const priorPages = this.openPages();
     await this.clearRefs(page);
     await page.goForward({ waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, options);
+    return this.navigationResult(page, priorPages, options);
   }
 
-  async reload(options?: ActionOptions): Promise<NavigationResult> {
+  async reload(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
+    const priorPages = this.openPages();
     await this.clearRefs(page);
     await page.reload({ waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, options);
+    return this.navigationResult(page, priorPages, options);
   }
 
   private async clearRefs(page: Page): Promise<void> {

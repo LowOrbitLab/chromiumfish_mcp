@@ -12,7 +12,7 @@ The browser starts lazily on the first tool call that needs a page, and is clean
 { "ok": true, "url": "https://example.com/done", "title": "Done", "navigated": true, "newPages": ["page-2"], "target": "e4" }
 ```
 
-- `navigated` is true when the URL changed within the action's settle window. Actions that start a navigation later than that report it on the next call, and same-URL navigations are not detected.
+- `navigated` is true when the URL changed within the action's settle window. Actions that start a navigation later than that report it on the next call, and same-URL navigations are not detected. `navigate`, `navigate_back`, `navigate_forward`, and `reload` are the exception: they report `navigated: true` unconditionally, because they invalidate element references even when the URL does not change.
 - `newPages` lists pages the action opened, such as a `target="_blank"` link. The current page never switches automatically — use `select_page` to move to one.
 - A detected navigation invalidates element references, exactly as `navigate` does.
 
