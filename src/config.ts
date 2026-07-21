@@ -1,6 +1,6 @@
 import type { LaunchOptions } from "playwright-core";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 export interface ServerConfig {
   personaSeed?: string;
