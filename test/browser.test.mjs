@@ -206,7 +206,11 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   const selectHandle = {
     isVisible: async () => true,
     evaluate: async (callback) => String(callback).includes("isConnected") ? true : ({
-      role: "select",
+      tag: "select",
+      explicitRole: "",
+      hasList: false,
+      multiple: false,
+      size: 0,
       label: "Country",
       href: "",
       disabled: false,
@@ -239,7 +243,11 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
       if (source.includes("isConnected")) return true;
       if (source.includes("return element.type.toLowerCase")) return "checkbox";
       return {
-        role: "input",
+        tag: "input",
+        explicitRole: "",
+        hasList: false,
+        multiple: false,
+        size: 0,
         label: "Accept terms",
         href: "",
         disabled: false,
@@ -267,6 +275,8 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   const page = {
     frames: () => [main, child],
     mainFrame: () => main,
+    url: () => "https://example.com/",
+    title: async () => "Example",
     mouse: {
       move: async (x, y) => moves.push({ x, y }),
       down: async () => undefined,
@@ -275,6 +285,7 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
       },
     },
     waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
   };
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
@@ -284,15 +295,83 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   assert.match(snapshot, /selected=\["us"\]/);
   assert.match(snapshot, /options=\[\{"value":"us","label":"United States"\}/);
   assert.match(snapshot, /type=checkbox unchecked/);
+  // Roles are printed as ARIA roles so they can be reused in a role= selector.
+  assert.match(snapshot, /^\[e1\] combobox "Country"/m);
+  assert.match(snapshot, /^\[e2\] checkbox "Accept terms"/m);
 
   await browser.hover("#country", frames[1].frameId);
   assert.ok(moves.length >= 4);
-  assert.deepEqual(
-    await browser.selectOption("e1", ["Canada"], "label"),
-    ["ca"],
-  );
+  const selected = await browser.selectOption("e1", ["Canada"], "label");
+  assert.deepEqual(selected.selectedValues, ["ca"]);
+  assert.equal(selected.navigated, false);
   assert.deepEqual(selectedOptions, [{ label: "Canada" }]);
-  assert.equal(await browser.setChecked("e2", true), true);
+  const set = await browser.setChecked("e2", true);
+  assert.equal(set.checked, true);
+  assert.equal(set.url, "https://example.com/");
+});
+
+test("actions report navigation, opened pages, and an opt-in snapshot", async () => {
+  let currentUrl = "https://example.com/form";
+  let pages;
+  const popup = {
+    isClosed: () => false,
+    once: () => undefined,
+    title: async () => "Popup",
+    url: () => "https://example.com/popup",
+  };
+  const handle = {
+    evaluate: async () => true,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => ({ x: 10, y: 10, width: 40, height: 20 }),
+  };
+  const main = {
+    url: () => currentUrl,
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({
+      elementHandles: async () => [],
+      first: () => ({ elementHandle: async () => handle }),
+    }),
+  };
+  const page = {
+    isClosed: () => false,
+    once: () => undefined,
+    frames: () => [main],
+    mainFrame: () => main,
+    url: () => currentUrl,
+    title: async () => "Done",
+    waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
+    mouse: {
+      move: async () => undefined,
+      down: async () => undefined,
+      up: async () => {
+        // The click both navigates the current page and opens a tab.
+        currentUrl = "https://example.com/done";
+        pages = [page, popup];
+      },
+    },
+  };
+  pages = [page];
+
+  const browser = new ChromiumFishBrowser(config);
+  browser.browser = { isConnected: () => true };
+  browser.context = { pages: () => pages };
+  browser.page = async () => page;
+  await browser.listPages();
+
+  const clicked = await browser.click("#submit");
+  assert.equal(clicked.ok, true);
+  assert.equal(clicked.navigated, true);
+  assert.equal(clicked.url, "https://example.com/done");
+  assert.equal(clicked.title, "Done");
+  assert.deepEqual(clicked.newPages, ["page-2"]);
+  assert.equal(clicked.snapshot, undefined);
+
+  const settled = await browser.click("#submit", undefined, { returnSnapshot: true });
+  assert.equal(settled.navigated, false);
+  assert.equal(settled.newPages, undefined);
+  assert.equal(settled.snapshot, "(No visible interactive elements)");
 });
 
 test("snapshot scans past hidden elements, reports truncation, and releases unused handles", async () => {
@@ -300,7 +379,11 @@ test("snapshot scans past hidden elements, reports truncation, and releases unus
   const makeHandle = (id, visible, label = "") => ({
     isVisible: async () => visible,
     evaluate: async () => ({
-      role: "button",
+      tag: "button",
+      explicitRole: "",
+      hasList: false,
+      multiple: false,
+      size: 0,
       label,
       href: "",
       disabled: false,
@@ -342,6 +425,122 @@ test("snapshot scans past hidden elements, reports truncation, and releases unus
   handles = [];
   await browser.snapshot({ maxElements: 1, maxChars: 5000 });
   assert.equal(disposed.length, 253);
+});
+
+test("element targeting bounds Playwright's otherwise unlimited auto-wait", async () => {
+  const seen = {};
+  const handle = {
+    evaluate: async () => true,
+    scrollIntoViewIfNeeded: async (options) => {
+      seen.scroll = options;
+    },
+    boundingBox: async () => ({ x: 0, y: 0, width: 10, height: 10 }),
+    selectOption: async (values, options) => {
+      seen.select = options;
+      return ["ca"];
+    },
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({
+      first: () => ({
+        elementHandle: async (options) => {
+          seen.resolve = options;
+          return handle;
+        },
+      }),
+    }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    url: () => "https://example.com/",
+    title: async () => "Example",
+    waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
+    mouse: {
+      move: async () => undefined,
+      down: async () => undefined,
+      up: async () => undefined,
+    },
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await browser.selectOption("#country", ["ca"], "value");
+  await browser.hover("#country");
+
+  // Assert the bound exists rather than its exact value; 0/undefined means "wait forever".
+  for (const [name, options] of Object.entries(seen)) {
+    assert.ok(
+      options?.timeout > 0 && options.timeout <= 10_000,
+      `${name} auto-wait is unbounded: ${JSON.stringify(options)}`,
+    );
+  }
+  assert.deepEqual(Object.keys(seen).sort(), ["resolve", "scroll", "select"]);
+});
+
+test("reference numbers are never reused, so a stale reference fails loudly", async () => {
+  const makeHandle = (label) => ({
+    isVisible: async () => true,
+    evaluate: async () => ({
+      tag: "button",
+      explicitRole: "",
+      hasList: false,
+      multiple: false,
+      size: 0,
+      label,
+      href: "",
+      disabled: false,
+      type: "",
+      value: null,
+      passwordSet: false,
+      checked: null,
+      selected: [],
+      selectedCount: 0,
+      options: [],
+      optionCount: 0,
+      expanded: null,
+    }),
+    dispose: async () => undefined,
+  });
+  let handles = [makeHandle("First")];
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ elementHandles: async () => handles }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    url: () => "https://example.com/",
+    title: async () => "Example",
+    waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const first = await browser.snapshot();
+  assert.match(first, /^\[e1\] button "First"/);
+
+  handles = [makeHandle("Second")];
+  const second = await browser.snapshot();
+  // A second snapshot must not hand out e1 again, or a remembered e1 would silently
+  // resolve to a different element.
+  assert.match(second, /^\[e2\] button "Second"/);
+
+  await assert.rejects(
+    browser.click("e1"),
+    /Unknown element reference e1; the current snapshot of this page covers e2-e2/,
+  );
+  await assert.rejects(
+    browser.waitFor({ condition: { kind: "element", target: "e1" }, timeoutMs: 1000 }),
+    /Reference numbers are never reused/,
+  );
 });
 
 test("setChecked rejects unchecking a radio", async () => {
@@ -469,6 +668,8 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    url: () => "https://example.com/",
+    title: async () => "Example",
     waitForURL: async (url, options) => calls.push(["url", url, options]),
     waitForLoadState: async (state, options) => calls.push(["load", state, options]),
     waitForTimeout: async (timeMs) => calls.push(["time", timeMs]),
@@ -476,32 +677,28 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
 
-  await browser.waitFor({
-    condition: { kind: "element", target: "#ready", state: "visible" },
-    timeoutMs: 1000,
-  });
-  await browser.waitFor({
-    condition: { kind: "text", text: "Complete", state: "hidden" },
-    timeoutMs: 2000,
-  });
-  await browser.waitFor({
-    condition: { kind: "url", url: "**/dashboard" },
-    timeoutMs: 3000,
-  });
-  await browser.waitFor({
-    condition: { kind: "load", state: "networkidle" },
-    timeoutMs: 4000,
-  });
-  await browser.waitFor({
-    condition: { kind: "time", timeMs: 250 },
-    timeoutMs: 5000,
-  });
+  /** Run one condition and drop the trailing settle every action shares. */
+  const run = async (condition, timeoutMs) => {
+    calls.length = 0;
+    const result = await browser.waitFor({ condition, timeoutMs });
+    assert.equal(result.url, "https://example.com/");
+    return calls.slice(0, -2);
+  };
 
-  assert.deepEqual(calls.map((entry) => entry[0]), ["element", "text", "url", "load", "time"]);
-  assert.equal(calls[0][2].state, "visible");
-  assert.deepEqual(calls[1][3], { visible: true });
-  assert.equal(calls[1][4].state, "detached");
-  assert.equal(calls[2][1], "**/dashboard");
-  assert.equal(calls[3][1], "networkidle");
-  assert.equal(calls[4][1], 250);
+  const element = await run({ kind: "element", target: "#ready", state: "visible" }, 1000);
+  const text = await run({ kind: "text", text: "Complete", state: "hidden" }, 2000);
+  const url = await run({ kind: "url", url: "**/dashboard" }, 3000);
+  const load = await run({ kind: "load", state: "networkidle" }, 4000);
+  const time = await run({ kind: "time", timeMs: 250 }, 5000);
+
+  assert.deepEqual(
+    [element, text, url, load, time].map((entry) => entry[0][0]),
+    ["element", "text", "url", "load", "time"],
+  );
+  assert.equal(element[0][2].state, "visible");
+  assert.deepEqual(text[0][3], { visible: true });
+  assert.equal(text[0][4].state, "detached");
+  assert.equal(url[0][1], "**/dashboard");
+  assert.equal(load[0][1], "networkidle");
+  assert.equal(time[0][1], 250);
 });

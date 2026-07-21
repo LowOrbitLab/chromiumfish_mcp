@@ -16,6 +16,73 @@ const structured = <T extends object>(value: T) => ({
   structuredContent: value as Record<string, unknown>,
 });
 
+/**
+ * Action results may carry a snapshot. Emit it as its own plain-text block so the model
+ * reads real newlines instead of a JSON-escaped blob, and keep it out of
+ * structuredContent so clients that forward both fields do not pay for it twice.
+ */
+const action = <T extends { snapshot?: string }>(value: T) => {
+  const { snapshot, ...state } = value;
+  const stateBlock = { type: "text" as const, text: JSON.stringify(state) };
+  return {
+    content: snapshot === undefined
+      ? [stateBlock]
+      : [stateBlock, { type: "text" as const, text: snapshot }],
+    structuredContent: state as Record<string, unknown>,
+  };
+};
+
+/** Opt-in follow-up snapshot, shared by every tool that changes page state. */
+const returnSnapshotInput = {
+  returnSnapshot: z.boolean().default(false)
+    .describe("Also return a fresh snapshot of the resulting page; renumbers element refs."),
+};
+
+const INSTRUCTIONS = `Drives one persistent ChromiumFish browser context over MCP.
+
+Workflow: navigate -> snapshot -> act on refs (e1, e2, ...) -> act again.
+
+Element references
+- Refs belong to the latest snapshot of one page and frame. Any navigation, the next
+  snapshot, and closing the page invalidate them.
+- Numbers are identifiers, not positions, and are never reused: snapshots keep counting
+  up (e1..e40, then e41..e77). A ref from an earlier snapshot therefore fails with an
+  error rather than acting on whatever element now sits in that slot. Re-snapshot instead
+  of guessing, and do not infer order or position from the number.
+
+Targeting
+- Every target field also accepts a selector. Prefer role=<role>[name="<label>"], built
+  from the role and label the snapshot already printed - it survives the re-renders that
+  invalidate refs, and costs nothing extra to read. Name matching is case-insensitive and
+  matches a substring.
+- Snapshot roles are ARIA roles wherever HTML defines one (link, button, textbox,
+  checkbox, radio, combobox, listbox, searchbox, slider, spinbutton). Anything else is a
+  tag name - for example a password field prints "input" - and cannot be used with role=;
+  target those by ref or CSS selector.
+- Targeting fails within a few seconds when nothing matches, so a wrong selector is
+  cheap to discover. For an element that has not rendered yet, use wait_for first
+  rather than retrying the action.
+
+Action results
+- navigate, click, hover, type_text, select_option, set_checked, press_key, scroll,
+  wait_for, and click_at return the resulting url and title plus navigated and newPages.
+  Read those instead of calling snapshot reflexively: re-snapshot only when navigated is
+  true or the part of the DOM you need has changed.
+- Pass returnSnapshot: true to get the action result and a fresh snapshot in one call.
+- newPages lists tabs the action opened. The current page never switches automatically;
+  use select_page to move to one.
+
+Challenges
+- On Cloudflare or "Just a moment" pages call find_challenge, then solve_challenge.
+- Never read challenge-frame DOM or probe cf-turnstile-response inputs; it measurably
+  lowers clearance rates and DOM access to those frames is blocked.
+- solve_challenge ok: false is terminal. Change network path or strategy rather than
+  retrying in a loop.
+
+Cost
+- Prefer snapshot and get_text over take_screenshot; use screenshots only for questions
+  that genuinely need pixels.`;
+
 const READ_ONLY = {
   readOnlyHint: true,
 } as const;
@@ -73,7 +140,10 @@ const waitConditionSchema = z.preprocess(parseMaybeJson, z.discriminatedUnion("k
 ]));
 
 export function createServer(browser: BrowserApi, config: ServerConfig): McpServer {
-  const server = new McpServer({ name: "chromiumfish_mcp", version: VERSION });
+  const server = new McpServer(
+    { name: "chromiumfish_mcp", version: VERSION },
+    { instructions: INSTRUCTIONS },
+  );
 
   server.registerTool(
     "list_pages",
@@ -119,40 +189,40 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "navigate",
     {
       description: "Open an HTTP/HTTPS URL in the current page and wait for DOMContentLoaded.",
-      inputSchema: { url: z.string().url() },
+      inputSchema: { url: z.string().url(), ...returnSnapshotInput },
       annotations: MUTATING,
     },
-    async ({ url }) => structured(await browser.navigate(url)),
+    async ({ url, returnSnapshot }) => action(await browser.navigate(url, { returnSnapshot })),
   );
 
   server.registerTool(
     "navigate_back",
     {
       description: "Navigate the current page to its previous history entry.",
-      inputSchema: {},
+      inputSchema: { ...returnSnapshotInput },
       annotations: MUTATING,
     },
-    async () => structured(await browser.navigateBack()),
+    async ({ returnSnapshot }) => action(await browser.navigateBack({ returnSnapshot })),
   );
 
   server.registerTool(
     "navigate_forward",
     {
       description: "Navigate the current page to its next history entry.",
-      inputSchema: {},
+      inputSchema: { ...returnSnapshotInput },
       annotations: MUTATING,
     },
-    async () => structured(await browser.navigateForward()),
+    async ({ returnSnapshot }) => action(await browser.navigateForward({ returnSnapshot })),
   );
 
   server.registerTool(
     "reload",
     {
       description: "Reload the current page and wait for DOMContentLoaded.",
-      inputSchema: {},
+      inputSchema: { ...returnSnapshotInput },
       annotations: MUTATING,
     },
-    async () => structured(await browser.reload()),
+    async ({ returnSnapshot }) => action(await browser.reload({ returnSnapshot })),
   );
 
   server.registerTool(
@@ -212,17 +282,18 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "click",
     {
-      description: "Click an element reference returned by snapshot or a CSS selector. Use frameId with selectors inside a frame.",
+      description: "Click an element reference returned by snapshot or a CSS selector. Use frameId with selectors inside a frame. Returns the resulting url, title, navigated, and any newPages.",
       inputSchema: {
         target: z.string().min(1),
         frameId: z.string().min(1).optional(),
+        ...returnSnapshotInput,
       },
       annotations: MUTATING,
     },
-    async ({ target, frameId }) => {
-      await browser.click(target, frameId);
-      return structured({ ok: true, target });
-    },
+    async ({ target, frameId, returnSnapshot }) => action({
+      ...await browser.click(target, frameId, { returnSnapshot }),
+      target,
+    }),
   );
 
   server.registerTool(
@@ -232,13 +303,14 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {
         target: z.string().min(1),
         frameId: z.string().min(1).optional(),
+        ...returnSnapshotInput,
       },
       annotations: IDEMPOTENT_MUTATION,
     },
-    async ({ target, frameId }) => {
-      await browser.hover(target, frameId);
-      return structured({ ok: true, target });
-    },
+    async ({ target, frameId, returnSnapshot }) => action({
+      ...await browser.hover(target, frameId, { returnSnapshot }),
+      target,
+    }),
   );
 
   server.registerTool(
@@ -249,10 +321,11 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {
         x: z.number().finite(),
         y: z.number().finite(),
+        ...returnSnapshotInput,
       },
       annotations: MUTATING,
     },
-    async ({ x, y }) => structured(await browser.clickAt(x, y)),
+    async ({ x, y, returnSnapshot }) => action(await browser.clickAt(x, y, { returnSnapshot })),
   );
 
   server.registerTool(
@@ -307,13 +380,15 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         clear: z.boolean().default(true),
         submit: z.boolean().default(false),
         frameId: z.string().min(1).optional(),
+        ...returnSnapshotInput,
       },
       annotations: MUTATING,
     },
-    async ({ target, text: value, clear, submit, frameId }) => {
-      await browser.typeText(target, value, clear, submit, frameId);
-      return structured({ ok: true, target, submitted: submit });
-    },
+    async ({ target, text: value, clear, submit, frameId, returnSnapshot }) => action({
+      ...await browser.typeText(target, value, clear, submit, frameId, { returnSnapshot }),
+      target,
+      submitted: submit,
+    }),
   );
 
   server.registerTool(
@@ -325,11 +400,13 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         values: z.array(z.string()).min(1).max(50),
         matchBy: z.enum(["value", "label"]).default("value"),
         frameId: z.string().min(1).optional(),
+        ...returnSnapshotInput,
       },
       annotations: IDEMPOTENT_MUTATION,
     },
-    async ({ target, values, matchBy, frameId }) => structured({
-      selectedValues: await browser.selectOption(target, values, matchBy, frameId),
+    async ({ target, values, matchBy, frameId, returnSnapshot }) => action({
+      ...await browser.selectOption(target, values, matchBy, frameId, { returnSnapshot }),
+      target,
     }),
   );
 
@@ -341,11 +418,13 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         target: z.string().min(1),
         checked: z.boolean(),
         frameId: z.string().min(1).optional(),
+        ...returnSnapshotInput,
       },
       annotations: IDEMPOTENT_MUTATION,
     },
-    async ({ target, checked, frameId }) => structured({
-      checked: await browser.setChecked(target, checked, frameId),
+    async ({ target, checked, frameId, returnSnapshot }) => action({
+      ...await browser.setChecked(target, checked, frameId, { returnSnapshot }),
+      target,
     }),
   );
 
@@ -353,13 +432,13 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "press_key",
     {
       description: "Press a key in the current page, such as Enter, Escape, ArrowDown, or Control+A.",
-      inputSchema: { key: z.string().min(1).max(100) },
+      inputSchema: { key: z.string().min(1).max(100), ...returnSnapshotInput },
       annotations: MUTATING,
     },
-    async ({ key }) => {
-      await browser.pressKey(key);
-      return structured({ ok: true, key });
-    },
+    async ({ key, returnSnapshot }) => action({
+      ...await browser.pressKey(key, { returnSnapshot }),
+      key,
+    }),
   );
 
   server.registerTool(
@@ -369,13 +448,15 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {
         deltaX: z.number().finite().default(0),
         deltaY: z.number().finite(),
+        ...returnSnapshotInput,
       },
       annotations: MUTATING,
     },
-    async ({ deltaX, deltaY }) => {
-      await browser.scroll(deltaX, deltaY);
-      return structured({ ok: true, deltaX, deltaY });
-    },
+    async ({ deltaX, deltaY, returnSnapshot }) => action({
+      ...await browser.scroll(deltaX, deltaY, { returnSnapshot }),
+      deltaX,
+      deltaY,
+    }),
   );
 
   server.registerTool(
@@ -385,13 +466,14 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {
         condition: waitConditionSchema,
         timeoutMs: z.number().int().min(100).max(120_000).default(30_000),
+        ...returnSnapshotInput,
       },
       annotations: READ_ONLY,
     },
-    async ({ condition, timeoutMs }) => {
-      await browser.waitFor({ condition, timeoutMs });
-      return structured({ ok: true, kind: condition.kind });
-    },
+    async ({ condition, timeoutMs, returnSnapshot }) => action({
+      ...await browser.waitFor({ condition, timeoutMs }, { returnSnapshot }),
+      kind: condition.kind,
+    }),
   );
 
   if (config.allowEval) {

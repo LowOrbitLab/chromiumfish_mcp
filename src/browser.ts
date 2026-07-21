@@ -9,6 +9,7 @@ import type {
   Page,
 } from "playwright-core";
 import { chromium } from "playwright-core";
+import { snapshotRole } from "./aria.js";
 import type { ServerConfig } from "./config.js";
 import {
   checkboxClickCandidates,
@@ -47,6 +48,41 @@ export interface PageSummary {
 export interface NavigationResult {
   title: string;
   url: string;
+  /** Present only when returnSnapshot was requested. Invalidates earlier element refs. */
+  snapshot?: string;
+}
+
+/** Shared options for tools that change page state. */
+export interface ActionOptions {
+  /**
+   * Also return a fresh snapshot of the resulting page, which saves the follow-up
+   * snapshot round trip. Like any snapshot, it renumbers element refs.
+   */
+  returnSnapshot?: boolean;
+}
+
+/**
+ * What an action did to the page. Callers read `navigated` / `newPages` instead of
+ * spending a second round trip on snapshot or get_text just to learn whether the page
+ * moved, which otherwise doubles the cost of every interaction.
+ */
+export interface ActionResult {
+  ok: true;
+  url: string;
+  title: string;
+  /** True when the URL changed within the action's settle window. */
+  navigated: boolean;
+  /** pageIds the action opened. The current page is never switched automatically. */
+  newPages?: string[];
+  snapshot?: string;
+}
+
+export interface SelectOptionResult extends ActionResult {
+  selectedValues: string[];
+}
+
+export interface SetCheckedResult extends ActionResult {
+  checked: boolean;
 }
 
 export interface PageListResult {
@@ -76,11 +112,9 @@ interface FrameBox {
   frameUrl: string;
 }
 
-export interface ClickAtResult {
+export interface ClickAtResult extends ActionResult {
   x: number;
   y: number;
-  title: string;
-  url: string;
 }
 
 export type ElementState = "attached" | "detached" | "visible" | "hidden";
@@ -117,30 +151,43 @@ export interface BrowserApi {
   openPage(url?: string): Promise<PageSummary>;
   selectPage(pageId: string): Promise<PageSummary>;
   closePage(pageId?: string): Promise<PageListResult>;
-  navigate(url: string): Promise<NavigationResult>;
-  navigateBack(): Promise<NavigationResult>;
-  navigateForward(): Promise<NavigationResult>;
-  reload(): Promise<NavigationResult>;
+  navigate(url: string, options?: ActionOptions): Promise<NavigationResult>;
+  navigateBack(options?: ActionOptions): Promise<NavigationResult>;
+  navigateForward(options?: ActionOptions): Promise<NavigationResult>;
+  reload(options?: ActionOptions): Promise<NavigationResult>;
   snapshot(options?: SnapshotOptions): Promise<string>;
   getText(options?: GetTextOptions): Promise<string>;
   takeScreenshot(fullPage: boolean): Promise<Buffer>;
-  click(target: string, frameId?: string): Promise<void>;
-  hover(target: string, frameId?: string): Promise<void>;
+  click(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult>;
+  hover(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult>;
   selectOption(
     target: string,
     values: string[],
     matchBy: SelectOptionMatch,
     frameId?: string,
-  ): Promise<string[]>;
-  setChecked(target: string, checked: boolean, frameId?: string): Promise<boolean>;
-  clickAt(x: number, y: number): Promise<ClickAtResult>;
+    options?: ActionOptions,
+  ): Promise<SelectOptionResult>;
+  setChecked(
+    target: string,
+    checked: boolean,
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<SetCheckedResult>;
+  clickAt(x: number, y: number, options?: ActionOptions): Promise<ClickAtResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   findChallenge(): Promise<ChallengeDetection>;
   solveChallenge(options?: ChallengeSolveOptions): Promise<ChallengeSolveResult>;
-  typeText(target: string, text: string, clear: boolean, submit: boolean, frameId?: string): Promise<void>;
-  pressKey(key: string): Promise<void>;
-  scroll(deltaX: number, deltaY: number): Promise<void>;
-  waitFor(options: WaitForOptions): Promise<void>;
+  typeText(
+    target: string,
+    text: string,
+    clear: boolean,
+    submit: boolean,
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<ActionResult>;
+  pressKey(key: string, options?: ActionOptions): Promise<ActionResult>;
+  scroll(deltaX: number, deltaY: number, options?: ActionOptions): Promise<ActionResult>;
+  waitFor(options: WaitForOptions, actionOptions?: ActionOptions): Promise<ActionResult>;
   evaluate(expression: string): Promise<string>;
   runTask(task: string, url: string | undefined, maxSteps: number): Promise<NativeTaskResult>;
   close(): Promise<void>;
@@ -169,8 +216,25 @@ const MIN_SNAPSHOT_CHARS = 5_000;
 const HANDLE_BATCH_SIZE = 32;
 const MAX_SCREENSHOT_PIXELS = 25_000_000;
 const MAX_SCREENSHOT_DIMENSION = 20_000;
-const TEXT_LOCATOR_TIMEOUT_MS = 5_000;
+/**
+ * Bound Playwright's auto-wait. playwright-core defaults action timeouts to 0 (no
+ * timeout) — only @playwright/test imposes 30s — so an unmatched selector would hang the
+ * tool call indefinitely. wait_for is the tool for elements that are genuinely slow.
+ */
+const LOCATOR_TIMEOUT_MS = 5_000;
+/** Navigation is legitimately slower than element resolution, so it gets its own bound. */
+const NAVIGATION_TIMEOUT_MS = 30_000;
 const SNAPSHOT_TRUNCATION_MARKER = "narrow scope or adjust maxElements/maxChars";
+/** Window an action gets to start a navigation before its result is read. */
+const ACTION_SETTLE_MS = 150;
+/** Upper bound on waiting for a navigation the action did start to become readable. */
+const ACTION_LOAD_TIMEOUT_MS = 2_000;
+
+/** Page state captured before an action so the result can report what changed. */
+interface ActionBaseline {
+  url: string;
+  pages: Page[];
+}
 
 function clip(value: string, max: number): string {
   if (value.length <= max) return value;
@@ -220,6 +284,8 @@ export class ChromiumFishBrowser implements BrowserApi {
   private readonly frameIds = new WeakMap<Frame, string>();
   private nextFrameId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
+  /** Never reset, not even per page: reusing a number would make a stale ref resolve silently. */
+  private nextRefId = 1;
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
   /** Prevent concurrent solve_challenge runs from fighting over the same mouse. */
   private solveChallengeInFlight = false;
@@ -277,6 +343,10 @@ export class ChromiumFishBrowser implements BrowserApi {
         height: this.config.windowSize[1],
       },
     });
+    // Safety net for any auto-waiting call that does not pass an explicit timeout;
+    // without it playwright-core would wait forever. Navigation keeps a looser bound.
+    this.context.setDefaultTimeout(LOCATOR_TIMEOUT_MS);
+    this.context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
     await this.installNavigationGuard(this.context);
     return this.context;
   }
@@ -419,33 +489,91 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.listPages();
   }
 
-  async navigate(rawUrl: string): Promise<NavigationResult> {
+  private async navigationResult(page: Page, options: ActionOptions = {}): Promise<NavigationResult> {
+    const result: NavigationResult = { title: await page.title(), url: page.url() };
+    if (options.returnSnapshot) result.snapshot = await this.snapshot();
+    return result;
+  }
+
+  /** State captured before an action so actionResult can report what the action changed. */
+  private actionBaseline(page: Page): ActionBaseline {
+    return {
+      url: page.url(),
+      pages: this.openPages(),
+    };
+  }
+
+  private openPages(): Page[] {
+    if (!this.context || !this.browser?.isConnected()) return [];
+    return this.context.pages().filter((page) => !page.isClosed());
+  }
+
+  /**
+   * Report the page state an action produced. Without this, callers must spend a second
+   * round trip on snapshot or get_text just to learn whether the page moved, which
+   * doubles the cost of every interaction.
+   */
+  private async actionResult(
+    page: Page,
+    baseline: ActionBaseline,
+    options: ActionOptions = {},
+  ): Promise<ActionResult> {
+    // A click or Enter commits its navigation after the input event resolves, so settle
+    // briefly, then let a navigation that did start become readable. Navigations starting
+    // later than this window are reported by the next call instead; the bound is a
+    // latency/accuracy trade, not a guarantee. Same-URL navigations are not detected.
+    // Both settle steps are best-effort: an action that closed the page must still report
+    // its result rather than failing after the side effect already happened.
+    await page.waitForTimeout(ACTION_SETTLE_MS).catch(() => undefined);
+    await page.waitForLoadState("domcontentloaded", { timeout: ACTION_LOAD_TIMEOUT_MS })
+      .catch(() => undefined);
+
+    const url = page.url();
+    const navigated = url !== baseline.url;
+    // The previous document is gone; its handles would only fail the staleness check later.
+    if (navigated) await this.clearRefs(page);
+
+    const opened = this.openPages().filter((candidate) => !baseline.pages.includes(candidate));
+    for (const candidate of opened) this.trackPage(candidate);
+
+    const result: ActionResult = {
+      ok: true,
+      url,
+      title: await page.title().catch(() => ""),
+      navigated,
+    };
+    if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
+    if (options.returnSnapshot) result.snapshot = await this.snapshot();
+    return result;
+  }
+
+  async navigate(rawUrl: string, options?: ActionOptions): Promise<NavigationResult> {
     const url = assertNavigationUrl(rawUrl, this.config.allowedHosts);
     const page = await this.page();
     await this.clearRefs(page);
     await page.goto(url.href, { waitUntil: "domcontentloaded" });
-    return { title: await page.title(), url: page.url() };
+    return this.navigationResult(page, options);
   }
 
-  async navigateBack(): Promise<NavigationResult> {
+  async navigateBack(options?: ActionOptions): Promise<NavigationResult> {
     const page = await this.page();
     await this.clearRefs(page);
     await page.goBack({ waitUntil: "domcontentloaded" });
-    return { title: await page.title(), url: page.url() };
+    return this.navigationResult(page, options);
   }
 
-  async navigateForward(): Promise<NavigationResult> {
+  async navigateForward(options?: ActionOptions): Promise<NavigationResult> {
     const page = await this.page();
     await this.clearRefs(page);
     await page.goForward({ waitUntil: "domcontentloaded" });
-    return { title: await page.title(), url: page.url() };
+    return this.navigationResult(page, options);
   }
 
-  async reload(): Promise<NavigationResult> {
+  async reload(options?: ActionOptions): Promise<NavigationResult> {
     const page = await this.page();
     await this.clearRefs(page);
     await page.reload({ waitUntil: "domcontentloaded" });
-    return { title: await page.title(), url: page.url() };
+    return this.navigationResult(page, options);
   }
 
   private async clearRefs(page: Page): Promise<void> {
@@ -536,7 +664,13 @@ export class ChromiumFishBrowser implements BrowserApi {
                 ? textarea.value
                 : null;
             return {
-              role: (html.getAttribute("role") || html.tagName.toLowerCase()).slice(0, 40),
+              // Raw facts only; the HTML-to-ARIA mapping lives in aria.ts so it can be
+              // unit-tested without a DOM.
+              tag: html.tagName.toLowerCase().slice(0, 40),
+              explicitRole: (html.getAttribute("role") ?? "").trim().toLowerCase().slice(0, 40),
+              hasList: Boolean(input?.hasAttribute("list")),
+              multiple: Boolean(select?.multiple),
+              size: select?.size ?? 0,
               label: label.trim().replace(/\s+/g, " ").slice(0, 120),
               href: element instanceof HTMLAnchorElement ? element.href.slice(0, 300) : "",
               disabled: html.getAttribute("aria-disabled") === "true"
@@ -565,7 +699,10 @@ export class ChromiumFishBrowser implements BrowserApi {
           }).catch(() => null);
           if (!info) continue;
 
-          const ref = `e${refs.size + 1}`;
+          // Monotonic across every snapshot and page: a number is never reused, so a
+          // reference held from an earlier snapshot fails loudly in resolveTarget instead
+          // of silently resolving to whatever element now occupies that position.
+          const ref = `e${this.nextRefId++}`;
           const suffix = [
             info.type ? `type=${info.type}` : "",
             info.disabled ? "disabled" : "",
@@ -585,7 +722,7 @@ export class ChromiumFishBrowser implements BrowserApi {
           ]
             .filter(Boolean)
             .join(" ");
-          let line = `[${ref}] ${info.role} ${JSON.stringify(info.label)}${suffix ? ` ${suffix}` : ""}`;
+          let line = `[${ref}] ${snapshotRole(info)} ${JSON.stringify(info.label)}${suffix ? ` ${suffix}` : ""}`;
           const separatorChars = lines.length > 0 ? 1 : 0;
           if (line.length + separatorChars > maxChars && lines.length === 0) {
             line = `${line.slice(0, Math.max(0, maxChars - 18))} [line truncated]`;
@@ -632,8 +769,8 @@ export class ChromiumFishBrowser implements BrowserApi {
     // Bound the auto-wait so a non-matching selector fails fast instead of hanging
     // for Playwright's default timeout.
     const text = options.selector
-      ? await locator.innerText({ timeout: TEXT_LOCATOR_TIMEOUT_MS })
-      : await locator.innerText({ timeout: TEXT_LOCATOR_TIMEOUT_MS }).catch(() => "");
+      ? await locator.innerText({ timeout: LOCATOR_TIMEOUT_MS })
+      : await locator.innerText({ timeout: LOCATOR_TIMEOUT_MS }).catch(() => "");
     const maxChars = clampInteger(options.maxChars, DEFAULT_SNAPSHOT_CHARS, 100, this.config.maxTextChars);
     return clip(text, maxChars);
   }
@@ -668,6 +805,18 @@ export class ChromiumFishBrowser implements BrowserApi {
     return page.screenshot({ type: "png", fullPage });
   }
 
+  /** Reference numbers are never reused, so an unknown one is always from an earlier snapshot. */
+  private unknownRefError(page: Page, target: string): Error {
+    const keys = [...this.refs.get(page)?.keys() ?? []];
+    const scope = keys.length > 0
+      ? `the current snapshot of this page covers ${keys[0]}-${keys.at(-1)}`
+      : "this page has no current snapshot";
+    return new Error(
+      `Unknown element reference ${target}; ${scope}. Reference numbers are never reused, `
+      + "so this one is stale — call snapshot again and use a reference from its output.",
+    );
+  }
+
   private async resolveTarget(page: Page, target: string, frameId?: string): Promise<InteractiveHandle> {
     const ref = this.refs.get(page)?.get(target);
     if (ref && frameId) {
@@ -677,10 +826,9 @@ export class ChromiumFishBrowser implements BrowserApi {
         throw new Error(`Target ${target} does not belong to frame ${frameId}`);
       }
     }
-    if (!ref && /^e\d+$/.test(target)) {
-      throw new Error(`Unknown element reference ${target}; call snapshot again`);
-    }
-    const handle = ref ?? await this.resolveFrame(page, frameId).locator(target).first().elementHandle();
+    if (!ref && /^e\d+$/.test(target)) throw this.unknownRefError(page, target);
+    const handle = ref ?? await this.resolveFrame(page, frameId).locator(target).first()
+      .elementHandle({ timeout: LOCATOR_TIMEOUT_MS });
     if (!handle) throw new Error(`Target ${target} not found; call snapshot again after the page changes`);
     const connected = await handle.evaluate((element) => element.isConnected).catch(() => false);
     if (!connected) throw new Error(`Target ${target} is stale; call snapshot again`);
@@ -706,7 +854,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   }
 
   private async moveTo(page: Page, handle: InteractiveHandle): Promise<void> {
-    await handle.scrollIntoViewIfNeeded();
+    await handle.scrollIntoViewIfNeeded({ timeout: LOCATOR_TIMEOUT_MS });
     const box = await handle.boundingBox();
     if (!box) throw new Error("Target is not currently clickable");
     const destination = {
@@ -723,16 +871,20 @@ export class ChromiumFishBrowser implements BrowserApi {
     await page.mouse.up();
   }
 
-  async click(target: string, frameId?: string): Promise<void> {
+  async click(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
+    const baseline = this.actionBaseline(page);
     await this.clickHandle(page, handle);
+    return this.actionResult(page, baseline, options);
   }
 
-  async hover(target: string, frameId?: string): Promise<void> {
+  async hover(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
+    const baseline = this.actionBaseline(page);
     await this.moveTo(page, handle);
+    return this.actionResult(page, baseline, options);
   }
 
   async selectOption(
@@ -740,14 +892,22 @@ export class ChromiumFishBrowser implements BrowserApi {
     values: string[],
     matchBy: SelectOptionMatch,
     frameId?: string,
-  ): Promise<string[]> {
+    options?: ActionOptions,
+  ): Promise<SelectOptionResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
-    const options = values.map((value) => matchBy === "label" ? { label: value } : { value });
-    return handle.selectOption(options);
+    const baseline = this.actionBaseline(page);
+    const requested = values.map((value) => matchBy === "label" ? { label: value } : { value });
+    const selectedValues = await handle.selectOption(requested, { timeout: LOCATOR_TIMEOUT_MS });
+    return { ...await this.actionResult(page, baseline, options), selectedValues };
   }
 
-  async setChecked(target: string, checked: boolean, frameId?: string): Promise<boolean> {
+  async setChecked(
+    target: string,
+    checked: boolean,
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<SetCheckedResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
     const kind = await handle.evaluate((element) => {
@@ -757,6 +917,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (kind === "radio" && !checked) {
       throw new Error(`Radio target ${target} cannot be unchecked directly; select another radio option instead`);
     }
+    const baseline = this.actionBaseline(page);
     let actual = await handle.isChecked();
     if (actual !== checked) {
       await this.clickHandle(page, handle);
@@ -765,10 +926,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (actual !== checked) {
       throw new Error(`Target ${target} did not reach the requested checked state`);
     }
-    return actual;
+    return { ...await this.actionResult(page, baseline, options), checked: actual };
   }
 
-  async clickAt(x: number, y: number): Promise<ClickAtResult> {
+  async clickAt(x: number, y: number, options?: ActionOptions): Promise<ClickAtResult> {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       throw new Error("click_at requires finite numeric x/y coordinates");
     }
@@ -781,17 +942,13 @@ export class ChromiumFishBrowser implements BrowserApi {
         );
       }
     }
+    const baseline = this.actionBaseline(page);
     await this.moveMouse(page, x, y, 14);
     await page.waitForTimeout(40 + Math.floor(Math.random() * 90));
     await page.mouse.down();
     await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
     await page.mouse.up();
-    return {
-      x,
-      y,
-      title: await page.title().catch(() => ""),
-      url: page.url(),
-    };
+    return { ...await this.actionResult(page, baseline, options), x, y };
   }
 
   private async frameBox(
@@ -1283,9 +1440,11 @@ export class ChromiumFishBrowser implements BrowserApi {
     clear: boolean,
     submit: boolean,
     frameId?: string,
-  ): Promise<void> {
+    options?: ActionOptions,
+  ): Promise<ActionResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
+    const baseline = this.actionBaseline(page);
     await this.moveTo(page, handle);
     await page.mouse.click(
       this.mousePositions.get(page)?.x ?? 0,
@@ -1297,18 +1456,31 @@ export class ChromiumFishBrowser implements BrowserApi {
     }
     await page.keyboard.type(text, { delay: 45 });
     if (submit) await page.keyboard.press("Enter");
+    return this.actionResult(page, baseline, options);
   }
 
-  async pressKey(key: string): Promise<void> {
-    await (await this.page()).keyboard.press(key);
-  }
-
-  async scroll(deltaX: number, deltaY: number): Promise<void> {
-    await (await this.page()).mouse.wheel(deltaX, deltaY);
-  }
-
-  async waitFor(options: WaitForOptions): Promise<void> {
+  async pressKey(key: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
+    const baseline = this.actionBaseline(page);
+    await page.keyboard.press(key);
+    return this.actionResult(page, baseline, options);
+  }
+
+  async scroll(deltaX: number, deltaY: number, options?: ActionOptions): Promise<ActionResult> {
+    const page = await this.page();
+    const baseline = this.actionBaseline(page);
+    await page.mouse.wheel(deltaX, deltaY);
+    return this.actionResult(page, baseline, options);
+  }
+
+  async waitFor(options: WaitForOptions, actionOptions?: ActionOptions): Promise<ActionResult> {
+    const page = await this.page();
+    const baseline = this.actionBaseline(page);
+    await this.runWaitCondition(page, options);
+    return this.actionResult(page, baseline, actionOptions);
+  }
+
+  private async runWaitCondition(page: Page, options: WaitForOptions): Promise<void> {
     const condition = options.condition;
 
     if (condition.kind === "element") {
@@ -1319,7 +1491,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         return;
       }
       const handle = this.refs.get(page)?.get(condition.target);
-      if (!handle) throw new Error(`Unknown element reference ${condition.target}; call snapshot again`);
+      if (!handle) throw this.unknownRefError(page, condition.target);
       const ownerFrame = await handle.ownerFrame();
       if (!ownerFrame) throw new Error(`Target ${condition.target} is no longer attached to a frame`);
       if (condition.frameId && ownerFrame !== this.resolveFrame(page, condition.frameId)) {
