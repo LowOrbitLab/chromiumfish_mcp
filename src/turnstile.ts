@@ -27,7 +27,7 @@ export interface ChallengeDetection {
   frames: Array<{ url: string }>;
 }
 
-export interface ClickChallengeResult {
+export interface ChallengeSolveResult {
   ok: boolean;
   method: "already_clear" | "click" | "not_found" | "timeout" | "busy";
   attempts: number;
