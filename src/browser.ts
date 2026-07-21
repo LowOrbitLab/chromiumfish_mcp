@@ -22,12 +22,20 @@ import {
   warmUpPath,
   type ChallengeDetection,
   type ChallengeKind,
+  type ChallengeSolveOptions,
   type ChallengeSolveResult,
   type WidgetBox,
   type WidgetState,
 } from "./turnstile.js";
 
-export type { ChallengeDetection, ChallengeKind, ChallengeSolveResult, WidgetBox, WidgetState };
+export type {
+  ChallengeDetection,
+  ChallengeKind,
+  ChallengeSolveOptions,
+  ChallengeSolveResult,
+  WidgetBox,
+  WidgetState,
+};
 
 export interface PageSummary {
   pageId: string;
@@ -68,7 +76,7 @@ interface FrameBox {
   frameUrl: string;
 }
 
-export interface MouseClickResult {
+export interface ClickAtResult {
   x: number;
   y: number;
   title: string;
@@ -104,23 +112,18 @@ export interface WaitForOptions {
   timeoutMs: number;
 }
 
-export interface ChallengeSolveOptions {
-  timeoutMs?: number;
-  maxClicks?: number;
-}
-
 export interface BrowserApi {
   listPages(): Promise<PageListResult>;
-  newPage(url?: string): Promise<PageSummary>;
+  openPage(url?: string): Promise<PageSummary>;
   selectPage(pageId: string): Promise<PageSummary>;
   closePage(pageId?: string): Promise<PageListResult>;
   navigate(url: string): Promise<NavigationResult>;
-  goBack(): Promise<NavigationResult>;
-  goForward(): Promise<NavigationResult>;
+  navigateBack(): Promise<NavigationResult>;
+  navigateForward(): Promise<NavigationResult>;
   reload(): Promise<NavigationResult>;
   snapshot(options?: SnapshotOptions): Promise<string>;
   getText(options?: GetTextOptions): Promise<string>;
-  screenshot(fullPage: boolean): Promise<Buffer>;
+  takeScreenshot(fullPage: boolean): Promise<Buffer>;
   click(target: string, frameId?: string): Promise<void>;
   hover(target: string, frameId?: string): Promise<void>;
   selectOption(
@@ -130,7 +133,7 @@ export interface BrowserApi {
     frameId?: string,
   ): Promise<string[]>;
   setChecked(target: string, checked: boolean, frameId?: string): Promise<boolean>;
-  mouseClick(x: number, y: number): Promise<MouseClickResult>;
+  clickAt(x: number, y: number): Promise<ClickAtResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   findChallenge(): Promise<ChallengeDetection>;
   solveChallenge(options?: ChallengeSolveOptions): Promise<ChallengeSolveResult>;
@@ -138,7 +141,7 @@ export interface BrowserApi {
   pressKey(key: string): Promise<void>;
   scroll(deltaX: number, deltaY: number): Promise<void>;
   waitFor(options: WaitForOptions): Promise<void>;
-  evalJs(expression: string): Promise<string>;
+  evaluate(expression: string): Promise<string>;
   runTask(task: string, url: string | undefined, maxSteps: number): Promise<NativeTaskResult>;
   close(): Promise<void>;
 }
@@ -376,7 +379,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { running: true, pages };
   }
 
-  async newPage(rawUrl?: string): Promise<PageSummary> {
+  async openPage(rawUrl?: string): Promise<PageSummary> {
     const context = await this.ensureContext();
     const page = await context.newPage();
     this.trackPage(page);
@@ -424,14 +427,14 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { title: await page.title(), url: page.url() };
   }
 
-  async goBack(): Promise<NavigationResult> {
+  async navigateBack(): Promise<NavigationResult> {
     const page = await this.page();
     await this.clearRefs(page);
     await page.goBack({ waitUntil: "domcontentloaded" });
     return { title: await page.title(), url: page.url() };
   }
 
-  async goForward(): Promise<NavigationResult> {
+  async navigateForward(): Promise<NavigationResult> {
     const page = await this.page();
     await this.clearRefs(page);
     await page.goForward({ waitUntil: "domcontentloaded" });
@@ -635,7 +638,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return clip(text, maxChars);
   }
 
-  async screenshot(fullPage: boolean): Promise<Buffer> {
+  async takeScreenshot(fullPage: boolean): Promise<Buffer> {
     const page = await this.page();
     const metrics = await page.evaluate(() => ({
       scale: window.devicePixelRatio || 1,
@@ -765,7 +768,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return actual;
   }
 
-  async mouseClick(x: number, y: number): Promise<MouseClickResult> {
+  async clickAt(x: number, y: number): Promise<ClickAtResult> {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       throw new Error("click_at requires finite numeric x/y coordinates");
     }
@@ -1364,7 +1367,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     await page.waitForTimeout(condition.timeMs);
   }
 
-  async evalJs(expression: string): Promise<string> {
+  async evaluate(expression: string): Promise<string> {
     const value = await (await this.page()).evaluate((source) => {
       return (0, eval)(source) as unknown;
     }, expression);
