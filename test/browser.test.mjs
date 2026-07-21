@@ -368,7 +368,7 @@ test("setChecked rejects unchecking a radio", async () => {
   );
 });
 
-test("screenshots reject oversized documents and viewports", async () => {
+test("takeScreenshot rejects oversized documents and viewports", async () => {
   let captured = false;
   const page = {
     evaluate: async () => ({
@@ -387,12 +387,12 @@ test("screenshots reject oversized documents and viewports", async () => {
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
 
-  await assert.rejects(browser.screenshot(true), /too large/);
-  await assert.rejects(browser.screenshot(false), /too large/);
+  await assert.rejects(browser.takeScreenshot(true), /too large/);
+  await assert.rejects(browser.takeScreenshot(false), /too large/);
   assert.equal(captured, false);
 });
 
-test("screenshot budget accounts for the device scale factor", async () => {
+test("takeScreenshot budget accounts for the device scale factor", async () => {
   let captured = false;
   const page = {
     evaluate: async () => ({
@@ -412,11 +412,11 @@ test("screenshot budget accounts for the device scale factor", async () => {
   browser.page = async () => page;
 
   // 4000x4000 CSS px is 16M pixels, but at scale 2 the PNG is 8000x8000 = 64M px.
-  await assert.rejects(browser.screenshot(true), /8000x8000/);
+  await assert.rejects(browser.takeScreenshot(true), /8000x8000/);
   assert.equal(captured, false);
 });
 
-test("goForward and reload wait for DOMContentLoaded", async () => {
+test("navigateForward and reload wait for DOMContentLoaded", async () => {
   const calls = [];
   const page = {
     goForward: async (options) => calls.push(["goForward", options]),
@@ -427,7 +427,7 @@ test("goForward and reload wait for DOMContentLoaded", async () => {
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
 
-  assert.deepEqual(await browser.goForward(), {
+  assert.deepEqual(await browser.navigateForward(), {
     title: "Example",
     url: "https://example.com/next",
   });

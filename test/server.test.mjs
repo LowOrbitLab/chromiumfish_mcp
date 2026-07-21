@@ -18,13 +18,13 @@ function fakeBrowser() {
   return {
     calls,
     listPages: async () => ({ running: false, pages: [] }),
-    newPage: async () => ({ pageId: "page-1", current: true, title: "", url: "about:blank" }),
+    openPage: async () => ({ pageId: "page-1", current: true, title: "", url: "about:blank" }),
     selectPage: async (pageId) => ({ pageId, current: true, title: "Example", url: "https://example.com/" }),
     closePage: async () => ({ running: true, pages: [] }),
     navigate: async (url) => ({ title: "Example", url }),
-    goBack: async () => ({ title: "", url: "about:blank" }),
-    goForward: async () => {
-      calls.push(["goForward"]);
+    navigateBack: async () => ({ title: "", url: "about:blank" }),
+    navigateForward: async () => {
+      calls.push(["navigateForward"]);
       return { title: "Forward", url: "https://example.com/forward" };
     },
     reload: async () => {
@@ -39,7 +39,7 @@ function fakeBrowser() {
       calls.push(["getText", options]);
       return "Page body";
     },
-    screenshot: async () => Buffer.from("png"),
+    takeScreenshot: async () => Buffer.from("png"),
     click: async (target, frameId) => calls.push(["click", target, frameId]),
     hover: async (target, frameId) => calls.push(["hover", target, frameId]),
     selectOption: async (target, values, matchBy, frameId) => {
@@ -50,7 +50,7 @@ function fakeBrowser() {
       calls.push(["setChecked", target, checked, frameId]);
       return checked;
     },
-    mouseClick: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
+    clickAt: async (x, y) => ({ x, y, title: "Example", url: "https://example.com/" }),
     listFrames: async (options) => {
       if (options?.includeBox === false) {
         return [{ frameId: "frame-1", url: "https://example.com/", name: "" }];
@@ -72,25 +72,28 @@ function fakeBrowser() {
       tokenPresent: false,
       frames: [{ url: "https://example.com/" }],
     }),
-    clickChallenge: async () => ({
-      ok: true,
-      method: "already_clear",
-      attempts: 0,
-      elapsedMs: 1,
-      title: "Example",
-      url: "https://example.com/",
-      bodySnippet: "Example Domain",
-      widgetState: "absent",
-      tokenPresent: false,
-      clicks: [],
-    }),
+    solveChallenge: async (options) => {
+      calls.push(["solveChallenge", options]);
+      return {
+        ok: true,
+        method: "already_clear",
+        attempts: 0,
+        elapsedMs: 1,
+        title: "Example",
+        url: "https://example.com/",
+        bodySnippet: "Example Domain",
+        widgetState: "absent",
+        tokenPresent: false,
+        clicks: [],
+      };
+    },
     typeText: async (target, value, clear, submit, frameId) => {
       calls.push(["typeText", target, value, clear, submit, frameId]);
     },
     pressKey: async () => undefined,
     scroll: async () => undefined,
     waitFor: async (options) => calls.push(["waitFor", options]),
-    evalJs: async () => 42,
+    evaluate: async () => 42,
     runTask: async () => ({ success: true, finalText: "Completed", steps: 1 }),
     close: async () => undefined,
   };
@@ -143,7 +146,7 @@ test("default tool set has a stable annotated contract", async (context) => {
 });
 
 test("solve_challenge and click_at return structured results", async (context) => {
-  const { client, server } = await connectedClient();
+  const { browser, client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
     await server.close();
@@ -154,6 +157,7 @@ test("solve_challenge and click_at return structured results", async (context) =
   });
   assert.match(solved.content[0].text, /already_clear/);
   assert.equal(solved.structuredContent.method, "already_clear");
+  assert.deepEqual(browser.calls[0], ["solveChallenge", { timeoutMs: 5000, maxClicks: 3 }]);
   const clicked = await client.callTool({
     name: "click_at",
     arguments: { x: 10, y: 20 },
@@ -250,7 +254,7 @@ test("forwards bounded inspection, form, navigation, and typed wait arguments", 
     "frame-2",
   ]);
   assert.deepEqual(browser.calls[4], ["setChecked", "#terms", true, "frame-2"]);
-  assert.deepEqual(browser.calls[5], ["goForward"]);
+  assert.deepEqual(browser.calls[5], ["navigateForward"]);
   assert.deepEqual(browser.calls[6], ["reload"]);
   assert.equal(browser.calls[7][0], "waitFor");
   assert.equal(browser.calls[7][1].condition.text, "Complete");
