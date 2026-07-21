@@ -7,6 +7,7 @@ const config = {
   windowSize: [1280, 720],
   allowEval: false,
   allowNativeAgent: false,
+  twoCaptchaForwardProxy: false,
   maxTextChars: 50_000,
   allowedHosts: [],
 };
@@ -504,4 +505,99 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
   assert.equal(calls[2][1], "**/dashboard");
   assert.equal(calls[3][1], "networkidle");
   assert.equal(calls[4][1], 250);
+});
+
+test("solveChallenge sends the detected target to 2Captcha and applies the token", async () => {
+  const calls = [];
+  let applied = false;
+  const solver = {
+    solve: async (target, options) => {
+      calls.push([target, options]);
+      return { taskId: "task-1", token: "solution-token", cost: "0.003" };
+    },
+  };
+  const browser = new ChromiumFishBrowser(config, solver);
+  const detection = {
+    present: true,
+    kind: "hcaptcha",
+    provider: "hcaptcha",
+    canSolve: true,
+    title: "Captcha",
+    url: "https://example.com/form",
+    bodySnippet: "Verify",
+    tokenPresent: false,
+    siteKey: "h-site-key",
+    frames: [],
+  };
+  const target = {
+    provider: "hcaptcha",
+    kind: "hcaptcha",
+    siteKey: "h-site-key",
+    pageUrl: "https://example.com/form",
+    userAgent: "TestAgent/1.0",
+  };
+  const page = {
+    waitForTimeout: async () => undefined,
+    isClosed: () => false,
+  };
+  browser.page = async () => page;
+  browser.inspectChallenge = async () => applied
+    ? {
+        detection: {
+          ...detection,
+          present: false,
+          kind: "none",
+          provider: "none",
+          canSolve: false,
+          tokenPresent: true,
+        },
+      }
+    : { detection, target };
+  browser.applyChallengeSolution = async (_page, appliedTarget, token) => {
+    calls.push([appliedTarget, token]);
+    applied = true;
+    return { applied: true, callbackInvoked: true, fieldsUpdated: 1 };
+  };
+
+  const result = await browser.solveChallenge({ timeoutMs: 10_000, action: "checkout" });
+  assert.equal(result.ok, true);
+  assert.equal(result.method, "2captcha");
+  assert.equal(result.taskId, "task-1");
+  assert.equal(result.tokenPresent, true);
+  assert.equal(result.callbackInvoked, true);
+  assert.equal(result.fieldsUpdated, 1);
+  assert.equal(calls[0][0].action, "checkout");
+  assert.equal(calls[1][1], "solution-token");
+});
+
+test("solveChallenge returns a configuration error without an API key", async () => {
+  const browser = new ChromiumFishBrowser(config);
+  const detection = {
+    present: true,
+    kind: "turnstile",
+    provider: "turnstile",
+    canSolve: true,
+    title: "Captcha",
+    url: "https://example.com/form",
+    bodySnippet: "Verify",
+    tokenPresent: false,
+    siteKey: "0x4AAAA",
+    frames: [],
+  };
+  browser.page = async () => ({ waitForTimeout: async () => undefined });
+  browser.inspectChallenge = async () => ({
+    detection,
+    target: {
+      provider: "turnstile",
+      kind: "turnstile",
+      siteKey: "0x4AAAA",
+      pageUrl: "https://example.com/form",
+      userAgent: "TestAgent/1.0",
+    },
+  });
+
+  const result = await browser.solveChallenge({ timeoutMs: 10_000 });
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, "API_KEY_MISSING");
+  assert.doesNotMatch(result.error, /[a-f0-9]{32}/i);
 });

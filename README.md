@@ -28,7 +28,10 @@ Add the server to your MCP client config:
   "mcpServers": {
     "chromiumfish": {
       "command": "chromiumfish_mcp",
-      "args": ["--persona-seed", "alice"]
+      "args": ["--persona-seed", "alice"],
+      "env": {
+        "TWOCAPTCHA_API_KEY": "YOUR_2CAPTCHA_API_KEY"
+      }
     }
   }
 }
@@ -47,7 +50,7 @@ To run from GitHub instead of a global install, set `"command": "npx"` and prepe
 | `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for` | Interact with the page |
 | `click_at` | Click absolute coordinates (for widgets `snapshot` cannot see) |
 | `list_frames` | List frames/iframes with stable IDs |
-| `find_challenge`, `solve_challenge` | Detect and clear interstitial / framed challenges |
+| `find_challenge`, `solve_challenge` | Detect reCAPTCHA, hCaptcha, or Turnstile and solve it through 2Captcha |
 | `evaluate` | Run arbitrary JavaScript — requires `--allow-eval` |
 | `run_task` | Native ChromiumFish agent — requires `--allow-native-agent` |
 
@@ -67,9 +70,12 @@ Snapshot references, frame-aware interaction, waiting, and the cross-origin chal
 --max-text-chars N         Set the hard limit for text and snapshot output
 --allow-eval               Enable arbitrary JavaScript execution
 --allow-native-agent       Enable the native ChromiumFish browser agent
+--2captcha-forward-proxy   Send the configured browser proxy to 2Captcha
 ```
 
-Proxy credentials can be embedded in the proxy URL, but are then exposed in the client config. Never commit config files containing proxy passwords, cookies, or API keys.
+`solve_challenge` reads its credential only from `TWOCAPTCHA_API_KEY`. Never commit MCP configuration files containing API keys, proxy passwords, or cookies.
+
+自动求解目前覆盖 reCAPTCHA v2/v3/Enterprise、hCaptcha 和独立 Turnstile。Cloudflare Managed Challenge 还要求浏览器使用 `--proxy`，并显式启用 `--2captcha-forward-proxy`，以便 2Captcha 使用相同出口地址。每次成功提交任务都可能产生 2Captcha 费用。
 
 ## Security
 
@@ -77,6 +83,7 @@ Proxy credentials can be embedded in the proxy URL, but are then exposed in the 
 - `evaluate` and the native agent are disabled by default; enable them only in trusted environments.
 - `--allowed-host example.com` restricts top-level HTTP/HTTPS navigation (redirects, links, form posts, popups) to a host and its subdomains. Third-party subframes and page assets remain reachable — it is a navigation guard, not a network egress filter.
 - Clients can click and type with real side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
+- `--2captcha-forward-proxy` 会把代理地址和凭据发送给 2Captcha；仅在你信任该服务且目标挑战要求同一出口地址时启用。
 - Each process runs an independent browser context; this is not a shared multi-tenant service.
 
 ## Development

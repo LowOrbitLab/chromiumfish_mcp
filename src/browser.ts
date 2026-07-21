@@ -11,23 +11,26 @@ import type {
 import { chromium } from "playwright-core";
 import type { ServerConfig } from "./config.js";
 import {
-  checkboxClickCandidates,
   classifyChallenge,
-  inferWidgetState,
-  initialCursorPos,
-  isCloudflareFrameUrl,
-  isVerifyingPhase,
-  looksCleared,
+  extractRecaptchaExecuteCandidates,
+  isProtectedChallengeFrameUrl,
   snippet,
-  warmUpPath,
+  type CaptchaSolver,
+  type ChallengeCandidate,
   type ChallengeDetection,
-  type ChallengeKind,
-  type ClickChallengeResult,
-  type WidgetBox,
-  type WidgetState,
-} from "./turnstile.js";
+  type ChallengeInspection,
+  type ChallengeSolveOptions,
+  type ChallengeSolveResult,
+  type ChallengeTarget,
+} from "./challenge.js";
+import { TwoCaptchaClient, TwoCaptchaError } from "./twocaptcha.js";
 
-export type { ChallengeDetection, ChallengeKind, ClickChallengeResult, WidgetBox, WidgetState };
+export type {
+  ChallengeDetection,
+  ChallengeKind,
+  ChallengeProvider,
+  ChallengeSolveResult,
+} from "./challenge.js";
 
 export interface PageSummary {
   pageId: string;
@@ -58,6 +61,14 @@ export interface FrameSummary {
   url: string;
   name: string;
   box?: { x: number; y: number; width: number; height: number };
+}
+
+interface FrameBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  frameUrl: string;
 }
 
 export interface MouseClickResult {
@@ -120,7 +131,7 @@ export interface BrowserApi {
   mouseClick(x: number, y: number): Promise<MouseClickResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   findChallenge(): Promise<ChallengeDetection>;
-  clickChallenge(options?: { timeoutMs?: number; maxClicks?: number }): Promise<ClickChallengeResult>;
+  solveChallenge(options?: ChallengeSolveOptions): Promise<ChallengeSolveResult>;
   typeText(target: string, text: string, clear: boolean, submit: boolean, frameId?: string): Promise<void>;
   pressKey(key: string): Promise<void>;
   scroll(deltaX: number, deltaY: number): Promise<void>;
@@ -205,10 +216,20 @@ export class ChromiumFishBrowser implements BrowserApi {
   private nextFrameId = 1;
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
-  /** Prevent concurrent solve_challenge runs from fighting over the same mouse. */
-  private clickChallengeInFlight = false;
+  private readonly captchaSolver?: CaptchaSolver;
+  private challengeSolveInFlight = false;
 
-  constructor(private readonly config: ServerConfig) {}
+  constructor(
+    private readonly config: ServerConfig,
+    captchaSolver?: CaptchaSolver,
+  ) {
+    this.captchaSolver = captchaSolver ?? (config.twoCaptchaApiKey
+      ? new TwoCaptchaClient(config.twoCaptchaApiKey, {
+          proxy: config.proxy,
+          forwardProxy: config.twoCaptchaForwardProxy,
+        })
+      : undefined);
+  }
 
   private nativeAgentArgs(): string[] {
     if (!this.config.allowNativeAgent) return [];
@@ -261,8 +282,116 @@ export class ChromiumFishBrowser implements BrowserApi {
         height: this.config.windowSize[1],
       },
     });
+    await this.installChallengeHooks(this.context);
     await this.installNavigationGuard(this.context);
     return this.context;
+  }
+
+  private async installChallengeHooks(context: BrowserContext): Promise<void> {
+    await context.addInitScript(() => {
+      type Provider = "recaptcha" | "hcaptcha" | "turnstile";
+      type CapturedEntry = {
+        provider: Provider;
+        siteKey?: string;
+        version?: "v2" | "v3";
+        action?: string;
+        enterprise?: boolean;
+        invisible?: boolean;
+        cData?: string;
+        chlPageData?: string;
+        callbackName?: string;
+        widgetId?: string;
+        callback?: (token: string) => unknown;
+      };
+      type CaptchaState = {
+        entries: CapturedEntry[];
+        appliedToken?: string;
+      };
+      type CaptchaWindow = Window & {
+        __chromiumfishCaptchaState?: CaptchaState;
+        grecaptcha?: Record<string, unknown> & { enterprise?: Record<string, unknown> };
+        hcaptcha?: Record<string, unknown>;
+        turnstile?: Record<string, unknown>;
+      };
+
+      const root = window as CaptchaWindow;
+      const state: CaptchaState = { entries: [] };
+      Object.defineProperty(root, "__chromiumfishCaptchaState", {
+        configurable: false,
+        enumerable: false,
+        value: state,
+      });
+      const wrapped = new WeakSet<object>();
+
+      const capture = (entry: CapturedEntry): void => {
+        state.entries.push(entry);
+        if (state.entries.length > 50) state.entries.splice(0, state.entries.length - 50);
+      };
+
+      const hookApi = (provider: Provider, api: Record<string, unknown>, enterprise = false): void => {
+        if (wrapped.has(api)) return;
+        wrapped.add(api);
+
+        const originalRender = typeof api.render === "function" ? api.render as (...args: unknown[]) => unknown : undefined;
+        if (originalRender) {
+          api.render = function render(container: unknown, rawOptions?: unknown): unknown {
+            const options = rawOptions && typeof rawOptions === "object"
+              ? rawOptions as Record<string, unknown>
+              : {};
+            const widgetId = originalRender.call(this, container, rawOptions);
+            const siteKey = typeof options.sitekey === "string" ? options.sitekey : undefined;
+            const callback = typeof options.callback === "function"
+              ? options.callback as (token: string) => unknown
+              : undefined;
+            capture({
+              provider,
+              ...(siteKey ? { siteKey } : {}),
+              ...(provider === "recaptcha" ? { version: "v2" as const } : {}),
+              ...(typeof options.action === "string" ? { action: options.action } : {}),
+              ...(enterprise ? { enterprise: true } : {}),
+              ...(options.size === "invisible" ? { invisible: true } : {}),
+              ...(typeof options.cData === "string" ? { cData: options.cData } : {}),
+              ...(typeof options.chlPageData === "string" ? { chlPageData: options.chlPageData } : {}),
+              ...(typeof options.callback === "string" ? { callbackName: options.callback } : {}),
+              ...(widgetId !== undefined ? { widgetId: String(widgetId) } : {}),
+              ...(callback ? { callback } : {}),
+            });
+            return widgetId;
+          };
+        }
+
+        const originalExecute = typeof api.execute === "function" ? api.execute as (...args: unknown[]) => unknown : undefined;
+        if (originalExecute) {
+          api.execute = function execute(siteKeyOrId?: unknown, rawOptions?: unknown): unknown {
+            const options = rawOptions && typeof rawOptions === "object"
+              ? rawOptions as Record<string, unknown>
+              : {};
+            capture({
+              provider,
+              ...(typeof siteKeyOrId === "string" ? { siteKey: siteKeyOrId } : {}),
+              ...(provider === "recaptcha" ? { version: "v3" as const } : {}),
+              ...(typeof options.action === "string" ? { action: options.action } : {}),
+              ...(enterprise ? { enterprise: true } : {}),
+            });
+            return originalExecute.call(this, siteKeyOrId, rawOptions);
+          };
+        }
+      };
+
+      const timer = window.setInterval(() => {
+        try {
+          if (root.grecaptcha) {
+            hookApi("recaptcha", root.grecaptcha);
+            if (root.grecaptcha.enterprise) hookApi("recaptcha", root.grecaptcha.enterprise, true);
+          }
+          if (root.hcaptcha) hookApi("hcaptcha", root.hcaptcha);
+          if (root.turnstile) hookApi("turnstile", root.turnstile);
+        } catch {
+          // 页面可能冻结或替换第三方对象，下个轮询周期会重新尝试。
+        }
+      }, 20);
+      window.addEventListener("pagehide", () => window.clearInterval(timer), { once: true });
+    });
   }
 
   private async installNavigationGuard(context: BrowserContext): Promise<void> {
@@ -316,7 +445,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       ? page.frames().find((candidate) => this.frameId(candidate) === frameId)
       : page.mainFrame();
     if (!frame) throw new Error(`Frame ${frameId} not found in the current page`);
-    if (frameId && isCloudflareFrameUrl(frame.url())) {
+    if (frameId && isProtectedChallengeFrameUrl(frame.url())) {
       throw new Error(
         `DOM access to challenge frame ${frameId} is disabled; use find_challenge and solve_challenge`,
       );
@@ -781,7 +910,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async frameBox(
     frame: Frame,
     options: { scroll?: boolean } = {},
-  ): Promise<WidgetBox | undefined> {
+  ): Promise<FrameBox | undefined> {
     try {
       if (options.scroll) {
         await frame.locator("body").scrollIntoViewIfNeeded({ timeout: 800 }).catch(() => undefined);
@@ -827,438 +956,395 @@ export class ChromiumFishBrowser implements BrowserApi {
     }));
   }
 
-  private async readTurnstileToken(page: Page, title: string): Promise<string> {
-    // Avoid probing challenge-related inputs while still on a CF gate page.
-    // A/B: evaluateAll on cf-turnstile-response / cf-chl-widget* before click => 0/3 pass;
-    // same click path without the probe => 3/3 pass.
-    if (/just a moment|\u5b89\u5168\u9a8c\u8bc1|checking your browser|performing security verification/i.test(title)) {
-      return "";
-    }
-
-    // Prefer a single lightweight read after leaving the gate.
-    const value = await page.evaluate(() => {
-      const nodes = Array.from(document.querySelectorAll("input, textarea"));
-      for (const node of nodes) {
-        const el = node as HTMLInputElement | HTMLTextAreaElement;
-        const key = `${el.name || ""} ${el.id || ""}`.toLowerCase();
-        if (!key.includes("turnstile") && !key.includes("cf-chl")) continue;
-        if (!key.includes("response")) continue;
-        const v = (el.value || "").trim();
-        if (v.length > 10) return v;
-      }
-      return "";
-    }).catch(() => "");
-    return value;
-  }
-
   private async readBody(page: Page): Promise<string> {
     return page.locator("body").innerText().catch(() => "");
   }
 
-  private async findTurnstileWidget(page: Page): Promise<WidgetBox | undefined> {
-    const preferred = page.frames().filter((frame) => isCloudflareFrameUrl(frame.url()));
-    const ordered = [
-      ...preferred,
-      ...page.frames().filter((frame) => !preferred.includes(frame) && frame !== page.mainFrame()),
-    ];
-    let fallback: WidgetBox | undefined;
-    for (const frame of ordered) {
-      const box = await this.frameBox(frame, { scroll: false });
-      if (!box) continue;
-      // Interactive Turnstile widget is typically ~300x65; ignore full-page frames.
-      if (box.width >= 200 && box.width <= 420 && box.height >= 50 && box.height <= 120) {
-        return box;
-      }
-      if (isCloudflareFrameUrl(frame.url()) && box.width >= 120 && box.width <= 500 && box.height >= 40 && box.height <= 200) {
-        fallback ??= box;
-      }
-    }
-    return fallback;
-  }
-
-  private async ensureWidgetInViewport(page: Page, widget: WidgetBox): Promise<WidgetBox> {
-    const viewport = page.viewportSize();
-    if (!viewport) return widget;
-    const margin = 12;
-    const fullyVisible =
-      widget.x >= margin
-      && widget.y >= margin
-      && widget.x + widget.width <= viewport.width - margin
-      && widget.y + widget.height <= viewport.height - margin;
-    if (fullyVisible) return widget;
-
-    // Scroll the challenge frame body into view, then re-measure.
-    for (const frame of page.frames()) {
-      if (frame.url() !== widget.frameUrl && !isCloudflareFrameUrl(frame.url())) continue;
-      await this.frameBox(frame, { scroll: true });
-    }
-    // Also nudge main page scroll toward widget center.
-    await page.evaluate(({ x, y }) => {
-      const targetY = window.scrollY + y - window.innerHeight / 2;
-      window.scrollTo(0, Math.max(0, targetY));
-    }, { x: widget.x + widget.width / 2, y: widget.y + widget.height / 2 }).catch(() => undefined);
-
-    await page.waitForTimeout(120);
-    return (await this.findTurnstileWidget(page)) ?? widget;
-  }
-
-  private async observeChallenge(page: Page): Promise<{
-    detection: ChallengeDetection;
-    kind: ChallengeKind;
-    widgetState: WidgetState;
-    tokenPresent: boolean;
-    hasChallengeFrame: boolean;
-    bodyText: string;
-  }> {
+  private async inspectChallenge(page: Page): Promise<ChallengeInspection> {
     const title = await page.title().catch(() => "");
     const url = page.url();
     const bodyText = await this.readBody(page);
     const frameUrls = page.frames().map((frame) => frame.url());
-    const hasChallengeFrame = frameUrls.some((frameUrl) => isCloudflareFrameUrl(frameUrl));
-    const token = await this.readTurnstileToken(page, title);
-    const tokenPresent = token.length > 10;
-    // Challenge-frame text is deliberately not read: probing challenges.cloudflare.com
-    // frames before clearance collapses success rates, so widget state relies on token
-    // presence and main-document signals only.
-    const widgetState = inferWidgetState({
-      tokenPresent,
-      hasChallengeFrame,
-      mainBodyText: bodyText,
-    });
-    const classified = classifyChallenge({
+    const avoidTokenRead = /just a moment|checking your browser|performing security verification/i.test(title);
+    const pageEvidence: {
+      candidates: ChallengeCandidate[];
+      inlineScripts: string[];
+      tokenPresent: boolean;
+      userAgent: string;
+    } = await page.evaluate((skipTokenFields) => {
+      type PageState = {
+        entries?: Array<Record<string, unknown>>;
+        appliedToken?: string;
+      };
+      const root = window as Window & { __chromiumfishCaptchaState?: PageState };
+      const candidates: ChallengeCandidate[] = [];
+      const seen = new Set<string>();
+      const add = (candidate: ChallengeCandidate): void => {
+        const key = [
+          candidate.provider,
+          candidate.siteKey ?? "",
+          candidate.version ?? "",
+          candidate.action ?? "",
+          candidate.enterprise ? "enterprise" : "",
+        ].join("|");
+        if (seen.has(key)) return;
+        seen.add(key);
+        candidates.push(candidate);
+      };
+
+      for (const entry of root.__chromiumfishCaptchaState?.entries ?? []) {
+        const provider = entry.provider;
+        if (provider !== "recaptcha" && provider !== "hcaptcha" && provider !== "turnstile") continue;
+        add({
+          provider,
+          ...(typeof entry.siteKey === "string" ? { siteKey: entry.siteKey } : {}),
+          ...(entry.version === "v2" || entry.version === "v3" ? { version: entry.version } : {}),
+          ...(typeof entry.action === "string" ? { action: entry.action } : {}),
+          ...(entry.enterprise === true ? { enterprise: true } : {}),
+          ...(entry.invisible === true ? { invisible: true } : {}),
+          ...(typeof entry.cData === "string" ? { cData: entry.cData } : {}),
+          ...(typeof entry.chlPageData === "string" ? { chlPageData: entry.chlPageData } : {}),
+          ...(typeof entry.callbackName === "string" ? { callbackName: entry.callbackName } : {}),
+          ...(typeof entry.widgetId === "string" ? { widgetId: entry.widgetId } : {}),
+        });
+      }
+
+      const recaptchaScriptUrls = Array.from(document.querySelectorAll<HTMLScriptElement>("script[src]"))
+        .map((script) => script.src)
+        .filter((src) => /recaptcha\/(?:api|enterprise)\.js/i.test(src));
+      const hasEnterpriseScript = recaptchaScriptUrls.some((src) => /recaptcha\/enterprise\.js/i.test(src));
+
+      for (const element of document.querySelectorAll<HTMLElement>("[data-sitekey]")) {
+        const siteKey = element.dataset.sitekey?.trim();
+        if (!siteKey) continue;
+        const marker = `${element.className || ""} ${element.id || ""} ${element.innerHTML.slice(0, 500)}`.toLowerCase();
+        const common = {
+          siteKey,
+          ...(element.dataset.action ? { action: element.dataset.action } : {}),
+          ...(element.dataset.callback ? { callbackName: element.dataset.callback } : {}),
+          ...(element.dataset.size === "invisible" ? { invisible: true } : {}),
+        };
+        if (marker.includes("h-captcha") || marker.includes("hcaptcha")) {
+          add({ provider: "hcaptcha", ...common });
+        } else if (marker.includes("cf-turnstile") || marker.includes("cloudflare")) {
+          add({ provider: "turnstile", ...common });
+        } else if (marker.includes("g-recaptcha") || marker.includes("recaptcha")) {
+          const version = element.dataset.action && element.dataset.size !== "invisible" ? "v3" : "v2";
+          add({
+            provider: "recaptcha",
+            version,
+            enterprise: hasEnterpriseScript || marker.includes("enterprise"),
+            ...common,
+          });
+        }
+      }
+
+      for (const frame of document.querySelectorAll<HTMLIFrameElement>("iframe[src]")) {
+        let parsed: URL;
+        try {
+          parsed = new URL(frame.src, location.href);
+        } catch {
+          continue;
+        }
+        const lower = parsed.href.toLowerCase();
+        if (lower.includes("recaptcha")) {
+          const siteKey = parsed.searchParams.get("k") ?? undefined;
+          add({
+            provider: "recaptcha",
+            version: "v2",
+            enterprise: lower.includes("enterprise"),
+            ...(siteKey ? { siteKey } : {}),
+          });
+        } else if (lower.includes("hcaptcha.com")) {
+          const siteKey = parsed.searchParams.get("sitekey") ?? parsed.searchParams.get("k") ?? undefined;
+          add({ provider: "hcaptcha", ...(siteKey ? { siteKey } : {}) });
+        } else if (lower.includes("challenges.cloudflare.com")) {
+          const siteKey = parsed.searchParams.get("k") ?? parsed.searchParams.get("sitekey") ?? undefined;
+          add({ provider: "turnstile", ...(siteKey ? { siteKey } : {}) });
+        }
+      }
+
+      for (const script of document.querySelectorAll<HTMLScriptElement>("script[src]")) {
+        let parsed: URL;
+        try {
+          parsed = new URL(script.src, location.href);
+        } catch {
+          continue;
+        }
+        if (!/recaptcha\/(?:api|enterprise)\.js/i.test(parsed.pathname)) continue;
+        const siteKey = parsed.searchParams.get("render");
+        if (!siteKey || siteKey === "explicit") continue;
+        add({
+          provider: "recaptcha",
+          siteKey,
+          version: "v3",
+          enterprise: parsed.pathname.includes("enterprise"),
+        });
+      }
+
+      let tokenPresent = (root.__chromiumfishCaptchaState?.appliedToken?.length ?? 0) > 10;
+      if (!skipTokenFields && !tokenPresent) {
+        const fields = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+          '[name="g-recaptcha-response"], [name="h-captcha-response"], [name="cf-turnstile-response"]',
+        );
+        tokenPresent = Array.from(fields).some((field) => field.value.trim().length > 10);
+      }
+      const inlineScripts = Array.from(document.scripts)
+        .map((script) => script.textContent ?? "")
+        .filter((text) => /grecaptcha(?:\.enterprise)?\.execute/.test(text))
+        .slice(0, 20)
+        .map((text) => text.slice(0, 200_000));
+      return { candidates, inlineScripts, tokenPresent, userAgent: navigator.userAgent };
+    }, avoidTokenRead).catch(() => ({ candidates: [], inlineScripts: [], tokenPresent: false, userAgent: "" }));
+
+    const activeV3Keys = pageEvidence.candidates
+      .filter((candidate) => candidate.provider === "recaptcha" && candidate.version === "v3")
+      .flatMap((candidate) => candidate.siteKey ? [candidate.siteKey] : []);
+    const candidates = [
+      ...pageEvidence.candidates,
+      ...extractRecaptchaExecuteCandidates(pageEvidence.inlineScripts, activeV3Keys),
+    ];
+
+    return classifyChallenge({
       title,
       url,
       bodyText,
       frameUrls,
-      tokenPresent,
-      widgetState,
+      tokenPresent: pageEvidence.tokenPresent,
+      userAgent: pageEvidence.userAgent,
+      candidates,
     });
-    const widget = (classified.present || widgetState === "success")
-      ? await this.findTurnstileWidget(page)
-      : undefined;
-
-    // If token/success already, force not-present for agent simplicity.
-    const present = tokenPresent || widgetState === "success" ? false : classified.present;
-    const kind = present ? classified.kind : "none";
-
-    return {
-      kind,
-      widgetState,
-      tokenPresent,
-      hasChallengeFrame,
-      bodyText,
-      detection: {
-        present,
-        kind,
-        widgetState,
-        title,
-        url,
-        bodySnippet: snippet(bodyText),
-        tokenPresent,
-        ...(widget ? { widget } : {}),
-        frames: frameUrls.map((frameUrl) => ({ url: frameUrl })),
-      },
-    };
   }
 
   async findChallenge(): Promise<ChallengeDetection> {
     const page = await this.page();
-    return (await this.observeChallenge(page)).detection;
+    return (await this.inspectChallenge(page)).detection;
   }
 
-  async clickChallenge(options: { timeoutMs?: number; maxClicks?: number } = {}): Promise<ClickChallengeResult> {
-    if (this.clickChallengeInFlight) {
-      const page = await this.page();
-      const title = await page.title().catch(() => "");
-      const url = page.url();
-      const bodySnippet = snippet(await this.readBody(page));
+  private async applyChallengeSolution(
+    page: Page,
+    target: ChallengeTarget,
+    token: string,
+  ): Promise<{ applied: boolean; callbackInvoked: boolean; fieldsUpdated: number }> {
+    return page.evaluate(({ provider, siteKey, callbackName, widgetId, solutionToken }) => {
+      type Entry = {
+        provider?: string;
+        siteKey?: string;
+        callbackName?: string;
+        widgetId?: string;
+        callback?: (token: string) => unknown;
+      };
+      type PageState = { entries?: Entry[]; appliedToken?: string };
+      const root = window as Window & {
+        __chromiumfishCaptchaState?: PageState;
+        grecaptcha?: Record<string, unknown>;
+        hcaptcha?: Record<string, unknown>;
+        turnstile?: Record<string, unknown>;
+      };
+      const state = root.__chromiumfishCaptchaState;
+      if (state) state.appliedToken = solutionToken;
+
+      const names = provider === "hcaptcha"
+        ? ["h-captcha-response", "g-recaptcha-response"]
+        : provider === "turnstile"
+          ? ["cf-turnstile-response"]
+          : ["g-recaptcha-response"];
+      let fieldsUpdated = 0;
+      for (const name of names) {
+        for (const field of document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(`[name="${name}"]`)) {
+          const prototype = field instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+          if (setter) setter.call(field, solutionToken);
+          else field.value = solutionToken;
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+          field.dispatchEvent(new Event("change", { bubbles: true }));
+          fieldsUpdated += 1;
+        }
+      }
+
+      const resolveCallback = (path: string): unknown => {
+        let value: unknown = root;
+        for (const part of path.split(".")) {
+          if (!value || (typeof value !== "object" && typeof value !== "function")) return undefined;
+          value = (value as Record<string, unknown>)[part];
+        }
+        return value;
+      };
+
+      let callbackInvoked = false;
+      const invoke = (callback: unknown): void => {
+        if (callbackInvoked || typeof callback !== "function") return;
+        try {
+          (callback as (value: string) => unknown)(solutionToken);
+          callbackInvoked = true;
+        } catch {
+          // 字段仍已写入；调用方会收到 applied=false 或继续自行提交表单。
+        }
+      };
+
+      if (callbackName) invoke(resolveCallback(callbackName));
+      const entries = [...(state?.entries ?? [])].reverse();
+      const captured = entries.find((entry) => entry.provider === provider
+        && (!siteKey || !entry.siteKey || entry.siteKey === siteKey)
+        && (!widgetId || !entry.widgetId || entry.widgetId === widgetId));
+      if (captured) {
+        invoke(captured.callback);
+        if (!callbackInvoked && captured.callbackName) invoke(resolveCallback(captured.callbackName));
+      }
+
+      let apiPatched = false;
+      const patchGetResponse = (api: Record<string, unknown> | undefined): void => {
+        if (!api) return;
+        try {
+          Object.defineProperty(api, "getResponse", {
+            configurable: true,
+            value: () => solutionToken,
+          });
+          apiPatched = true;
+        } catch {
+          // 某些供应商会冻结 API 对象，此时依赖字段和回调完成回填。
+        }
+      };
+      if (provider === "recaptcha") patchGetResponse(root.grecaptcha);
+      if (provider === "recaptcha" && root.grecaptcha?.enterprise
+        && typeof root.grecaptcha.enterprise === "object") {
+        patchGetResponse(root.grecaptcha.enterprise as Record<string, unknown>);
+      }
+      if (provider === "hcaptcha") patchGetResponse(root.hcaptcha);
+      if (provider === "turnstile") patchGetResponse(root.turnstile);
+
       return {
+        applied: fieldsUpdated > 0 || callbackInvoked || apiPatched,
+        callbackInvoked,
+        fieldsUpdated,
+      };
+    }, {
+      provider: target.provider,
+      siteKey: target.siteKey,
+      callbackName: target.callbackName,
+      widgetId: target.widgetId,
+      solutionToken: token,
+    }).catch(() => ({ applied: false, callbackInvoked: false, fieldsUpdated: 0 }));
+  }
+
+  async solveChallenge(options: ChallengeSolveOptions = {}): Promise<ChallengeSolveResult> {
+    const started = Date.now();
+    const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 120_000, 10_000), 600_000);
+    const page = await this.page();
+    let inspection = await this.inspectChallenge(page);
+    const baseResult = (
+      partial: Omit<ChallengeSolveResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "tokenPresent">,
+      detection = inspection.detection,
+    ): ChallengeSolveResult => ({
+      ...partial,
+      elapsedMs: Date.now() - started,
+      title: detection.title,
+      url: detection.url,
+      bodySnippet: detection.bodySnippet,
+      tokenPresent: detection.tokenPresent,
+    });
+
+    if (this.challengeSolveInFlight) {
+      return baseResult({
         ok: false,
         method: "busy",
-        attempts: 0,
-        elapsedMs: 0,
-        title,
-        url,
-        bodySnippet,
-        widgetState: "unknown",
-        tokenPresent: false,
-        clicks: [],
-        reason: "busy",
+        provider: inspection.detection.provider,
+        kind: inspection.detection.kind,
+        applied: false,
+        errorCode: "BUSY",
         error: "solve_challenge is already running; wait for the current call to finish",
-      };
-    }
-
-    this.clickChallengeInFlight = true;
-    try {
-      return await this.clickChallengeLocked(options);
-    } finally {
-      this.clickChallengeInFlight = false;
-    }
-  }
-
-  private async clickChallengeLocked(
-    options: { timeoutMs?: number; maxClicks?: number } = {},
-  ): Promise<ClickChallengeResult> {
-    const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 45_000, 3_000), 180_000);
-    const maxClicks = Math.min(Math.max(options.maxClicks ?? 12, 1), 30);
-    const started = Date.now();
-    const clicks: Array<{ x: number; y: number }> = [];
-    const page = await this.page();
-    /** How many times we entered verifying and exited still uncleared. */
-    let stuckVerifyingRounds = 0;
-    const maxStuckVerifyingRounds = 2;
-
-    const finish = async (
-      partial: Omit<ClickChallengeResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"> & {
-        widgetState?: WidgetState;
-        tokenPresent?: boolean;
-      },
-    ): Promise<ClickChallengeResult> => {
-      const observed = await this.observeChallenge(page);
-      return {
-        ...partial,
-        elapsedMs: Date.now() - started,
-        title: observed.detection.title,
-        url: observed.detection.url,
-        bodySnippet: observed.detection.bodySnippet,
-        widgetState: partial.widgetState ?? observed.widgetState,
-        tokenPresent: partial.tokenPresent ?? observed.tokenPresent,
-        widget: partial.widget ?? observed.detection.widget,
-      };
-    };
-
-    const clearanceInput = (
-      observed: Awaited<ReturnType<ChromiumFishBrowser["observeChallenge"]>>,
-      kind: ChallengeKind,
-    ) => ({
-      title: observed.detection.title,
-      url: observed.detection.url,
-      bodyText: observed.bodyText,
-      hadChallenge: true as const,
-      kind,
-      tokenPresent: observed.tokenPresent,
-      widgetState: observed.widgetState,
-      hasChallengeFrame: observed.hasChallengeFrame,
-    });
-
-    /** Poll without clicking. Returns cleared | still_verifying | ready_for_click. */
-    const waitWithoutClicking = async (
-      kind: ChallengeKind,
-      budgetMs: number,
-    ): Promise<"cleared" | "still_verifying" | "ready_for_click"> => {
-      const deadline = Math.min(Date.now() + budgetMs, started + timeoutMs);
-      let sawVerifying = false;
-      while (Date.now() < deadline) {
-        await page.waitForTimeout(450);
-        const observed = await this.observeChallenge(page);
-        if (looksCleared(clearanceInput(observed, kind))) {
-          // Confirm briefly.
-          await page.waitForTimeout(500);
-          const confirmed = await this.observeChallenge(page);
-          if (looksCleared(clearanceInput(confirmed, kind))) {
-            return "cleared";
-          }
-        }
-        if (isVerifyingPhase({
-          widgetState: observed.widgetState,
-          bodyText: observed.bodyText,
-          title: observed.detection.title,
-        })) {
-          sawVerifying = true;
-          continue;
-        }
-        // Not verifying and not cleared; another click may help.
-        if (sawVerifying) return "ready_for_click";
-        // Never entered verifying in this wait window.
-        if (Date.now() >= deadline) break;
-      }
-      const end = await this.observeChallenge(page);
-      if (looksCleared(clearanceInput(end, kind))) return "cleared";
-      if (isVerifyingPhase({
-        widgetState: end.widgetState,
-        bodyText: end.bodyText,
-        title: end.detection.title,
-      })) {
-        return "still_verifying";
-      }
-      return sawVerifying ? "still_verifying" : "ready_for_click";
-    };
-
-    let observed = await this.observeChallenge(page);
-    // Late-mounted challenge frames: wait briefly before concluding already_clear.
-    if (!observed.detection.present) {
-      const lateDeadline = started + 5_000;
-      while (Date.now() < lateDeadline) {
-        await page.waitForTimeout(400);
-        observed = await this.observeChallenge(page);
-        if (observed.detection.present) break;
-      }
-    }
-    if (!observed.detection.present) {
-      return finish({
-        ok: true,
-        method: "already_clear",
-        attempts: 0,
-        clicks,
-        widgetState: observed.widgetState,
-        tokenPresent: observed.tokenPresent,
       });
     }
 
-    const kind = observed.kind;
-    let widget = observed.detection.widget;
+    this.challengeSolveInFlight = true;
+    try {
+      const detectionDeadline = Date.now() + Math.min(3_000, timeoutMs);
+      while ((!inspection.detection.present || !inspection.target) && Date.now() < detectionDeadline) {
+        await page.waitForTimeout(250);
+        const next = await this.inspectChallenge(page);
+        if (next.detection.present || next.target) inspection = next;
+        if (inspection.target) break;
+      }
 
-    // Wait for the widget frame to finish mounting.
-    while (!widget && Date.now() - started < Math.min(15_000, timeoutMs)) {
-      await page.waitForTimeout(350);
-      observed = await this.observeChallenge(page);
-      if (!observed.detection.present) {
-        return finish({
+      if (!inspection.detection.present) {
+        return baseResult({
           ok: true,
           method: "already_clear",
-          attempts: 0,
-          clicks,
-          widgetState: observed.widgetState,
-          tokenPresent: observed.tokenPresent,
+          provider: "none",
+          kind: "none",
+          applied: false,
         });
       }
-      widget = observed.detection.widget;
-    }
 
-    if (!widget) {
-      return finish({
-        ok: false,
-        method: "not_found",
-        attempts: 0,
-        clicks,
-        reason: "not_found",
-        error: "Cross-origin challenge control area not found",
-      });
-    }
-
-    widget = await this.ensureWidgetInViewport(page, widget);
-
-    // Seed the cursor away from (0,0); A/B tests showed origin starts reduce hit rate.
-    const seed = initialCursorPos(page.viewportSize());
-    await page.mouse.move(seed.x, seed.y);
-    this.mousePositions.set(page, seed);
-    await page.waitForTimeout(40 + Math.floor(Math.random() * 80));
-
-    // Exterior warm-up path (matches high-success A/B pattern).
-    for (const point of warmUpPath(widget)) {
-      if (Date.now() - started > timeoutMs) break;
-      const viewport = page.viewportSize();
-      if (viewport && (point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height)) {
-        continue;
-      }
-      await this.moveMouse(page, point.x, point.y, 8 + Math.floor(Math.random() * 4));
-      await page.waitForTimeout(50 + Math.floor(Math.random() * 80));
-    }
-
-    let attempts = 0;
-
-    const clearedResult = (): Promise<ClickChallengeResult> =>
-      finish({ ok: true, method: "click", attempts, clicks, widget });
-
-    const bumpStuckVerifying = (
-      errorMessage: string,
-    ): Promise<ClickChallengeResult> | undefined => {
-      stuckVerifyingRounds += 1;
-      if (stuckVerifyingRounds < maxStuckVerifyingRounds) return undefined;
-      return finish({
-        ok: false,
-        method: "timeout",
-        attempts,
-        clicks,
-        widget,
-        reason: "stuck_verifying",
-        error: errorMessage,
-      });
-    };
-
-    while (Date.now() - started < timeoutMs && attempts < maxClicks) {
-      // If already verifying, do NOT click; only wait.
-      observed = await this.observeChallenge(page);
-      if (isVerifyingPhase({
-        widgetState: observed.widgetState,
-        bodyText: observed.bodyText,
-        title: observed.detection.title,
-      })) {
-        const waitResult = await waitWithoutClicking(kind, 15_000);
-        if (waitResult === "cleared") return clearedResult();
-        if (waitResult === "still_verifying") {
-          const stuckResult = bumpStuckVerifying(
-            "The page remained in the Verifying state too long; stopped clicking",
-          );
-          if (stuckResult) return stuckResult;
-        }
+      if (!inspection.target) {
+        return baseResult({
+          ok: false,
+          method: "unsupported",
+          provider: inspection.detection.provider,
+          kind: inspection.detection.kind,
+          applied: false,
+          errorCode: "MISSING_SITE_KEY",
+          error: "The challenge was detected, but its site key could not be extracted",
+        });
       }
 
-      widget = await this.ensureWidgetInViewport(
-        page,
-        (await this.findTurnstileWidget(page)) ?? widget,
-      );
-      // Prefer the left-checkbox primary target first (same as successful A/B: box.x+28).
-      const primary = {
-        x: widget.x + Math.min(36, Math.max(22, widget.width * 0.1)),
-        y: widget.y + widget.height / 2,
+      if (!this.captchaSolver) {
+        return baseResult({
+          ok: false,
+          method: "error",
+          provider: inspection.detection.provider,
+          kind: inspection.detection.kind,
+          applied: false,
+          errorCode: "API_KEY_MISSING",
+          error: "TWOCAPTCHA_API_KEY is not configured",
+        });
+      }
+
+      const target: ChallengeTarget = {
+        ...inspection.target,
+        ...(options.action ? { action: options.action } : {}),
       };
-      const queue = attempts === 0 ? [primary, ...checkboxClickCandidates(widget)] : checkboxClickCandidates(widget);
-      const target = queue[attempts % queue.length] ?? primary;
-      const x = target.x + (Math.random() - 0.5) * 3;
-      const y = target.y + (Math.random() - 0.5) * 2;
-      attempts += 1;
-      clicks.push({ x, y });
-      await this.moveMouse(page, x, y, 14 + Math.floor(Math.random() * 6));
-      await page.waitForTimeout(80 + Math.floor(Math.random() * 100));
-      await page.mouse.down();
-      await page.waitForTimeout(45 + Math.floor(Math.random() * 60));
-      await page.mouse.up();
-
-      // After each click: long no-click wait (verifying-aware).
-      // The first click gets a longer window; successful manual paths clear in about 1-3s.
-      const waitBudget = attempts === 1 ? 18_000 : 12_000;
-      const waitResult = await waitWithoutClicking(kind, waitBudget);
-      if (waitResult === "cleared") return clearedResult();
-      if (waitResult === "still_verifying") {
-        const stuckResult = bumpStuckVerifying(
-          "The page remained in the Verifying state too long after a click; stopped clicking",
-        );
-        if (stuckResult) return stuckResult;
-      }
-    }
-
-    observed = await this.observeChallenge(page);
-    const cleared = looksCleared(clearanceInput(observed, kind));
-    if (cleared) {
-      return finish({
-        ok: true,
-        method: "click",
-        attempts,
-        clicks,
-        widget,
-        widgetState: observed.widgetState,
-        tokenPresent: observed.tokenPresent,
+      const solution = await this.captchaSolver.solve(target, {
+        timeoutMs: Math.max(1_000, timeoutMs - (Date.now() - started)),
+        ...(options.minScore !== undefined ? { minScore: options.minScore } : {}),
       });
+      const application = await this.applyChallengeSolution(page, target, solution.token);
+      await page.waitForTimeout(500).catch(() => undefined);
+      const after = page.isClosed() ? inspection.detection : (await this.inspectChallenge(page)).detection;
+      const applied = application.applied;
+      return baseResult({
+        ok: applied,
+        method: applied ? "2captcha" : "error",
+        provider: inspection.detection.provider,
+        kind: inspection.detection.kind,
+        applied,
+        taskId: solution.taskId,
+        callbackInvoked: application.callbackInvoked,
+        fieldsUpdated: application.fieldsUpdated,
+        ...(solution.cost ? { cost: solution.cost } : {}),
+        ...(solution.solveCount !== undefined ? { solveCount: solution.solveCount } : {}),
+        ...(!applied ? {
+          errorCode: "APPLY_FAILED",
+          error: "2Captcha returned a token, but the page exposed no response field or callback",
+        } : {}),
+      }, { ...after, tokenPresent: applied || after.tokenPresent });
+    } catch (error) {
+      const known = error instanceof TwoCaptchaError;
+      const code = known ? error.code : "SOLVE_FAILED";
+      return baseResult({
+        ok: false,
+        method: code === "CAPTCHA_TIMEOUT" ? "timeout" : code === "PROXY_REQUIRED" ? "unsupported" : "error",
+        provider: inspection.detection.provider,
+        kind: inspection.detection.kind,
+        applied: false,
+        errorCode: code,
+        error: error instanceof Error ? error.message : "Could not solve the challenge",
+      });
+    } finally {
+      this.challengeSolveInFlight = false;
     }
-    const stuck = isVerifyingPhase({
-      widgetState: observed.widgetState,
-      bodyText: observed.bodyText,
-      title: observed.detection.title,
-    });
-    return finish({
-      ok: false,
-      method: "timeout",
-      attempts,
-      clicks,
-      widget,
-      widgetState: observed.widgetState,
-      tokenPresent: observed.tokenPresent,
-      reason: stuck ? "stuck_verifying" : "timeout",
-      error: stuck
-        ? "The page remained in the Verifying state too long; stopped clicking"
-        : "Could not confirm challenge clearance before the timeout",
-    });
   }
 
   async typeText(

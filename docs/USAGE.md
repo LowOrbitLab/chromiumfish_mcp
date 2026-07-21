@@ -6,7 +6,7 @@ The browser starts lazily on the first tool call that needs a page, and is clean
 
 ## Snapshots and element references
 
-`snapshot` lists visible interactive elements and assigns temporary references (`e1`, `e2`, …). A call returns output like:
+`snapshot` lists visible interactive elements and assigns temporary references (`e1`, `e2`, ...). A call returns output like:
 
 ```text
 [e1] input "Search" type=text value=""
@@ -16,7 +16,7 @@ The browser starts lazily on the first tool call that needs a page, and is clean
 [e5] link "Documentation" -> https://example.com/docs
 ```
 
-Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. References belong to the latest snapshot of the current page and selected frame — request a new snapshot after the page changes.
+Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. References belong to the latest snapshot of the current page and selected frame; request a new snapshot after the page changes.
 
 `snapshot` reports input type and value, checked/unchecked, selected values, up to 20 dropdown options, expanded/collapsed, and disabled. Password values are never returned. Output defaults to 100 visible elements and 20,000 characters; tune it with `scope`, `maxElements`, and `maxChars`. A truncation marker means more matching elements may exist. Use `select_option` with `matchBy: "value"` or `matchBy: "label"`, and use `set_checked` instead of toggling a checkbox blindly. Radios support `checked: true` only; select another radio to change the choice.
 
@@ -41,18 +41,31 @@ Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. Reference
 }
 ```
 
-## Cross-origin challenge widgets
+## 2Captcha 验证码流程
 
-Ordinary frames can be inspected by `frameId`, including cross-origin application frames. DOM access to known Cloudflare challenge frames is intentionally blocked because probing them can reduce clearance rates. For those cases:
+普通跨域应用 frame 仍可通过 `frameId` 检查。reCAPTCHA、hCaptcha 和 Cloudflare challenge frame 的直接 DOM 访问会被阻止，验证码应使用以下流程：
 
-1. `navigate` to the target URL
-2. `find_challenge` — inspect `present`, `kind`, and `widget`
-3. `solve_challenge` — automatic clicks near the widget checkbox region + clearance polling
-4. Or `list_frames` + `click_at` for manual coordinate control
+1. 使用 `navigate` 打开目标页面。
+2. 调用 `find_challenge`，检查 `present`、`provider`、`kind`、`siteKey` 与 `canSolve`。
+3. 调用 `solve_challenge`。服务会向 2Captcha 提交任务、轮询结果、写入响应字段并调用页面注册的 widget 回调。
+4. 根据 `ok` 与 `tokenPresent` 判断结果，再继续页面操作。
 
-`solve_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, a different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
+`solve_challenge` 接受以下参数：
 
-Do **not** read challenge-frame document text or probe `cf-turnstile-response` / `cf-chl-widget*` inputs while still on the gate page; that can collapse interactive clearance rates.
+- `timeoutMs`：10 秒到 10 分钟，默认 120 秒。
+- `action`：覆盖自动提取的 reCAPTCHA v3 或 Turnstile action。
+- `minScore`：reCAPTCHA v3 的最低分数，范围 0.1 到 0.9。
+
+返回值包含 `method`、`provider`、`kind`、`taskId`、`cost`、`solveCount`、`applied`、`callbackInvoked`、`fieldsUpdated` 和稳定的 `errorCode`。完整令牌不会返回给 MCP 客户端，也不会写入日志。
+
+自动检测与回填范围：
+
+- reCAPTCHA v2、v3 和 Enterprise。
+- hCaptcha；该类型通过 2Captcha v1 的 `method=hcaptcha` 提交。
+- 独立 Cloudflare Turnstile。
+- Cloudflare Managed Challenge，但必须同时配置浏览器代理和 `--2captcha-forward-proxy`。
+
+2Captcha 目录中的图片、音频、坐标、Cookie 和多阶段任务并非统一令牌协议，因此不伪装成可自动回填。它们需要后续提供对应的页面参数提取与结果适配器。
 
 ## Native browser agent
 

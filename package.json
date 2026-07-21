@@ -1,6 +1,6 @@
 {
   "name": "chromiumfish_mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A secure, session-aware MCP server for ChromiumFish.",
   "type": "module",
   "main": "./dist/index.js",
@@ -26,7 +26,8 @@
     "NOTICE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
     "prepare": "npm run build",

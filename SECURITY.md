@@ -11,6 +11,8 @@ Privately report vulnerabilities that could expose browser data, proxy credentia
 - Keep `evaluate` and the native browser agent disabled by default.
 - Treat `--allowed-host` as a top-level navigation guard, not a network egress filter; page assets and subframes may contact other hosts.
 - Use a separate, least-privilege browser account with revocable credentials.
+- Configure 2Captcha only through `TWOCAPTCHA_API_KEY`, and rotate a key immediately if it appears in logs or chat history.
+- Enable `--2captcha-forward-proxy` only when required; it sends the configured proxy address and credentials to 2Captcha.
 - Require human confirmation before automating purchases, publishing, deletion, or permission changes.
 
 Security updates are currently provided only for the latest release.

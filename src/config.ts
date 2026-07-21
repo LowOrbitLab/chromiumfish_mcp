@@ -1,6 +1,6 @@
 import type { LaunchOptions } from "playwright-core";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 export interface ServerConfig {
   personaSeed?: string;
@@ -12,6 +12,8 @@ export interface ServerConfig {
   proxy?: LaunchOptions["proxy"];
   allowEval: boolean;
   allowNativeAgent: boolean;
+  twoCaptchaApiKey?: string;
+  twoCaptchaForwardProxy: boolean;
   maxTextChars: number;
   allowedHosts: string[];
 }
@@ -66,10 +68,14 @@ export function parseCli(argv: string[]): ParsedCli {
     windowSize: [1920, 1080],
     allowEval: false,
     allowNativeAgent: false,
+    twoCaptchaForwardProxy: false,
     maxTextChars: 50_000,
     allowedHosts: [],
   };
   if (process.env.CHROME_BIN) config.chromePath = process.env.CHROME_BIN;
+  if (process.env.TWOCAPTCHA_API_KEY?.trim()) {
+    config.twoCaptchaApiKey = process.env.TWOCAPTCHA_API_KEY.trim();
+  }
   let help = false;
   let version = false;
   let timezoneArg: string | undefined;
@@ -93,6 +99,9 @@ export function parseCli(argv: string[]): ParsedCli {
         break;
       case "--allow-native-agent":
         config.allowNativeAgent = true;
+        break;
+      case "--2captcha-forward-proxy":
+        config.twoCaptchaForwardProxy = true;
         break;
       case "--persona-seed":
         config.personaSeed = readValue(argv, index, arg);
@@ -143,6 +152,10 @@ export function parseCli(argv: string[]): ParsedCli {
     config.timezone = timezoneArg;
   }
 
+  if (config.twoCaptchaForwardProxy && !config.proxy) {
+    throw new Error("--2captcha-forward-proxy requires --proxy");
+  }
+
   return { config, help, version };
 }
 
@@ -163,7 +176,9 @@ Options:
   --max-text-chars N         Set the text and snapshot hard limit (default: 50000)
   --allow-eval               Enable the arbitrary JavaScript execution tool
   --allow-native-agent       Enable the native browser agent tool
+  --2captcha-forward-proxy   Send the configured browser proxy to 2Captcha
   --help                     Show help
   --version                  Show version
 
+2Captcha reads its API key only from TWOCAPTCHA_API_KEY.
 The native agent reads configuration only from OPENAI_API_KEY, OPENAI_API_BASE, and OPENAI_API_MODEL.`;

@@ -274,7 +274,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "find_challenge",
     {
       description:
-        "Detect common browser interstitials and embedded cross-origin challenge controls. Returns present, kind, widgetState, tokenPresent, the widget box, and related frames.",
+        "Detect reCAPTCHA, hCaptcha, and Cloudflare Turnstile on the current page. Returns provider, kind, site key, action, solvability, token state, and related frames.",
       inputSchema: {},
       annotations: READ_ONLY,
     },
@@ -285,15 +285,16 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "solve_challenge",
     {
       description:
-        "Use human-like coordinate clicks on a standard checkbox inside a cross-origin challenge frame, then poll until clearance is confirmed by a response token, widget success state, or interstitial exit. Does not require a vision model; use the JSON ok field as the result.",
+        "Solve the detected reCAPTCHA, hCaptcha, or Cloudflare Turnstile challenge through 2Captcha, inject the returned token into the current page, and invoke the captured widget callback.",
       inputSchema: {
-        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
-        maxClicks: z.number().int().min(1).max(30).default(6),
+        timeoutMs: z.number().int().min(10_000).max(600_000).default(120_000),
+        action: z.string().min(1).max(200).optional(),
+        minScore: z.number().min(0.1).max(0.9).optional(),
       },
       annotations: MUTATING,
     },
-    async ({ timeoutMs, maxClicks }) => structured(
-      await browser.clickChallenge({ timeoutMs, maxClicks }),
+    async ({ timeoutMs, action, minScore }) => structured(
+      await browser.solveChallenge({ timeoutMs, action, minScore }),
     ),
   );
 

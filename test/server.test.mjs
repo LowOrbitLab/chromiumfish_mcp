@@ -9,6 +9,7 @@ const config = {
   windowSize: [1920, 1080],
   allowEval: false,
   allowNativeAgent: false,
+  twoCaptchaForwardProxy: false,
   maxTextChars: 50_000,
   allowedHosts: [],
 };
@@ -65,25 +66,29 @@ function fakeBrowser() {
     findChallenge: async () => ({
       present: false,
       kind: "none",
-      widgetState: "absent",
+      provider: "none",
+      canSolve: false,
       title: "Example",
       url: "https://example.com/",
       bodySnippet: "Example Domain",
       tokenPresent: false,
       frames: [{ url: "https://example.com/" }],
     }),
-    clickChallenge: async () => ({
+    solveChallenge: async (options) => {
+      calls.push(["solveChallenge", options]);
+      return {
       ok: true,
       method: "already_clear",
-      attempts: 0,
+      provider: "none",
+      kind: "none",
       elapsedMs: 1,
+      applied: false,
       title: "Example",
       url: "https://example.com/",
       bodySnippet: "Example Domain",
-      widgetState: "absent",
       tokenPresent: false,
-      clicks: [],
-    }),
+      };
+    },
     typeText: async (target, value, clear, submit, frameId) => {
       calls.push(["typeText", target, value, clear, submit, frameId]);
     },
@@ -142,18 +147,23 @@ test("default tool set has a stable annotated contract", async (context) => {
   assert.equal(tools.find((tool) => tool.name === "close_page").annotations.destructiveHint, true);
 });
 
-test("solve_challenge and click_at return structured results", async (context) => {
-  const { client, server } = await connectedClient();
+test("solve_challenge forwards 2Captcha options and click_at remains available", async (context) => {
+  const { browser, client, server } = await connectedClient();
   context.after(async () => {
     await client.close();
     await server.close();
   });
   const solved = await client.callTool({
     name: "solve_challenge",
-    arguments: { timeoutMs: 5000, maxClicks: 3 },
+    arguments: { timeoutMs: 10000, action: "login", minScore: 0.7 },
   });
   assert.match(solved.content[0].text, /already_clear/);
   assert.equal(solved.structuredContent.method, "already_clear");
+  assert.deepEqual(browser.calls[0], ["solveChallenge", {
+    timeoutMs: 10000,
+    action: "login",
+    minScore: 0.7,
+  }]);
   const clicked = await client.callTool({
     name: "click_at",
     arguments: { x: 10, y: 20 },
