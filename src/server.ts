@@ -478,6 +478,30 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
+  if (config.uploadDirs.length > 0) {
+    server.registerTool(
+      "upload_file",
+      {
+        description:
+          "Attach local files to a file input. Target the input[type=file] itself, by ref or "
+          + "CSS selector; a hidden input works, so a styled upload button usually means "
+          + "targeting the input it wraps. Paths must resolve inside a directory the server "
+          + "was started with via --upload-dir. Registered only when --upload-dir is set.",
+        inputSchema: {
+          target: z.string().min(1),
+          paths: z.array(z.string().min(1)).min(1).max(10),
+          frameId: z.string().min(1).optional(),
+          ...returnSnapshotInput,
+        },
+        annotations: MUTATING,
+      },
+      async ({ target, paths, frameId, returnSnapshot }) => action({
+        ...await browser.uploadFile(target, paths, frameId, { returnSnapshot }),
+        target,
+      }),
+    );
+  }
+
   if (config.allowEval) {
     server.registerTool(
       "evaluate",

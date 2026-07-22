@@ -11,6 +11,7 @@ const config = {
   allowNativeAgent: false,
   maxTextChars: 50_000,
   allowedHosts: [],
+  uploadDirs: [],
 };
 
 const SNAPSHOT_TEXT = "[e1] button \"Submit\"";
@@ -78,6 +79,12 @@ function fakeBrowser() {
     setChecked: async (target, checked, frameId, options) => {
       calls.push(["setChecked", target, checked, frameId, options]);
       return acted(options, { checked });
+    },
+    uploadFile: async (target, paths, frameId, options) => {
+      calls.push(["uploadFile", target, paths, frameId, options]);
+      return acted(options, {
+        files: paths.map((path) => ({ name: path.split("/").at(-1), bytes: 3 })),
+      });
     },
     clickAt: async (x, y, options) => acted(options, { x, y }),
     listFrames: async (options) => {
@@ -342,6 +349,38 @@ test("registers dangerous tools when explicitly enabled", async (context) => {
   const names = (await client.listTools()).tools.map((tool) => tool.name);
   assert.ok(names.includes("evaluate"));
   assert.ok(names.includes("run_task"));
+});
+
+test("upload_file is registered and forwards its arguments once --upload-dir is set", async (context) => {
+  const { browser, client, server } = await connectedClient({ uploadDirs: ["/tmp/uploads"] });
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const names = (await client.listTools()).tools.map((tool) => tool.name);
+  assert.ok(names.includes("upload_file"));
+
+  const result = await client.callTool({
+    name: "upload_file",
+    arguments: {
+      target: "input[type=file]",
+      paths: ["/tmp/uploads/a.png", "/tmp/uploads/b.png"],
+      frameId: "frame-1",
+    },
+  });
+  assert.deepEqual(browser.calls[0], [
+    "uploadFile",
+    "input[type=file]",
+    ["/tmp/uploads/a.png", "/tmp/uploads/b.png"],
+    "frame-1",
+    { returnSnapshot: false },
+  ]);
+  assert.deepEqual(result.structuredContent.files, [
+    { name: "a.png", bytes: 3 },
+    { name: "b.png", bytes: 3 },
+  ]);
+  assert.equal(result.structuredContent.target, "input[type=file]");
 });
 
 test("initialize carries workflow instructions", async (context) => {

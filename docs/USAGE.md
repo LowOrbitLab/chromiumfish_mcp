@@ -60,6 +60,14 @@ Resolving a target — reference or selector — is bounded at five seconds, so 
 
 `list_frames` returns a stable `frameId` for each frame in the current page. Bounding boxes are omitted by default; set `includeBox: true` only for coordinate interaction. Pass a frame ID to `snapshot` or `get_text` to inspect that frame. Element references created by a frame snapshot work with `click`, `hover`, `type_text`, `select_option`, `set_checked`, and `wait_for`; when using a CSS selector instead of a reference, pass the same `frameId` to the action. Refresh `list_frames` after navigation because detached child frames receive new IDs.
 
+## File uploads
+
+`upload_file` is registered only when the server was started with at least one `--upload-dir`; every path in `paths` must resolve inside one of those roots, with symlinks resolved first.
+
+Target the `input[type=file]` itself. Attaching does not require visibility, so the common "styled button in front of a `display:none` input" pattern works by passing the CSS selector of the hidden input — it will not appear in `snapshot`, which lists visible elements only. Pass more than one path only when the input is marked `multiple`. The result reports `files` as base names with byte sizes.
+
+`click` refuses a file input rather than acting on it. Clicking one cannot open anything, because the chooser is only intercepted while a listener is registered and this server registers none; a headless click would otherwise report an ordinary success and leave you waiting on an upload that never started.
+
 ## Waiting
 
 `wait_for` accepts a typed `condition` object. Supported kinds are `element`, `text`, `url`, `load`, and `time`. Element and text states default to `visible`; URL values support Playwright glob patterns such as `**/dashboard`.

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
 import test from "node:test";
-import { ChromiumFishBrowser } from "../dist/browser.js";
+import { assertUploadPath, ChromiumFishBrowser } from "../dist/browser.js";
 
 const config = {
   headless: true,
@@ -9,7 +12,11 @@ const config = {
   allowNativeAgent: false,
   maxTextChars: 50_000,
   allowedHosts: [],
+  uploadDirs: [],
 };
+
+/** What resolveTarget's staleness evaluate returns for a live, non-file element. */
+const LIVE = { connected: true, fileInput: false };
 
 function frame({ url, name = "", parent = null, text = "", box } = {}) {
   return {
@@ -205,7 +212,7 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   };
   const selectHandle = {
     isVisible: async () => true,
-    evaluate: async (callback) => String(callback).includes("isConnected") ? true : ({
+    evaluate: async (callback) => String(callback).includes("isConnected") ? LIVE : ({
       tag: "select",
       explicitRole: "",
       hasList: false,
@@ -240,7 +247,7 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
     isVisible: async () => true,
     evaluate: async (callback) => {
       const source = String(callback);
-      if (source.includes("isConnected")) return true;
+      if (source.includes("isConnected")) return LIVE;
       if (source.includes("return element.type.toLowerCase")) return "checkbox";
       return {
         tag: "input",
@@ -320,7 +327,7 @@ test("actions report navigation, opened pages, and an opt-in snapshot", async ()
     url: () => "https://example.com/popup",
   };
   const handle = {
-    evaluate: async () => true,
+    evaluate: async () => LIVE,
     scrollIntoViewIfNeeded: async () => undefined,
     boundingBox: async () => ({ x: 10, y: 10, width: 40, height: 20 }),
   };
@@ -450,7 +457,7 @@ test("snapshot scans past hidden elements, reports truncation, and releases unus
 test("element targeting bounds Playwright's otherwise unlimited auto-wait", async () => {
   const seen = {};
   const handle = {
-    evaluate: async () => true,
+    evaluate: async () => LIVE,
     scrollIntoViewIfNeeded: async (options) => {
       seen.scroll = options;
     },
@@ -565,7 +572,7 @@ test("reference numbers are never reused, so a stale reference fails loudly", as
 
 test("setChecked rejects unchecking a radio", async () => {
   const handle = {
-    evaluate: async (callback) => String(callback).includes("isConnected") ? true : "radio",
+    evaluate: async (callback) => String(callback).includes("isConnected") ? LIVE : "radio",
     isChecked: async () => true,
   };
   const main = {
@@ -725,4 +732,173 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
   assert.equal(url[0][1], "**/dashboard");
   assert.equal(load[0][1], "networkidle");
   assert.equal(time[0][1], 250);
+});
+
+async function uploadFixture() {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "cf-upload-")));
+  const inside = join(root, "inside.txt");
+  await writeFile(inside, "abc");
+  const outsideRoot = await realpath(await mkdtemp(join(tmpdir(), "cf-outside-")));
+  const outside = join(outsideRoot, "secret.txt");
+  await writeFile(outside, "secret");
+  await mkdir(join(root, "sub"));
+  return { root, inside, outside, outsideRoot };
+}
+
+test("assertUploadPath confines uploads to the configured roots", async () => {
+  const { root, inside, outside } = await uploadFixture();
+
+  assert.equal(await assertUploadPath(inside, [root]), inside);
+  // A relative path is resolved against the process, not silently rejected.
+  assert.equal(await assertUploadPath(relative(process.cwd(), inside), [root]), inside);
+
+  await assert.rejects(assertUploadPath(outside, [root]), /outside every --upload-dir root/);
+  await assert.rejects(assertUploadPath(join(root, "nope.txt"), [root]), /does not exist/);
+  await assert.rejects(assertUploadPath(join(root, "sub"), [root]), /not a regular file/);
+  await assert.rejects(assertUploadPath(inside, []), /Uploads are disabled/);
+});
+
+test("assertUploadPath resolves symlinks before the containment check", async (t) => {
+  const { root, outside } = await uploadFixture();
+  const link = join(root, "link.txt");
+  try {
+    await symlink(outside, link);
+  } catch {
+    // Windows needs elevation or Developer Mode to create file symlinks.
+    t.skip("symlink creation not permitted");
+    return;
+  }
+  // The link sits inside the root; only realpath reveals that its target does not.
+  await assert.rejects(assertUploadPath(link, [root]), /outside every --upload-dir root/);
+});
+
+test("assertUploadPath matches roots that are themselves symlinks", async (t) => {
+  const { root, inside } = await uploadFixture();
+  const aliasParent = await mkdtemp(join(tmpdir(), "cf-alias-"));
+  const alias = join(aliasParent, "root");
+  try {
+    await symlink(root, alias, "dir");
+  } catch {
+    t.skip("symlink creation not permitted");
+    return;
+  }
+  // Realpathing only the file would leave this failing to match its own root.
+  assert.equal(await assertUploadPath(inside, [alias]), inside);
+});
+
+test("uploadFile rejects a non-file input before touching the page", async () => {
+  const handle = {
+    evaluate: async (callback) => String(callback).includes("isConnected")
+      ? LIVE
+      : { isFile: false, multiple: false },
+    setInputFiles: async () => assert.fail("must not attach to a non-file input"),
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const browser = new ChromiumFishBrowser({ ...config, uploadDirs: [tmpdir()] });
+  browser.page = async () => ({ frames: () => [main], mainFrame: () => main });
+
+  await assert.rejects(
+    browser.uploadFile("#name", ["/tmp/a.txt"]),
+    /is not a file input/,
+  );
+});
+
+test("uploadFile validates every path before attaching any of them", async () => {
+  const { root, inside, outside } = await uploadFixture();
+  let attached;
+  const handle = {
+    evaluate: async (callback) => String(callback).includes("isConnected")
+      ? { connected: true, fileInput: true }
+      : { isFile: true, multiple: true },
+    setInputFiles: async (paths) => {
+      attached = paths;
+    },
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    url: () => "https://example.com/",
+    title: async () => "Example",
+    isClosed: () => false,
+    waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
+  };
+  const browser = new ChromiumFishBrowser({ ...config, uploadDirs: [root] });
+  browser.page = async () => page;
+
+  // One bad entry must leave the input untouched rather than attaching a partial list.
+  await assert.rejects(
+    browser.uploadFile("input[type=file]", [inside, outside]),
+    /outside every --upload-dir root/,
+  );
+  assert.equal(attached, undefined);
+
+  const result = await browser.uploadFile("input[type=file]", [inside]);
+  assert.deepEqual(attached, [inside]);
+  // Base names only: the host's directory layout never reaches the caller.
+  assert.deepEqual(result.files, [{ name: "inside.txt", bytes: 3 }]);
+});
+
+test("uploadFile rejects multiple files on a single-file input", async () => {
+  const { root, inside } = await uploadFixture();
+  const handle = {
+    evaluate: async (callback) => String(callback).includes("isConnected")
+      ? { connected: true, fileInput: true }
+      : { isFile: true, multiple: false },
+    setInputFiles: async () => assert.fail("must not attach past the multiple check"),
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const browser = new ChromiumFishBrowser({ ...config, uploadDirs: [root] });
+  browser.page = async () => ({ frames: () => [main], mainFrame: () => main });
+
+  await assert.rejects(
+    browser.uploadFile("input[type=file]", [inside, inside]),
+    /not marked multiple/,
+  );
+});
+
+test("click on a file input fails loudly instead of silently doing nothing", async () => {
+  const handle = {
+    evaluate: async () => ({ connected: true, fileInput: true }),
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const page = { frames: () => [main], mainFrame: () => main };
+
+  // Without --upload-dir the tool is absent, so the error has to say why.
+  const gated = new ChromiumFishBrowser(config);
+  gated.page = async () => page;
+  await assert.rejects(gated.click("input[type=file]"), /started without --upload-dir/);
+
+  const enabled = new ChromiumFishBrowser({ ...config, uploadDirs: [tmpdir()] });
+  enabled.page = async () => page;
+  await assert.rejects(enabled.click("input[type=file]"), /Use upload_file instead/);
+
+  // The guard is click-only: hover and the rest still resolve a file input normally.
+  const hovered = new ChromiumFishBrowser(config);
+  hovered.page = async () => page;
+  await assert.rejects(
+    hovered.hover("input[type=file]"),
+    (error) => !/file input/.test(error.message),
+  );
 });
