@@ -142,6 +142,30 @@ export interface GetTextOptions {
   maxChars?: number;
 }
 
+export interface ScreenshotOptions {
+  fullPage?: boolean;
+  /** Crop to one element; mutually exclusive with fullPage. */
+  target?: string;
+  frameId?: string;
+}
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+/** Where a drag ends: onto another element, or by a viewport-space offset. */
+export interface DragDestination {
+  toTarget?: string;
+  dx?: number;
+  dy?: number;
+}
+
+export interface DragResult extends ActionResult {
+  from: Point;
+  to: Point;
+}
+
 export type WaitForCondition =
   | { kind: "element"; target: string; state?: ElementState; frameId?: string }
   | { kind: "text"; text: string; state?: "visible" | "hidden"; frameId?: string }
@@ -165,7 +189,7 @@ export interface BrowserApi {
   reload(options?: ActionOptions): Promise<ActionResult>;
   snapshot(options?: SnapshotOptions): Promise<string>;
   getText(options?: GetTextOptions): Promise<string>;
-  takeScreenshot(fullPage: boolean): Promise<Buffer>;
+  takeScreenshot(options?: ScreenshotOptions): Promise<Buffer>;
   click(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult>;
   hover(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult>;
   selectOption(
@@ -188,6 +212,12 @@ export interface BrowserApi {
     options?: ActionOptions,
   ): Promise<UploadFileResult>;
   clickAt(x: number, y: number, options?: ActionOptions): Promise<ClickAtResult>;
+  drag(
+    target: string,
+    destination: DragDestination,
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<DragResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   findChallenge(): Promise<ChallengeDetection>;
   solveChallenge(options?: ChallengeSolveOptions): Promise<ChallengeSolveResult>;
@@ -856,8 +886,15 @@ export class ChromiumFishBrowser implements BrowserApi {
     return clip(text, maxChars);
   }
 
-  async takeScreenshot(fullPage: boolean): Promise<Buffer> {
+  async takeScreenshot(options: ScreenshotOptions = {}): Promise<Buffer> {
     const page = await this.page();
+    const fullPage = options.fullPage ?? false;
+    if (options.target !== undefined) {
+      if (fullPage) {
+        throw new Error("take_screenshot cannot combine target with fullPage; an element capture is already cropped");
+      }
+      return this.elementScreenshot(page, options.target, options.frameId);
+    }
     const metrics = await page.evaluate(() => ({
       scale: window.devicePixelRatio || 1,
       scrollWidth: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0),
@@ -884,6 +921,35 @@ export class ChromiumFishBrowser implements BrowserApi {
       );
     }
     return page.screenshot({ type: "png", fullPage });
+  }
+
+  /**
+   * Crop to one element instead of shipping a whole viewport PNG to answer a question about
+   * a single control. The element is scrolled in first, so the capture does not depend on
+   * where the page happens to be scrolled.
+   */
+  private async elementScreenshot(page: Page, target: string, frameId?: string): Promise<Buffer> {
+    const handle = await this.resolveTarget(page, target, frameId);
+    await handle.scrollIntoViewIfNeeded({ timeout: LOCATOR_TIMEOUT_MS });
+    const box = await handle.boundingBox();
+    if (!box || box.width <= 0 || box.height <= 0) {
+      throw new Error(`Target ${target} has no visible box to capture`);
+    }
+    const scale = await page.evaluate(() => window.devicePixelRatio || 1)
+      .then((value) => Number.isFinite(value) && value > 0 ? value : 1)
+      .catch(() => 1);
+    const width = Math.ceil(box.width * scale);
+    const height = Math.ceil(box.height * scale);
+    if (
+      width > MAX_SCREENSHOT_DIMENSION
+      || height > MAX_SCREENSHOT_DIMENSION
+      || width * height > MAX_SCREENSHOT_PIXELS
+    ) {
+      throw new Error(
+        `Element screenshot is too large (${width}x${height}); capture a smaller descendant instead`,
+      );
+    }
+    return handle.screenshot({ type: "png" });
   }
 
   /** Reference numbers are never reused, so an unknown one is always from an earlier snapshot. */
@@ -964,11 +1030,16 @@ export class ChromiumFishBrowser implements BrowserApi {
     await handle.scrollIntoViewIfNeeded({ timeout: LOCATOR_TIMEOUT_MS });
     const box = await handle.boundingBox();
     if (!box) throw new Error("Target is not currently clickable");
-    const destination = {
+    const destination = this.pointInBox(box);
+    await this.moveMouse(page, destination.x, destination.y, 12);
+  }
+
+  /** Jittered point inside a box, matching how moveTo picks its click point. */
+  private pointInBox(box: { x: number; y: number; width: number; height: number }): Point {
+    return {
       x: box.x + box.width * (0.35 + Math.random() * 0.3),
       y: box.y + box.height * (0.35 + Math.random() * 0.3),
     };
-    await this.moveMouse(page, destination.x, destination.y, 12);
   }
 
   private async clickHandle(page: Page, handle: InteractiveHandle): Promise<void> {
@@ -1097,6 +1168,61 @@ export class ChromiumFishBrowser implements BrowserApi {
     await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
     await page.mouse.up();
     return { ...await this.actionResult(page, baseline, options), x, y };
+  }
+
+  async drag(
+    target: string,
+    destination: DragDestination,
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<DragResult> {
+    const { toTarget, dx, dy } = destination;
+    const hasOffset = dx !== undefined || dy !== undefined;
+    if (hasOffset === (toTarget !== undefined)) {
+      throw new Error("drag needs exactly one destination: either toTarget, or dx/dy");
+    }
+    if (hasOffset && (!Number.isFinite(dx ?? 0) || !Number.isFinite(dy ?? 0))) {
+      throw new Error("drag requires finite numeric dx/dy offsets");
+    }
+
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target, frameId);
+    // Scrolls the source into view and seeds the cursor on it, so the press below lands
+    // where the drag is supposed to start.
+    await this.moveTo(page, handle);
+    const from = this.mousePositions.get(page) ?? { x: 0, y: 0 };
+
+    let to: Point;
+    if (toTarget !== undefined) {
+      const destHandle = await this.resolveTarget(page, toTarget, frameId);
+      // Deliberately not scrolled into view: scrolling now would slide the source out from
+      // under the cursor. Both ends have to be on screen at once for a drag to mean anything.
+      const box = await destHandle.boundingBox();
+      if (!box) throw new Error(`Drag destination ${toTarget} is not visible`);
+      to = this.pointInBox(box);
+    } else {
+      to = { x: from.x + (dx ?? 0), y: from.y + (dy ?? 0) };
+    }
+
+    const viewport = page.viewportSize();
+    if (viewport && (to.x < 0 || to.y < 0 || to.x > viewport.width || to.y > viewport.height)) {
+      throw new Error(
+        `Drag would end at (${Math.round(to.x)}, ${Math.round(to.y)}), outside the `
+        + `${viewport.width}x${viewport.height} viewport; scroll both ends into view first`,
+      );
+    }
+
+    const baseline = this.actionBaseline(page);
+    await page.mouse.down();
+    // A press that jumps straight to the release point reads as synthetic. Pause as a hand
+    // would before pulling, then follow moveMouse's curved, jittered path — sliders that
+    // score trajectory reject the linear interpolation locator.dragTo would produce.
+    await page.waitForTimeout(90 + Math.floor(Math.random() * 120));
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    await this.moveMouse(page, to.x, to.y, Math.max(14, Math.min(40, Math.round(distance / 18))));
+    await page.waitForTimeout(60 + Math.floor(Math.random() * 90));
+    await page.mouse.up();
+    return { ...await this.actionResult(page, baseline, options), from, to };
   }
 
   private async frameBox(

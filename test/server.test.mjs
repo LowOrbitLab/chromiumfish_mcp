@@ -63,7 +63,14 @@ function fakeBrowser() {
       calls.push(["getText", options]);
       return "Page body";
     },
-    takeScreenshot: async () => Buffer.from("png"),
+    takeScreenshot: async (options) => {
+      calls.push(["takeScreenshot", options]);
+      return Buffer.from("png");
+    },
+    drag: async (target, destination, frameId, options) => {
+      calls.push(["drag", target, destination, frameId, options]);
+      return acted(options, { from: { x: 10, y: 20 }, to: { x: 210, y: 20 } });
+    },
     click: async (target, frameId, options) => {
       calls.push(["click", target, frameId, options]);
       return acted(options, { navigated: true, newPages: ["page-2"] });
@@ -170,6 +177,7 @@ test("default tool set has a stable annotated contract", async (context) => {
     "click",
     "hover",
     "click_at",
+    "drag",
     "list_frames",
     "find_challenge",
     "solve_challenge",
@@ -486,4 +494,63 @@ test("tool calls return browser results", async (context) => {
   });
   assert.match(result.content[0].text, /Example/);
   assert.equal(result.structuredContent.url, "https://example.com/");
+});
+
+test("drag forwards exactly one destination form", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const offset = await client.callTool({
+    name: "drag",
+    arguments: { target: "e1", dx: 200, dy: 0 },
+  });
+  assert.deepEqual(browser.calls[0], [
+    "drag",
+    "e1",
+    { toTarget: undefined, dx: 200, dy: 0 },
+    undefined,
+    { returnSnapshot: false },
+  ]);
+  assert.deepEqual(offset.structuredContent.from, { x: 10, y: 20 });
+  assert.deepEqual(offset.structuredContent.to, { x: 210, y: 20 });
+
+  await client.callTool({
+    name: "drag",
+    arguments: { target: "#card", toTarget: "#column-2", frameId: "frame-1" },
+  });
+  assert.deepEqual(browser.calls[1], [
+    "drag",
+    "#card",
+    { toTarget: "#column-2", dx: undefined, dy: undefined },
+    "frame-1",
+    { returnSnapshot: false },
+  ]);
+});
+
+test("take_screenshot forwards the element crop", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({
+    name: "take_screenshot",
+    arguments: { target: "e5", frameId: "frame-1" },
+  });
+  assert.deepEqual(browser.calls[0], [
+    "takeScreenshot",
+    { fullPage: false, target: "e5", frameId: "frame-1" },
+  ]);
+  assert.equal(result.content[0].type, "image");
+  assert.equal(result.content[0].mimeType, "image/png");
+
+  await client.callTool({ name: "take_screenshot", arguments: {} });
+  assert.deepEqual(browser.calls[1], [
+    "takeScreenshot",
+    { fullPage: false, target: undefined, frameId: undefined },
+  ]);
 });

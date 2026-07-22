@@ -613,8 +613,8 @@ test("takeScreenshot rejects oversized documents and viewports", async () => {
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
 
-  await assert.rejects(browser.takeScreenshot(true), /too large/);
-  await assert.rejects(browser.takeScreenshot(false), /too large/);
+  await assert.rejects(browser.takeScreenshot({ fullPage: true }), /too large/);
+  await assert.rejects(browser.takeScreenshot({ fullPage: false }), /too large/);
   assert.equal(captured, false);
 });
 
@@ -638,7 +638,7 @@ test("takeScreenshot budget accounts for the device scale factor", async () => {
   browser.page = async () => page;
 
   // 4000x4000 CSS px is 16M pixels, but at scale 2 the PNG is 8000x8000 = 64M px.
-  await assert.rejects(browser.takeScreenshot(true), /8000x8000/);
+  await assert.rejects(browser.takeScreenshot({ fullPage: true }), /8000x8000/);
   assert.equal(captured, false);
 });
 
@@ -901,4 +901,171 @@ test("click on a file input fails loudly instead of silently doing nothing", asy
     hovered.hover("input[type=file]"),
     (error) => !/file input/.test(error.message),
   );
+});
+
+/** Page fake that records mouse traffic, for the drag tests. */
+function draggablePage(handles, { viewport = { width: 1280, height: 720 } } = {}) {
+  const events = [];
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: (selector) => ({
+      first: () => ({ elementHandle: async () => handles[selector] }),
+    }),
+  };
+  return {
+    events,
+    page: {
+      frames: () => [main],
+      mainFrame: () => main,
+      url: () => "https://example.com/",
+      title: async () => "Example",
+      isClosed: () => false,
+      viewportSize: () => viewport,
+      waitForTimeout: async () => undefined,
+      waitForLoadState: async () => undefined,
+      mouse: {
+        move: async (x, y) => events.push(["move", x, y]),
+        down: async () => events.push(["down"]),
+        up: async () => events.push(["up"]),
+      },
+    },
+  };
+}
+
+function draggableHandle(box) {
+  return {
+    evaluate: async () => LIVE,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => box,
+  };
+}
+
+test("drag presses, follows a curved path, and releases in order", async () => {
+  const handles = { "#slider": draggableHandle({ x: 100, y: 300, width: 40, height: 40 }) };
+  const { events, page } = draggablePage(handles);
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const result = await browser.drag("#slider", { dx: 260, dy: 0 });
+
+  const down = events.findIndex((event) => event[0] === "down");
+  const up = events.findIndex((event) => event[0] === "up");
+  assert.ok(down > 0, "moves to the source before pressing");
+  assert.ok(up > down);
+  // The path between press and release is what a trajectory check scores; a straight
+  // two-point interpolation would defeat the point of routing through moveMouse.
+  const dragMoves = events.slice(down, up).filter((event) => event[0] === "move");
+  assert.ok(dragMoves.length >= 14, `expected a stepped path, got ${dragMoves.length} moves`);
+  const offAxis = dragMoves.some((event) => Math.abs(event[2] - result.from.y) > 0.5);
+  assert.ok(offAxis, "path should bow off the straight line");
+
+  assert.equal(Math.round(result.to.x - result.from.x), 260);
+  assert.equal(Math.round(result.to.y - result.from.y), 0);
+  const [, lastX, lastY] = dragMoves.at(-1);
+  assert.ok(Math.abs(lastX - result.to.x) < 0.001);
+  assert.ok(Math.abs(lastY - result.to.y) < 0.001);
+});
+
+test("drag onto a target element measures the destination without scrolling it", async () => {
+  let destScrolled = false;
+  const handles = {
+    "#card": draggableHandle({ x: 100, y: 100, width: 50, height: 50 }),
+    "#column": {
+      evaluate: async () => LIVE,
+      scrollIntoViewIfNeeded: async () => {
+        destScrolled = true;
+      },
+      boundingBox: async () => ({ x: 600, y: 400, width: 200, height: 200 }),
+    },
+  };
+  const { page } = draggablePage(handles);
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const result = await browser.drag("#card", { toTarget: "#column" });
+  // Scrolling the destination mid-drag would slide the source out from under the cursor.
+  assert.equal(destScrolled, false);
+  assert.ok(result.to.x >= 670 && result.to.x <= 730);
+  assert.ok(result.to.y >= 470 && result.to.y <= 530);
+});
+
+test("drag rejects an ambiguous or out-of-viewport destination", async () => {
+  const handles = { "#slider": draggableHandle({ x: 100, y: 300, width: 40, height: 40 }) };
+  const { page } = draggablePage(handles);
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await assert.rejects(browser.drag("#slider", {}), /exactly one destination/);
+  await assert.rejects(
+    browser.drag("#slider", { toTarget: "#column", dx: 10 }),
+    /exactly one destination/,
+  );
+  await assert.rejects(browser.drag("#slider", { dx: 5000, dy: 0 }), /outside the 1280x720/);
+});
+
+test("element screenshot crops instead of returning the viewport", async () => {
+  let captured;
+  const handle = {
+    evaluate: async () => LIVE,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => ({ x: 10, y: 20, width: 120, height: 40 }),
+    screenshot: async (options) => {
+      captured = options;
+      return Buffer.from("element-png");
+    },
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    evaluate: async () => 1,
+    viewportSize: () => ({ width: 1280, height: 720 }),
+    screenshot: async () => assert.fail("must not fall back to a page capture"),
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const png = await browser.takeScreenshot({ target: "#badge" });
+  assert.equal(png.toString(), "element-png");
+  assert.deepEqual(captured, { type: "png" });
+
+  await assert.rejects(
+    browser.takeScreenshot({ target: "#badge", fullPage: true }),
+    /cannot combine target with fullPage/,
+  );
+});
+
+test("element screenshot rejects an invisible element and honors the pixel budget", async () => {
+  const boxes = { "#hidden": null, "#huge": { x: 0, y: 0, width: 9_000, height: 9_000 } };
+  const makeHandle = (selector) => ({
+    evaluate: async () => LIVE,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => boxes[selector],
+    screenshot: async () => assert.fail("must not capture past the budget check"),
+  });
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: (selector) => ({ first: () => ({ elementHandle: async () => makeHandle(selector) }) }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    // Scale 2 turns a 9000px box into 18000px of PNG.
+    evaluate: async () => 2,
+    viewportSize: () => ({ width: 1280, height: 720 }),
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await assert.rejects(browser.takeScreenshot({ target: "#hidden" }), /no visible box/);
+  await assert.rejects(browser.takeScreenshot({ target: "#huge" }), /18000x18000/);
 });
