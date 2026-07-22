@@ -1613,6 +1613,9 @@ export class ChromiumFishBrowser implements BrowserApi {
       return {
         ok: false,
         method: "busy",
+        challengeObserved: false,
+        interactionPerformed: false,
+        clearanceVerified: false,
         attempts: 0,
         elapsedMs: 0,
         title,
@@ -1645,9 +1648,26 @@ export class ChromiumFishBrowser implements BrowserApi {
     /** How many times we entered verifying and exited still uncleared. */
     let stuckVerifyingRounds = 0;
     const maxStuckVerifyingRounds = 2;
+    /** Latched by observe(): whether a challenge was ever actually seen on this page. */
+    let challengeObserved = false;
+
+    /**
+     * Every observation in this method goes through here so challengeObserved cannot drift
+     * from what was really detected. It latches: a challenge that clears mid-run was still
+     * observed, and the result should say so.
+     */
+    const observe = async () => {
+      const result = await this.observeChallenge(page);
+      if (result.detection.present) challengeObserved = true;
+      return result;
+    };
 
     const finish = async (
-      partial: Omit<ChallengeSolveResult, "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"> & {
+      partial: Omit<
+        ChallengeSolveResult,
+        "elapsedMs" | "title" | "url" | "bodySnippet" | "widgetState" | "tokenPresent"
+        | "challengeObserved" | "interactionPerformed"
+      > & {
         widgetState?: WidgetState;
         tokenPresent?: boolean;
       },
@@ -1655,6 +1675,11 @@ export class ChromiumFishBrowser implements BrowserApi {
       const observed = await this.observeChallenge(page);
       return {
         ...partial,
+        // Derived here rather than passed in. A return site that spelled these out could
+        // claim an interaction that never happened, which is the exact misreport they exist
+        // to prevent; clicks and the observation log are the only sources.
+        challengeObserved,
+        interactionPerformed: partial.clicks.length > 0,
         elapsedMs: Date.now() - started,
         title: observed.detection.title,
         url: observed.detection.url,
@@ -1688,11 +1713,11 @@ export class ChromiumFishBrowser implements BrowserApi {
       let sawVerifying = false;
       while (Date.now() < deadline) {
         await page.waitForTimeout(450);
-        const observed = await this.observeChallenge(page);
+        const observed = await observe();
         if (looksCleared(clearanceInput(observed, kind))) {
           // Confirm briefly.
           await page.waitForTimeout(500);
-          const confirmed = await this.observeChallenge(page);
+          const confirmed = await observe();
           if (looksCleared(clearanceInput(confirmed, kind))) {
             return "cleared";
           }
@@ -1710,7 +1735,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         // Never entered verifying in this wait window.
         if (Date.now() >= deadline) break;
       }
-      const end = await this.observeChallenge(page);
+      const end = await observe();
       if (looksCleared(clearanceInput(end, kind))) return "cleared";
       if (isVerifyingPhase({
         widgetState: end.widgetState,
@@ -1722,13 +1747,13 @@ export class ChromiumFishBrowser implements BrowserApi {
       return sawVerifying ? "still_verifying" : "ready_for_click";
     };
 
-    let observed = await this.observeChallenge(page);
+    let observed = await observe();
     // Late-mounted challenge frames: wait briefly before concluding already_clear.
     if (!observed.detection.present) {
       const lateDeadline = started + 5_000;
       while (Date.now() < lateDeadline) {
         await page.waitForTimeout(400);
-        observed = await this.observeChallenge(page);
+        observed = await observe();
         if (observed.detection.present) break;
       }
     }
@@ -1736,6 +1761,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       return finish({
         ok: true,
         method: "already_clear",
+        clearanceVerified: false,
         attempts: 0,
         clicks,
         widgetState: observed.widgetState,
@@ -1749,11 +1775,12 @@ export class ChromiumFishBrowser implements BrowserApi {
     // Wait for the widget frame to finish mounting.
     while (!widget && Date.now() - started < Math.min(15_000, timeoutMs)) {
       await page.waitForTimeout(350);
-      observed = await this.observeChallenge(page);
+      observed = await observe();
       if (!observed.detection.present) {
         return finish({
           ok: true,
           method: "already_clear",
+          clearanceVerified: false,
           attempts: 0,
           clicks,
           widgetState: observed.widgetState,
@@ -1767,6 +1794,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       return finish({
         ok: false,
         method: "not_found",
+        clearanceVerified: false,
         attempts: 0,
         clicks,
         reason: "not_found",
@@ -1795,8 +1823,16 @@ export class ChromiumFishBrowser implements BrowserApi {
 
     let attempts = 0;
 
-    const clearedResult = (): Promise<ChallengeSolveResult> =>
-      finish({ ok: true, method: "click", attempts, clicks, widget });
+    // A challenge can finish its own automatic check while this runs, in which case nothing
+    // was clicked and calling that "click" would claim an interaction that never happened.
+    const clearedResult = (): Promise<ChallengeSolveResult> => finish({
+      ok: true,
+      method: attempts > 0 ? "click" : "self_cleared",
+      clearanceVerified: true,
+      attempts,
+      clicks,
+      widget,
+    });
 
     const bumpStuckVerifying = (
       errorMessage: string,
@@ -1806,6 +1842,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       return finish({
         ok: false,
         method: "timeout",
+        clearanceVerified: false,
         attempts,
         clicks,
         widget,
@@ -1816,7 +1853,7 @@ export class ChromiumFishBrowser implements BrowserApi {
 
     while (Date.now() - started < timeoutMs && attempts < maxClicks) {
       // If already verifying, do NOT click; only wait.
-      observed = await this.observeChallenge(page);
+      observed = await observe();
       if (isVerifyingPhase({
         widgetState: observed.widgetState,
         bodyText: observed.bodyText,
@@ -1866,12 +1903,13 @@ export class ChromiumFishBrowser implements BrowserApi {
       }
     }
 
-    observed = await this.observeChallenge(page);
+    observed = await observe();
     const cleared = looksCleared(clearanceInput(observed, kind));
     if (cleared) {
       return finish({
         ok: true,
-        method: "click",
+        method: attempts > 0 ? "click" : "self_cleared",
+        clearanceVerified: true,
         attempts,
         clicks,
         widget,
@@ -1887,6 +1925,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return finish({
       ok: false,
       method: "timeout",
+      clearanceVerified: false,
       attempts,
       clicks,
       widget,

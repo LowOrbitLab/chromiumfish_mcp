@@ -33,8 +33,23 @@ export interface ChallengeSolveOptions {
 }
 
 export interface ChallengeSolveResult {
+  /**
+   * The page is not blocked and work can continue. It does **not** mean a challenge was
+   * defeated: the three flags below say what actually happened, and on a page that never
+   * had a challenge all of them are false while this stays true.
+   */
   ok: boolean;
-  method: "already_clear" | "click" | "not_found" | "timeout" | "busy";
+  method: "already_clear" | "self_cleared" | "click" | "not_found" | "timeout" | "busy";
+  /** A challenge was actually detected on the page. */
+  challengeObserved: boolean;
+  /** At least one click was performed. Derived from clicks, never asserted by hand. */
+  interactionPerformed: boolean;
+  /**
+   * Clearance was positively confirmed — a response token, a widget success state, or
+   * leaving the interstitial. Finding no challenge is not confirmation, so a page that was
+   * never challenged reports false.
+   */
+  clearanceVerified: boolean;
   attempts: number;
   elapsedMs: number;
   title: string;
