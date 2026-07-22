@@ -70,6 +70,9 @@ Action results
   true or the part of the DOM you need has changed.
 - navigate, navigate_back, navigate_forward, and reload always report navigated: true.
   They invalidate refs even when the URL is unchanged, so always re-snapshot after one.
+- navigationPending: true means the action started a navigation that had not landed yet, so
+  url and title still describe the page being left. The action itself worked - wait_for the
+  destination rather than repeating it, which on a login or a purchase would submit twice.
 - Pass returnSnapshot: true to get the action result and a fresh snapshot in one call.
 - newPages lists tabs the action opened. The current page never switches automatically;
   use select_page to move to one.
