@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
+import { basename, isAbsolute, relative } from "node:path";
 import { buildArgs, ChromiumFish } from "chromiumfish";
 import type {
   Browser,
@@ -79,6 +81,16 @@ export interface SelectOptionResult extends ActionResult {
 
 export interface SetCheckedResult extends ActionResult {
   checked: boolean;
+}
+
+export interface UploadedFile {
+  name: string;
+  bytes: number;
+}
+
+export interface UploadFileResult extends ActionResult {
+  /** Base names only: the host's directory layout never travels back to the caller. */
+  files: UploadedFile[];
 }
 
 export interface PageListResult {
@@ -169,6 +181,12 @@ export interface BrowserApi {
     frameId?: string,
     options?: ActionOptions,
   ): Promise<SetCheckedResult>;
+  uploadFile(
+    target: string,
+    paths: string[],
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<UploadFileResult>;
   clickAt(x: number, y: number, options?: ActionOptions): Promise<ClickAtResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
   findChallenge(): Promise<ChallengeDetection>;
@@ -269,6 +287,44 @@ export function assertNavigationUrl(rawUrl: string, allowedHosts: string[]): URL
     if (!allowed) throw new Error(`Target host ${host} is not permitted by --allowed-host`);
   }
   return url;
+}
+
+/**
+ * Resolve an upload path and prove it sits inside a configured --upload-dir root.
+ *
+ * Uploading reads a host file and hands it to a remote origin, chosen from page content the
+ * model is reading, so this is the boundary that keeps a prompt-injected page from asking
+ * for ~/.ssh/id_rsa. Both the candidate and each root are realpath'd before comparison:
+ * resolving only one side lets a symlink inside a root point anywhere on the disk, and
+ * leaves roots that are themselves symlinks (macOS /tmp) failing to match their own files.
+ */
+export async function assertUploadPath(rawPath: string, uploadDirs: string[]): Promise<string> {
+  if (uploadDirs.length === 0) {
+    throw new Error("Uploads are disabled; start the server with --upload-dir to enable them");
+  }
+
+  let file: string;
+  try {
+    file = await realpath(rawPath);
+  } catch {
+    throw new Error(`Upload path does not exist: ${rawPath}`);
+  }
+  const info = await stat(file);
+  if (!info.isFile()) {
+    throw new Error(`Upload path is not a regular file: ${rawPath}`);
+  }
+
+  for (const dir of uploadDirs) {
+    // A root that has been renamed or removed cannot match; it must not abort the others.
+    const root = await realpath(dir).catch(() => undefined);
+    if (root === undefined) continue;
+    const rel = relative(root, file);
+    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) return file;
+  }
+  throw new Error(
+    `Upload path ${rawPath} is outside every --upload-dir root (${uploadDirs.join(", ")}); `
+    + "symlinks are resolved before this check, so a link out of a root is rejected too.",
+  );
 }
 
 export class ChromiumFishBrowser implements BrowserApi {
@@ -842,7 +898,27 @@ export class ChromiumFishBrowser implements BrowserApi {
     );
   }
 
-  private async resolveTarget(page: Page, target: string, frameId?: string): Promise<InteractiveHandle> {
+  /**
+   * Clicking a file input cannot open anything: Playwright only intercepts the chooser
+   * while a filechooser listener is registered, and this server registers none. Headless
+   * therefore swallows the click and actionResult reports an ordinary ok/navigated:false,
+   * which reads as success and leaves the caller waiting on an upload that never starts.
+   * Failing here converts that silent no-op into a message naming the tool that works.
+   */
+  private fileInputClickError(target: string): Error {
+    const enabled = this.config.uploadDirs.length > 0
+      ? "Use upload_file instead; clicking cannot attach a file."
+      : "Attaching files needs the upload_file tool, which this server did not register "
+        + "because it was started without --upload-dir.";
+    return new Error(`Target ${target} is a file input. ${enabled}`);
+  }
+
+  private async resolveTarget(
+    page: Page,
+    target: string,
+    frameId?: string,
+    options: { rejectFileInput?: boolean } = {},
+  ): Promise<InteractiveHandle> {
     const ref = this.refs.get(page)?.get(target);
     if (ref && frameId) {
       const requestedFrame = this.resolveFrame(page, frameId);
@@ -855,8 +931,14 @@ export class ChromiumFishBrowser implements BrowserApi {
     const handle = ref ?? await this.resolveFrame(page, frameId).locator(target).first()
       .elementHandle({ timeout: LOCATOR_TIMEOUT_MS });
     if (!handle) throw new Error(`Target ${target} not found; call snapshot again after the page changes`);
-    const connected = await handle.evaluate((element) => element.isConnected).catch(() => false);
-    if (!connected) throw new Error(`Target ${target} is stale; call snapshot again`);
+    // One round trip carries both facts; the staleness check already cost an evaluate, so
+    // the file-input guard rides along instead of adding latency to every click.
+    const info = await handle.evaluate((element) => ({
+      connected: element.isConnected,
+      fileInput: element instanceof HTMLInputElement && element.type.toLowerCase() === "file",
+    })).catch(() => null);
+    if (!info?.connected) throw new Error(`Target ${target} is stale; call snapshot again`);
+    if (info.fileInput && options.rejectFileInput) throw this.fileInputClickError(target);
     return handle as InteractiveHandle;
   }
 
@@ -898,7 +980,7 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   async click(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
-    const handle = await this.resolveTarget(page, target, frameId);
+    const handle = await this.resolveTarget(page, target, frameId, { rejectFileInput: true });
     const baseline = this.actionBaseline(page);
     await this.clickHandle(page, handle);
     return this.actionResult(page, baseline, options);
@@ -952,6 +1034,47 @@ export class ChromiumFishBrowser implements BrowserApi {
       throw new Error(`Target ${target} did not reach the requested checked state`);
     }
     return { ...await this.actionResult(page, baseline, options), checked: actual };
+  }
+
+  async uploadFile(
+    target: string,
+    paths: string[],
+    frameId?: string,
+    options?: ActionOptions,
+  ): Promise<UploadFileResult> {
+    const page = await this.page();
+    const handle = await this.resolveTarget(page, target, frameId);
+    const info = await handle.evaluate((element) => {
+      const input = element instanceof HTMLInputElement ? element : undefined;
+      return {
+        isFile: input?.type.toLowerCase() === "file",
+        multiple: Boolean(input?.multiple),
+      };
+    });
+    if (!info.isFile) {
+      throw new Error(
+        `Target ${target} is not a file input. Target the input[type=file] itself — a hidden `
+        + "one is still reachable by CSS selector, since attaching does not require visibility.",
+      );
+    }
+    if (paths.length > 1 && !info.multiple) {
+      throw new Error(`Target ${target} accepts a single file; it is not marked multiple`);
+    }
+
+    // Every path clears the allowlist before the page sees any of them, so a list with one
+    // bad entry attaches nothing rather than half of what was asked for.
+    const files: { path: string; bytes: number }[] = [];
+    for (const path of paths) {
+      const resolved = await assertUploadPath(path, this.config.uploadDirs);
+      files.push({ path: resolved, bytes: (await stat(resolved)).size });
+    }
+
+    const baseline = this.actionBaseline(page);
+    await handle.setInputFiles(files.map((file) => file.path), { timeout: LOCATOR_TIMEOUT_MS });
+    return {
+      ...await this.actionResult(page, baseline, options),
+      files: files.map((file) => ({ name: basename(file.path), bytes: file.bytes })),
+    };
   }
 
   async clickAt(x: number, y: number, options?: ActionOptions): Promise<ClickAtResult> {
