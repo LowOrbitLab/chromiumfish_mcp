@@ -10,6 +10,7 @@ import type {
   ElementHandle,
   Frame,
   Page,
+  Request as PlaywrightRequest,
 } from "playwright-core";
 import { chromium } from "playwright-core";
 import { snapshotRole } from "./aria.js";
@@ -73,6 +74,12 @@ export interface ActionResult {
   navigated: boolean;
   /** pageIds the action opened. The current page is never switched automatically. */
   newPages?: string[];
+  /**
+   * The action started a top-level navigation that had not committed when this result was
+   * built, so url and title still describe the outgoing page. The action itself succeeded;
+   * wait_for the destination rather than treating it as a no-op or retrying the action.
+   */
+  navigationPending?: boolean;
   snapshot?: string;
 }
 
@@ -281,11 +288,36 @@ const SNAPSHOT_TRUNCATION_MARKER = "narrow scope or adjust maxElements/maxChars"
 const ACTION_SETTLE_MS = 150;
 /** Upper bound on waiting for a navigation the action did start to become readable. */
 const ACTION_LOAD_TIMEOUT_MS = 2_000;
+/**
+ * How long an action waits for a navigation it started to commit. Long enough for a slow
+ * login POST or a redirect chain; past it the result says navigationPending instead of
+ * describing the document that is on its way out.
+ */
+const ACTION_NAV_COMMIT_TIMEOUT_MS = 10_000;
 
 /** Page state captured before an action so the result can report what changed. */
 interface ActionBaseline {
   url: string;
   pages: Page[];
+  /** Resolves once the main frame commits a new document. */
+  committed: Promise<void>;
+  /** A top-level navigation has been requested but has not committed yet. */
+  pending: () => boolean;
+  /** Detaches the listeners; every actionResult must call it. */
+  release: () => void;
+}
+
+/**
+ * Playwright's wording for "the document this call was evaluating in went away". A
+ * navigation committing mid-query is a race, not a failure: the action that started it
+ * succeeded, and asking again on the new document is the answer the caller wanted.
+ * Deliberately excludes a closed page or browser, which no retry can help.
+ */
+function isNavigationRace(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Execution context was destroyed")
+    || message.includes("Cannot find context with specified id")
+    || message.includes("Execution context is not available in detached frame");
 }
 
 function clip(value: string, max: number): string {
@@ -616,12 +648,79 @@ export class ChromiumFishBrowser implements BrowserApi {
     return result;
   }
 
-  /** State captured before an action so actionResult can report what the action changed. */
+  /**
+   * Snapshot the page state an action starts from, and arm the navigation listeners.
+   *
+   * They are armed here, before the action runs, because Playwright offers no way to ask
+   * afterwards whether a navigation is in flight: the request can be issued and the document
+   * torn down before the first read, and by then the only evidence has already gone past.
+   */
   private actionBaseline(page: Page): ActionBaseline {
+    let commit!: () => void;
+    const committed = new Promise<void>((resolve) => {
+      commit = resolve;
+    });
+    let started = false;
+    let done = false;
+    const onRequest = (request: PlaywrightRequest) => {
+      if (started || !request.isNavigationRequest()) return;
+      // frame() throws once a frame is detached, which only means this is not the main one.
+      try {
+        if (request.frame() !== page.mainFrame()) return;
+      } catch {
+        return;
+      }
+      started = true;
+    };
+    const onNavigated = (frame: Frame) => {
+      if (frame !== page.mainFrame()) return;
+      done = true;
+      commit();
+    };
+    page.on("request", onRequest);
+    page.on("framenavigated", onNavigated);
+
+    let attached = true;
+    const detach = () => {
+      if (!attached) return;
+      attached = false;
+      page.off("request", onRequest);
+      page.off("framenavigated", onNavigated);
+    };
+    // These listeners cannot change any outcome once the commit window has closed, so that
+    // window is their lifetime. Enforcing it here rather than relying on release() alone is
+    // what keeps an action that throws on its way to actionResult — a setInputFiles timeout,
+    // a failed selectOption — from leaving a pair attached for the rest of the session.
+    const expiry = setTimeout(detach, ACTION_NAV_COMMIT_TIMEOUT_MS + ACTION_LOAD_TIMEOUT_MS);
+    expiry.unref?.();
+
     return {
       url: page.url(),
       pages: this.openPages(),
+      committed,
+      pending: () => started && !done,
+      release: () => {
+        clearTimeout(expiry);
+        detach();
+      },
     };
+  }
+
+  /**
+   * Run a read that evaluates in the page, retrying once if a navigation destroyed the
+   * context underneath it. Without this a snapshot or get_text issued in the window after a
+   * click that navigates fails outright, which reads as "the action broke" when the action
+   * in fact worked and the page simply moved on.
+   */
+  private async readThroughNavigation<T>(page: Page, read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (error) {
+      if (!isNavigationRace(error)) throw error;
+      await page.waitForLoadState("domcontentloaded", { timeout: ACTION_LOAD_TIMEOUT_MS })
+        .catch(() => undefined);
+      return read();
+    }
   }
 
   private openPages(): Page[] {
@@ -639,33 +738,63 @@ export class ChromiumFishBrowser implements BrowserApi {
     baseline: ActionBaseline,
     options: ActionOptions = {},
   ): Promise<ActionResult> {
-    // A click or Enter commits its navigation after the input event resolves, so settle
-    // briefly, then let a navigation that did start become readable. Navigations starting
-    // later than this window are reported by the next call instead; the bound is a
-    // latency/accuracy trade, not a guarantee. Same-URL navigations are not detected.
-    // Both settle steps are best-effort: an action that closed the page must still report
-    // its result rather than failing after the side effect already happened.
-    await page.waitForTimeout(ACTION_SETTLE_MS).catch(() => undefined);
-    await page.waitForLoadState("domcontentloaded", { timeout: ACTION_LOAD_TIMEOUT_MS })
-      .catch(() => undefined);
+    try {
+      // A click or Enter commits its navigation after the input event resolves, so settle
+      // briefly first. Every step is best-effort: an action that closed the page must still
+      // report its result rather than failing after the side effect already happened.
+      await page.waitForTimeout(ACTION_SETTLE_MS).catch(() => undefined);
 
-    const url = page.url();
-    const navigated = url !== baseline.url;
-    // The previous document is gone; its handles would only fail the staleness check later.
-    if (navigated) await this.clearRefs(page);
+      // waitForLoadState answers for the *current* document. While a navigation is in
+      // flight that is still the old one, already loaded, so it returns within a millisecond
+      // and every read below would describe the page that is about to be replaced: the old
+      // url, Chromium's "Loading <url>" placeholder title, navigated: false for a click that
+      // did navigate, and a snapshot racing the teardown. Wait for the commit itself, and
+      // only when a top-level navigation request was actually seen, so a click that changes
+      // nothing still returns in the settle window.
+      if (baseline.pending()) {
+        await Promise.race([
+          baseline.committed,
+          page.waitForTimeout(ACTION_NAV_COMMIT_TIMEOUT_MS).catch(() => undefined),
+        ]).catch(() => undefined);
+      }
+      await page.waitForLoadState("domcontentloaded", { timeout: ACTION_LOAD_TIMEOUT_MS })
+        .catch(() => undefined);
 
-    const opened = this.openPages().filter((candidate) => !baseline.pages.includes(candidate));
-    for (const candidate of opened) this.trackPage(candidate);
+      // Still in flight after the bound above: a slow endpoint or a redirect chain. Report
+      // that rather than let the stale reads below read as "the action did nothing".
+      const navigationPending = baseline.pending();
+      const url = page.url();
+      const navigated = url !== baseline.url;
+      // The previous document is gone; its handles would only fail the staleness check later.
+      if (navigated) await this.clearRefs(page);
 
-    const result: ActionResult = {
-      ok: true,
-      url,
-      title: await page.title().catch(() => ""),
-      navigated,
-    };
-    if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
-    if (options.returnSnapshot) result.snapshot = await this.snapshot();
-    return result;
+      const opened = this.openPages().filter((candidate) => !baseline.pages.includes(candidate));
+      for (const candidate of opened) this.trackPage(candidate);
+
+      const result: ActionResult = {
+        ok: true,
+        url,
+        title: await this.settledTitle(page, navigationPending),
+        navigated,
+      };
+      if (navigationPending) result.navigationPending = true;
+      if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
+      if (options.returnSnapshot) result.snapshot = await this.snapshot();
+      return result;
+    } finally {
+      baseline.release();
+    }
+  }
+
+  /**
+   * Chromium reports "Loading <url>" as the title of a document that has not arrived yet.
+   * That is a placeholder, not the page's title, and returning it invites a caller to match
+   * on it or record it as the destination's name.
+   */
+  private async settledTitle(page: Page, navigationPending: boolean): Promise<string> {
+    const title = await page.title().catch(() => "");
+    if (navigationPending && /^Loading https?:\/\//.test(title)) return "";
+    return title;
   }
 
   async navigate(rawUrl: string, options?: ActionOptions): Promise<ActionResult> {
@@ -726,7 +855,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     const locator = options.scope
       ? frame.locator(options.scope).locator(INTERACTIVE_SELECTOR)
       : frame.locator(INTERACTIVE_SELECTOR);
-    const handles = await locator.elementHandles() as InteractiveHandle[];
+    const handles = await this.readThroughNavigation(
+      page,
+      async () => await locator.elementHandles() as InteractiveHandle[],
+    );
     const maxElements = clampInteger(
       options.maxElements,
       DEFAULT_SNAPSHOT_ELEMENTS,
@@ -895,9 +1027,12 @@ export class ChromiumFishBrowser implements BrowserApi {
     const locator = frame.locator(options.selector ?? "body").first();
     // Bound the auto-wait so a non-matching selector fails fast instead of hanging
     // for Playwright's default timeout.
+    const read = () => locator.innerText({ timeout: LOCATOR_TIMEOUT_MS });
     const text = options.selector
-      ? await locator.innerText({ timeout: LOCATOR_TIMEOUT_MS })
-      : await locator.innerText({ timeout: LOCATOR_TIMEOUT_MS }).catch(() => "");
+      ? await this.readThroughNavigation(page, read)
+      // No body text is a valid answer for the default scope, but the retry has to run
+      // first: catching here directly would turn a navigation race into a silent "".
+      : await this.readThroughNavigation(page, read).catch(() => "");
     const maxChars = clampInteger(options.maxChars, DEFAULT_SNAPSHOT_CHARS, 100, this.config.maxTextChars);
     return clip(text, maxChars);
   }
@@ -995,8 +1130,11 @@ export class ChromiumFishBrowser implements BrowserApi {
       ? `the current snapshot of this page covers ${keys[0]}-${keys.at(-1)}`
       : "this page has no current snapshot";
     return new Error(
-      `Unknown element reference ${target}; ${scope}. Reference numbers are never reused, `
-      + "so this one is stale — call snapshot again and use a reference from its output.",
+      `Unknown element reference ${target}; ${scope}. Reference numbers are never reused, and `
+      + "every snapshot numbers its output afresh, so this one belongs to an earlier snapshot. "
+      + "A selector built from the role and label snapshot printed — role=button[name=\"Save\"] "
+      + "— stays valid across snapshots and re-renders; otherwise call snapshot again and use a "
+      + "reference from its output.",
     );
   }
 
@@ -1057,7 +1195,14 @@ export class ChromiumFishBrowser implements BrowserApi {
         multiple: Boolean(input?.multiple),
       };
     }).catch(() => null);
-    if (!info?.connected) throw new Error(`Target ${target} is stale; call snapshot again`);
+    if (!info?.connected) {
+      throw new Error(
+        `Target ${target} is stale: the element it pointed at was replaced, which a re-render `
+        + "does on every keystroke in some forms. A selector built from the role and label "
+        + "snapshot already printed survives that — role=textbox[name=\"Email\"] — and costs "
+        + "no extra call. Otherwise call snapshot again for fresh references.",
+      );
+    }
     if (info.fileInput && options.rejectFileInput) throw this.fileInputClickError(target);
     return { handle: handle as InteractiveHandle, info };
   }

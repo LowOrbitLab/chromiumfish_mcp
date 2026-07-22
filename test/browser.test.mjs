@@ -15,6 +15,12 @@ const config = {
   uploadDirs: [],
 };
 
+/**
+ * actionBaseline arms framenavigated/request listeners before every action. Fakes whose
+ * pages never navigate accept and drop them.
+ */
+const NO_NAV = { on: () => undefined, off: () => undefined };
+
 /** What resolveTarget's staleness evaluate returns for a live, non-file element. */
 const LIVE = { connected: true, fileInput: false, multiple: false };
 
@@ -142,6 +148,7 @@ test("listFrames returns stable frame IDs and blocks challenge DOM access", asyn
   const page = {
     frames: () => [main, child, challenge],
     mainFrame: () => main,
+    ...NO_NAV,
   };
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
@@ -176,6 +183,7 @@ test("getText surfaces explicit selector errors", async () => {
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
   };
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
@@ -191,6 +199,7 @@ test("getText enforces the returned character budget", async () => {
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
   };
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
@@ -282,6 +291,7 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
   const page = {
     frames: () => [main, child],
     mainFrame: () => main,
+    ...NO_NAV,
     url: () => "https://example.com/",
     title: async () => "Example",
     mouse: {
@@ -351,6 +361,7 @@ test("actions report navigation, opened pages, and an opt-in snapshot", async ()
     once: () => undefined,
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
     url: () => currentUrl,
     title: async () => "Done",
     waitForTimeout: async () => undefined,
@@ -440,6 +451,7 @@ test("snapshot scans past hidden elements, reports truncation, and releases unus
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
   };
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
@@ -483,6 +495,7 @@ test("element targeting bounds Playwright's otherwise unlimited auto-wait", asyn
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
     url: () => "https://example.com/",
     title: async () => "Example",
     waitForTimeout: async () => undefined,
@@ -543,6 +556,7 @@ test("reference numbers are never reused, so a stale reference fails loudly", as
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
     url: () => "https://example.com/",
     title: async () => "Example",
     waitForTimeout: async () => undefined,
@@ -584,6 +598,7 @@ test("setChecked rejects unchecking a radio", async () => {
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
   };
   const browser = new ChromiumFishBrowser(config);
   browser.page = async () => page;
@@ -699,6 +714,7 @@ test("waitFor supports element, text, URL, load-state, and time conditions", asy
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
     url: () => "https://example.com/",
     title: async () => "Example",
     waitForURL: async (url, options) => calls.push(["url", url, options]),
@@ -825,6 +841,7 @@ test("uploadFile validates every path before attaching any of them", async () =>
   const page = {
     frames: () => [main],
     mainFrame: () => main,
+    ...NO_NAV,
     url: () => "https://example.com/",
     title: async () => "Example",
     isClosed: () => false,
@@ -914,6 +931,7 @@ function draggablePage(handles, { viewport = { width: 1280, height: 720 } } = {}
     page: {
       frames: () => [main],
       mainFrame: () => main,
+    ...NO_NAV,
       url: () => "https://example.com/",
       title: async () => "Example",
       isClosed: () => false,
@@ -1020,6 +1038,7 @@ function screenshotPage(handles, { scale = 1 } = {}) {
     page: {
       frames: () => [main],
       mainFrame: () => main,
+    ...NO_NAV,
       viewportSize: () => ({ width: 1280, height: 720 }),
       screenshot: async () => assert.fail("must not fall back to a page capture"),
       evaluate: async (callback, arg) => {
@@ -1104,4 +1123,241 @@ test("element screenshot rejects an invisible element and honors the pixel budge
   await assert.rejects(browser.takeScreenshot({ target: "#hidden" }), /no visible box/);
   await assert.rejects(browser.takeScreenshot({ target: "#huge" }), /18000x18000/);
   assert.deepEqual(fake.scroll, { x: 0, y: 0 });
+});
+
+/**
+ * Page fake that models a navigation the way Chromium sequences one: the request goes out
+ * immediately, the old document stays current and already loaded, and the commit lands
+ * later. waitForLoadState therefore answers about the outgoing document, which is exactly
+ * what made actionResult describe the wrong page.
+ */
+function navigatingPage({ commitAfterMs = 40, from = "https://example.com/login", to = "https://example.com/clientarea" } = {}) {
+  const listeners = { request: [], framenavigated: [] };
+  const main = {
+    url: () => state.url,
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const handle = {
+    evaluate: async () => LIVE,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => ({ x: 10, y: 10, width: 40, height: 20 }),
+  };
+  const state = { url: from, committed: false, titleReads: [] };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    isClosed: () => false,
+    url: () => state.url,
+    // Chromium's placeholder while the destination has not arrived.
+    title: async () => (state.committed ? "Client Area" : `Loading ${to}`),
+    viewportSize: () => ({ width: 1280, height: 720 }),
+    mouse: { move: async () => undefined, down: async () => undefined, up: async () => undefined },
+    on: (event, fn) => listeners[event]?.push(fn),
+    off: (event, fn) => {
+      const list = listeners[event] ?? [];
+      const at = list.indexOf(fn);
+      if (at >= 0) list.splice(at, 1);
+    },
+    waitForTimeout: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    // Resolves at once: the current document is the old one, and it finished loading long ago.
+    waitForLoadState: async () => undefined,
+  };
+  return {
+    page,
+    listeners,
+    state,
+    /** Drive the navigation the way the browser would once the click lands. */
+    start() {
+      for (const fn of listeners.request) {
+        fn({ isNavigationRequest: () => true, frame: () => main });
+      }
+      if (commitAfterMs !== null) {
+        setTimeout(() => {
+          state.url = to;
+          state.committed = true;
+          for (const fn of [...listeners.framenavigated]) fn(main);
+        }, commitAfterMs);
+      }
+    },
+  };
+}
+
+test("an action waits for the navigation it started instead of describing the outgoing page", async () => {
+  const fake = navigatingPage({ commitAfterMs: 400 });
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+  // The click issues the navigation request; the commit lands well after the settle window.
+  fake.page.mouse.down = async () => {
+    fake.start();
+  };
+
+  const result = await browser.click("#login");
+
+  assert.equal(result.url, "https://example.com/clientarea");
+  assert.equal(result.navigated, true);
+  assert.equal(result.title, "Client Area");
+  assert.equal(result.navigationPending, undefined);
+  // Both listeners come off, or every action leaks one onto the page.
+  assert.equal(fake.listeners.request.length, 0);
+  assert.equal(fake.listeners.framenavigated.length, 0);
+});
+
+test("a navigation that outlasts the bound is reported, not silently read as a no-op", async () => {
+  const fake = navigatingPage({ commitAfterMs: null });
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+  fake.page.mouse.down = async () => {
+    fake.start();
+  };
+  // Keep the test quick: the real bound is ACTION_NAV_COMMIT_TIMEOUT_MS.
+  fake.page.waitForTimeout = async (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 60)));
+
+  const result = await browser.click("#login");
+
+  assert.equal(result.ok, true);
+  assert.equal(result.navigationPending, true);
+  assert.equal(result.navigated, false);
+  assert.equal(result.url, "https://example.com/login");
+  // Chromium's "Loading <url>" placeholder is not a title and must not be passed off as one.
+  assert.equal(result.title, "");
+  assert.equal(fake.listeners.request.length, 0);
+});
+
+test("an action that navigates nothing does not pay the navigation wait", async () => {
+  const fake = navigatingPage();
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+  const waits = [];
+  fake.page.waitForTimeout = async (ms) => {
+    waits.push(ms);
+  };
+
+  const result = await browser.click("#noop");
+
+  assert.equal(result.navigated, false);
+  assert.equal(result.navigationPending, undefined);
+  // The settle window and the click's own dwell, and nothing else: with no navigation
+  // request seen there is nothing to wait for, so the commit bound is never armed. Asserting
+  // on that bound rather than a total keeps the click's randomized dwell out of the fixture.
+  assert.ok(waits.includes(150), `expected the settle window, got ${waits.join()}`);
+  assert.ok(
+    waits.every((ms) => ms < 1_000),
+    `no wait should approach the commit bound, got ${waits.join()}`,
+  );
+});
+
+test("snapshot and get_text retry a read the committing navigation destroyed", async () => {
+  let attempts = 0;
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({
+      elementHandles: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("locator.elementHandles: Execution context was destroyed, most likely because of a navigation");
+        }
+        return [];
+      },
+      first: () => ({
+        innerText: async () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error("Execution context was destroyed, most likely because of a navigation");
+          return "Account: Rebecka";
+        },
+      }),
+    }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    ...NO_NAV,
+    waitForLoadState: async () => undefined,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  assert.equal(await browser.snapshot(), "(No visible interactive elements)");
+  assert.equal(attempts, 2);
+
+  attempts = 0;
+  assert.equal(await browser.getText({ selector: "body" }), "Account: Rebecka");
+  assert.equal(attempts, 2);
+});
+
+test("a read failure that is not a navigation race still surfaces", async () => {
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({
+      elementHandles: async () => {
+        throw new Error("Unknown engine \"nope\" while parsing selector");
+      },
+      first: () => ({
+        innerText: async () => {
+          throw new Error("Invalid selector");
+        },
+      }),
+    }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    ...NO_NAV,
+    waitForLoadState: async () => assert.fail("must not settle for a non-navigation error"),
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await assert.rejects(browser.snapshot(), /Unknown engine/);
+  await assert.rejects(browser.getText({ selector: "[broken" }), /Invalid selector/);
+});
+
+test("navigation listeners come off the page whether the action succeeds or throws", async (t) => {
+  const counts = { request: 0, framenavigated: 0 };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const handle = { evaluate: async () => LIVE };
+  let pressFails = false;
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    isClosed: () => false,
+    url: () => "https://example.com/",
+    title: async () => "Example",
+    on: (event) => { counts[event] += 1; },
+    off: (event) => { counts[event] -= 1; },
+    keyboard: {
+      press: async () => {
+        if (pressFails) throw new Error("Keyboard press failed");
+      },
+    },
+    waitForTimeout: async () => undefined,
+    waitForLoadState: async () => undefined,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  await browser.pressKey("Enter");
+  assert.deepEqual(counts, { request: 0, framenavigated: 0 }, "released as soon as the result is built");
+
+  // An action that throws never reaches actionResult, so release() never runs for it. The
+  // listeners still have to go: without a bound, a session of failing actions accumulates a
+  // pair per attempt on the page and eventually trips Node's max-listeners warning.
+  pressFails = true;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (let index = 0; index < 5; index += 1) {
+    await assert.rejects(browser.pressKey("Enter"), /Keyboard press failed/);
+  }
+  assert.equal(counts.request, 5, "still attached while the commit window is open");
+  t.mock.timers.tick(20_000);
+  assert.deepEqual(counts, { request: 0, framenavigated: 0 }, "detached once the window closes");
 });
