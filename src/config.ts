@@ -1,6 +1,7 @@
+import { resolve } from "node:path";
 import type { LaunchOptions } from "playwright-core";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 
 export interface ServerConfig {
   personaSeed?: string;
@@ -14,6 +15,8 @@ export interface ServerConfig {
   allowNativeAgent: boolean;
   maxTextChars: number;
   allowedHosts: string[];
+  /** Absolute directories upload_file may read from; empty leaves the tool unregistered. */
+  uploadDirs: string[];
 }
 
 export interface ParsedCli {
@@ -68,6 +71,7 @@ export function parseCli(argv: string[]): ParsedCli {
     allowNativeAgent: false,
     maxTextChars: 50_000,
     allowedHosts: [],
+    uploadDirs: [],
   };
   if (process.env.CHROME_BIN) config.chromePath = process.env.CHROME_BIN;
   let help = false;
@@ -131,6 +135,12 @@ export function parseCli(argv: string[]): ParsedCli {
         config.allowedHosts.push(readValue(argv, index, arg).toLowerCase());
         index += 1;
         break;
+      case "--upload-dir":
+        // Absolute here so the root does not move with the process working directory;
+        // symlinks stay unresolved until upload time, where the file is realpath'd too.
+        config.uploadDirs.push(resolve(readValue(argv, index, arg)));
+        index += 1;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
@@ -161,6 +171,7 @@ Options:
   --proxy URL                Route browser traffic through a proxy
   --allowed-host HOST        Allow navigation to a host; repeatable
   --max-text-chars N         Set the text and snapshot hard limit (default: 50000)
+  --upload-dir PATH          Allow upload_file to read this directory; repeatable
   --allow-eval               Enable the arbitrary JavaScript execution tool
   --allow-native-agent       Enable the native browser agent tool
   --help                     Show help

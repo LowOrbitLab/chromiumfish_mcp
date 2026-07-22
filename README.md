@@ -43,8 +43,10 @@ To run from GitHub instead of a global install, set `"command": "npx"` and prepe
 | `list_pages`, `open_page`, `select_page`, `close_page` | Manage pages by stable `pageId` |
 | `navigate`, `navigate_back`, `navigate_forward`, `reload` | Navigate and use page history |
 | `snapshot` | List visible interactive elements with `e1`/`e2` references |
-| `get_text`, `take_screenshot` | Retrieve page or frame content |
+| `get_text`, `take_screenshot` | Retrieve page or frame content; `take_screenshot` crops to one element with `target` |
 | `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for` | Interact with the page |
+| `drag` | Drag onto another element or by a pixel offset, with a human-like path |
+| `upload_file` | Attach local files to a file input — requires `--upload-dir` |
 | `click_at` | Click absolute coordinates (for widgets `snapshot` cannot see) |
 | `list_frames` | List frames/iframes with stable IDs |
 | `find_challenge`, `solve_challenge` | Detect and clear interstitial / framed challenges |
@@ -67,6 +69,7 @@ Snapshot references, frame-aware interaction, waiting, and the cross-origin chal
 --proxy URL                Route browser traffic through a proxy
 --allowed-host HOST        Allow top-level navigation to a host and its subdomains; repeatable
 --max-text-chars N         Set the hard limit for text and snapshot output
+--upload-dir PATH          Allow upload_file to read this directory; repeatable
 --allow-eval               Enable arbitrary JavaScript execution
 --allow-native-agent       Enable the native ChromiumFish browser agent
 ```
@@ -78,6 +81,7 @@ Proxy credentials can be embedded in the proxy URL, but are then exposed in the 
 - stdio only — do not expose the Chromium DevTools endpoint to the public internet.
 - `evaluate` and the native agent are disabled by default; enable them only in trusted environments.
 - `--allowed-host example.com` restricts top-level HTTP/HTTPS navigation (redirects, links, form posts, popups) to a host and its subdomains. Third-party subframes and page assets remain reachable — it is a navigation guard, not a network egress filter.
+- `upload_file` sends host files to whatever origin the page posts to, so it is unregistered until `--upload-dir` names at least one directory, and every path must resolve inside one. Both the path and the roots are resolved through symlinks first, so a link planted inside a root cannot reach outside it. Scope the roots to the files a task actually needs — a page can influence which file the model picks.
 - Clients can click and type with real side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
 - Each process runs an independent browser context; this is not a shared multi-tenant service.
 

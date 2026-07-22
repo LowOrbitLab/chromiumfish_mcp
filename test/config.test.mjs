@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isAbsolute, resolve } from "node:path";
 import test from "node:test";
 import { parseCli, parseProxy, parseWindowSize } from "../dist/config.js";
 
@@ -65,6 +66,20 @@ test("treats --timezone system as no override", () => {
 test("rejects out-of-range window sizes", () => {
   assert.throws(() => parseWindowSize("100x100"), /between/);
   assert.throws(() => parseWindowSize("large"), /format/);
+});
+
+test("collects --upload-dir roots as absolute paths", () => {
+  const { config } = parseCli(["--upload-dir", "fixtures", "--upload-dir", "docs"]);
+  assert.equal(config.uploadDirs.length, 2);
+  // Absolute at parse time so a later cwd change cannot move the root.
+  for (const dir of config.uploadDirs) assert.equal(isAbsolute(dir), true);
+  assert.equal(config.uploadDirs[0], resolve("fixtures"));
+  assert.equal(config.uploadDirs[1], resolve("docs"));
+});
+
+test("leaves uploads disabled without --upload-dir", () => {
+  assert.deepEqual(parseCli([]).config.uploadDirs, []);
+  assert.throws(() => parseCli(["--upload-dir"]), /requires a value/);
 });
 
 test("separates proxy credentials from the server URL", () => {

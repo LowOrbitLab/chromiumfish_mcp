@@ -11,6 +11,7 @@ const config = {
   allowNativeAgent: false,
   maxTextChars: 50_000,
   allowedHosts: [],
+  uploadDirs: [],
 };
 
 const SNAPSHOT_TEXT = "[e1] button \"Submit\"";
@@ -62,7 +63,14 @@ function fakeBrowser() {
       calls.push(["getText", options]);
       return "Page body";
     },
-    takeScreenshot: async () => Buffer.from("png"),
+    takeScreenshot: async (options) => {
+      calls.push(["takeScreenshot", options]);
+      return Buffer.from("png");
+    },
+    drag: async (target, destination, frameId, options) => {
+      calls.push(["drag", target, destination, frameId, options]);
+      return acted(options, { from: { x: 10, y: 20 }, to: { x: 210, y: 20 } });
+    },
     click: async (target, frameId, options) => {
       calls.push(["click", target, frameId, options]);
       return acted(options, { navigated: true, newPages: ["page-2"] });
@@ -78,6 +86,12 @@ function fakeBrowser() {
     setChecked: async (target, checked, frameId, options) => {
       calls.push(["setChecked", target, checked, frameId, options]);
       return acted(options, { checked });
+    },
+    uploadFile: async (target, paths, frameId, options) => {
+      calls.push(["uploadFile", target, paths, frameId, options]);
+      return acted(options, {
+        files: paths.map((path) => ({ name: path.split("/").at(-1), bytes: 3 })),
+      });
     },
     clickAt: async (x, y, options) => acted(options, { x, y }),
     listFrames: async (options) => {
@@ -163,6 +177,7 @@ test("default tool set has a stable annotated contract", async (context) => {
     "click",
     "hover",
     "click_at",
+    "drag",
     "list_frames",
     "find_challenge",
     "solve_challenge",
@@ -344,6 +359,38 @@ test("registers dangerous tools when explicitly enabled", async (context) => {
   assert.ok(names.includes("run_task"));
 });
 
+test("upload_file is registered and forwards its arguments once --upload-dir is set", async (context) => {
+  const { browser, client, server } = await connectedClient({ uploadDirs: ["/tmp/uploads"] });
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const names = (await client.listTools()).tools.map((tool) => tool.name);
+  assert.ok(names.includes("upload_file"));
+
+  const result = await client.callTool({
+    name: "upload_file",
+    arguments: {
+      target: "input[type=file]",
+      paths: ["/tmp/uploads/a.png", "/tmp/uploads/b.png"],
+      frameId: "frame-1",
+    },
+  });
+  assert.deepEqual(browser.calls[0], [
+    "uploadFile",
+    "input[type=file]",
+    ["/tmp/uploads/a.png", "/tmp/uploads/b.png"],
+    "frame-1",
+    { returnSnapshot: false },
+  ]);
+  assert.deepEqual(result.structuredContent.files, [
+    { name: "a.png", bytes: 3 },
+    { name: "b.png", bytes: 3 },
+  ]);
+  assert.equal(result.structuredContent.target, "input[type=file]");
+});
+
 test("initialize carries workflow instructions", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
@@ -447,4 +494,63 @@ test("tool calls return browser results", async (context) => {
   });
   assert.match(result.content[0].text, /Example/);
   assert.equal(result.structuredContent.url, "https://example.com/");
+});
+
+test("drag forwards exactly one destination form", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const offset = await client.callTool({
+    name: "drag",
+    arguments: { target: "e1", dx: 200, dy: 0 },
+  });
+  assert.deepEqual(browser.calls[0], [
+    "drag",
+    "e1",
+    { toTarget: undefined, dx: 200, dy: 0 },
+    undefined,
+    { returnSnapshot: false },
+  ]);
+  assert.deepEqual(offset.structuredContent.from, { x: 10, y: 20 });
+  assert.deepEqual(offset.structuredContent.to, { x: 210, y: 20 });
+
+  await client.callTool({
+    name: "drag",
+    arguments: { target: "#card", toTarget: "#column-2", frameId: "frame-1" },
+  });
+  assert.deepEqual(browser.calls[1], [
+    "drag",
+    "#card",
+    { toTarget: "#column-2", dx: undefined, dy: undefined },
+    "frame-1",
+    { returnSnapshot: false },
+  ]);
+});
+
+test("take_screenshot forwards the element crop", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({
+    name: "take_screenshot",
+    arguments: { target: "e5", frameId: "frame-1" },
+  });
+  assert.deepEqual(browser.calls[0], [
+    "takeScreenshot",
+    { fullPage: false, target: "e5", frameId: "frame-1" },
+  ]);
+  assert.equal(result.content[0].type, "image");
+  assert.equal(result.content[0].mimeType, "image/png");
+
+  await client.callTool({ name: "take_screenshot", arguments: {} });
+  assert.deepEqual(browser.calls[1], [
+    "takeScreenshot",
+    { fullPage: false, target: undefined, frameId: undefined },
+  ]);
 });
