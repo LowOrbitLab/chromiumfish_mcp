@@ -1361,3 +1361,125 @@ test("navigation listeners come off the page whether the action succeeds or thro
   t.mock.timers.tick(20_000);
   assert.deepEqual(counts, { request: 0, framenavigated: 0 }, "detached once the window closes");
 });
+
+/**
+ * Drive solveChallenge against a scripted sequence of observations. The real method reads
+ * the page through observeChallenge only, so stubbing that is enough to exercise every
+ * reporting path without a browser.
+ */
+function challengeBrowser(states) {
+  const browser = new ChromiumFishBrowser(config);
+  const page = {
+    url: () => "https://site.example/gate",
+    title: async () => "Just a moment...",
+    viewportSize: () => ({ width: 1280, height: 720 }),
+    frames: () => [],
+    waitForTimeout: async () => undefined,
+    mouse: { move: async () => undefined, down: async () => undefined, up: async () => undefined },
+    ...NO_NAV,
+  };
+  browser.page = async () => page;
+  let round = 0;
+  browser.observeChallenge = async () => {
+    const present = states[Math.min(round++, states.length - 1)];
+    return {
+      detection: {
+        present,
+        kind: present ? "interstitial" : "none",
+        title: present ? "Just a moment..." : "Dashboard",
+        url: "https://site.example/gate",
+        bodySnippet: "",
+        widget: { x: 100, y: 100, width: 300, height: 65 },
+        widgetState: present ? "verifying" : "absent",
+        tokenPresent: !present,
+        frames: [],
+      },
+      kind: present ? "interstitial" : "none",
+      widgetState: present ? "verifying" : "success",
+      tokenPresent: !present,
+      hasChallengeFrame: present,
+      bodyText: present ? "Verifying you are human. This may take a few seconds." : "Welcome back",
+    };
+  };
+  browser.ensureWidgetInViewport = async (_page, widget) => widget;
+  browser.findTurnstileWidget = async () => ({ x: 100, y: 100, width: 300, height: 65 });
+  return browser;
+}
+
+test("an unchallenged page reports that nothing was found, done, or verified", async () => {
+  const browser = challengeBrowser([false]);
+
+  const result = await browser.solveChallenge({ timeoutMs: 3_000, maxClicks: 2 });
+
+  assert.equal(result.ok, true, "ok stays true: the page is not blocked and work can continue");
+  // ok alone reads as "the captcha was defeated" on a tool called solve_challenge. These are
+  // the fields that make the difference reportable.
+  assert.equal(result.challengeObserved, false);
+  assert.equal(result.interactionPerformed, false);
+  assert.equal(result.clearanceVerified, false);
+  assert.equal(result.method, "already_clear");
+  assert.deepEqual(result.clicks, []);
+});
+
+test("a challenge that clears itself is not reported as a click", async () => {
+  // Present and verifying on entry, then through on its own: a managed interstitial
+  // finishing its automatic check while solve_challenge is running.
+  const browser = challengeBrowser([true, true, false]);
+
+  const result = await browser.solveChallenge({ timeoutMs: 20_000, maxClicks: 5 });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.method, "self_cleared", "method must follow what was done, not how it ended");
+  assert.equal(result.challengeObserved, true);
+  assert.equal(result.interactionPerformed, false);
+  assert.equal(result.clearanceVerified, true, "clearance was positively confirmed, just not by us");
+  assert.equal(result.attempts, 0);
+});
+
+test("interactionPerformed cannot disagree with the clicks it reports", async () => {
+  // Never clears, so the run exhausts its clicks and times out.
+  const browser = challengeBrowser([true]);
+
+  const result = await browser.solveChallenge({ timeoutMs: 4_000, maxClicks: 2 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.clearanceVerified, false, "a timeout verifies nothing");
+  assert.equal(result.challengeObserved, true);
+  // Derived in finish() from clicks, so no return site can assert an interaction it did
+  // not perform — which is how method "click" came to be reported after zero clicks.
+  assert.equal(result.interactionPerformed, result.clicks.length > 0);
+});
+
+test("a concurrent call claims neither observation nor interaction", async () => {
+  const browser = challengeBrowser([true]);
+  browser.solveChallengeInFlight = true;
+  browser.readBody = async () => "Just a moment...";
+
+  const result = await browser.solveChallenge({});
+
+  assert.equal(result.ok, false);
+  assert.equal(result.method, "busy");
+  // It returned before looking at anything; reporting otherwise would invent a finding.
+  assert.equal(result.challengeObserved, false);
+  assert.equal(result.interactionPerformed, false);
+  assert.equal(result.clearanceVerified, false);
+});
+
+test("a challenge that vanishes before its widget mounts is not reported as verified", async () => {
+  // Present, but the widget never appears; then the challenge is simply gone. Nothing was
+  // confirmed — it stopped being visible, which is not the same thing.
+  const browser = challengeBrowser([true, true, false]);
+  const observe = browser.observeChallenge;
+  browser.observeChallenge = async () => {
+    const result = await observe();
+    return { ...result, detection: { ...result.detection, widget: undefined } };
+  };
+
+  const result = await browser.solveChallenge({ timeoutMs: 6_000, maxClicks: 2 });
+
+  assert.equal(result.ok, true, "not blocked, so work can continue");
+  assert.equal(result.method, "already_clear");
+  assert.equal(result.challengeObserved, true, "a challenge really was there");
+  assert.equal(result.interactionPerformed, false);
+  assert.equal(result.clearanceVerified, false, "it disappeared; that is not confirmation");
+});

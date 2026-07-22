@@ -120,6 +120,9 @@ function fakeBrowser() {
       return {
         ok: true,
         method: "already_clear",
+        challengeObserved: false,
+        interactionPerformed: false,
+        clearanceVerified: false,
         attempts: 0,
         elapsedMs: 1,
         title: "Example",
