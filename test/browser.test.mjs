@@ -16,7 +16,7 @@ const config = {
 };
 
 /** What resolveTarget's staleness evaluate returns for a live, non-file element. */
-const LIVE = { connected: true, fileInput: false };
+const LIVE = { connected: true, fileInput: false, multiple: false };
 
 function frame({ url, name = "", parent = null, text = "", box } = {}) {
   return {
@@ -748,9 +748,10 @@ async function uploadFixture() {
 test("assertUploadPath confines uploads to the configured roots", async () => {
   const { root, inside, outside } = await uploadFixture();
 
-  assert.equal(await assertUploadPath(inside, [root]), inside);
+  // Returns the size too, so uploadFile does not stat the same file again.
+  assert.deepEqual(await assertUploadPath(inside, [root]), { path: inside, bytes: 3 });
   // A relative path is resolved against the process, not silently rejected.
-  assert.equal(await assertUploadPath(relative(process.cwd(), inside), [root]), inside);
+  assert.equal((await assertUploadPath(relative(process.cwd(), inside), [root])).path, inside);
 
   await assert.rejects(assertUploadPath(outside, [root]), /outside every --upload-dir root/);
   await assert.rejects(assertUploadPath(join(root, "nope.txt"), [root]), /does not exist/);
@@ -783,14 +784,12 @@ test("assertUploadPath matches roots that are themselves symlinks", async (t) =>
     return;
   }
   // Realpathing only the file would leave this failing to match its own root.
-  assert.equal(await assertUploadPath(inside, [alias]), inside);
+  assert.equal((await assertUploadPath(inside, [alias])).path, inside);
 });
 
 test("uploadFile rejects a non-file input before touching the page", async () => {
   const handle = {
-    evaluate: async (callback) => String(callback).includes("isConnected")
-      ? LIVE
-      : { isFile: false, multiple: false },
+    evaluate: async () => LIVE,
     setInputFiles: async () => assert.fail("must not attach to a non-file input"),
   };
   const main = {
@@ -812,9 +811,7 @@ test("uploadFile validates every path before attaching any of them", async () =>
   const { root, inside, outside } = await uploadFixture();
   let attached;
   const handle = {
-    evaluate: async (callback) => String(callback).includes("isConnected")
-      ? { connected: true, fileInput: true }
-      : { isFile: true, multiple: true },
+    evaluate: async () => ({ connected: true, fileInput: true, multiple: true }),
     setInputFiles: async (paths) => {
       attached = paths;
     },
@@ -853,9 +850,7 @@ test("uploadFile validates every path before attaching any of them", async () =>
 test("uploadFile rejects multiple files on a single-file input", async () => {
   const { root, inside } = await uploadFixture();
   const handle = {
-    evaluate: async (callback) => String(callback).includes("isConnected")
-      ? { connected: true, fileInput: true }
-      : { isFile: true, multiple: false },
+    evaluate: async () => ({ connected: true, fileInput: true, multiple: false }),
     setInputFiles: async () => assert.fail("must not attach past the multiple check"),
   };
   const main = {
@@ -875,7 +870,7 @@ test("uploadFile rejects multiple files on a single-file input", async () => {
 
 test("click on a file input fails loudly instead of silently doing nothing", async () => {
   const handle = {
-    evaluate: async () => ({ connected: true, fileInput: true }),
+    evaluate: async () => ({ connected: true, fileInput: true, multiple: false }),
   };
   const main = {
     url: () => "https://example.com/",
@@ -1005,36 +1000,66 @@ test("drag rejects an ambiguous or out-of-viewport destination", async () => {
   await assert.rejects(browser.drag("#slider", { dx: 5000, dy: 0 }), /outside the 1280x720/);
 });
 
-test("element screenshot crops instead of returning the viewport", async () => {
-  let captured;
-  const handle = {
-    evaluate: async () => LIVE,
-    scrollIntoViewIfNeeded: async () => undefined,
-    boundingBox: async () => ({ x: 10, y: 20, width: 120, height: 40 }),
-    screenshot: async (options) => {
-      captured = options;
-      return Buffer.from("element-png");
-    },
-  };
+/**
+ * Page fake that owns a scroll offset and routes evaluate by what the callback reads, so a
+ * capture can be observed to move the page and then put it back.
+ *
+ * No handle here exposes scrollIntoViewIfNeeded: element capture must not call it, and the
+ * missing method turns a regression into a failure instead of a silently passing test.
+ */
+function screenshotPage(handles, { scale = 1 } = {}) {
+  const scroll = { x: 0, y: 0 };
   const main = {
     url: () => "https://example.com/",
     name: () => "",
     parentFrame: () => null,
-    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+    locator: (selector) => ({ first: () => ({ elementHandle: async () => handles[selector] }) }),
   };
-  const page = {
-    frames: () => [main],
-    mainFrame: () => main,
-    evaluate: async () => 1,
-    viewportSize: () => ({ width: 1280, height: 720 }),
-    screenshot: async () => assert.fail("must not fall back to a page capture"),
+  return {
+    scroll,
+    page: {
+      frames: () => [main],
+      mainFrame: () => main,
+      viewportSize: () => ({ width: 1280, height: 720 }),
+      screenshot: async () => assert.fail("must not fall back to a page capture"),
+      evaluate: async (callback, arg) => {
+        const source = String(callback);
+        if (source.includes("devicePixelRatio")) return scale;
+        if (source.includes("scrollX")) return [scroll.x, scroll.y];
+        if (source.includes("scrollTo")) {
+          [scroll.x, scroll.y] = arg;
+          return undefined;
+        }
+        return assert.fail(`unexpected page.evaluate: ${source}`);
+      },
+    },
   };
+}
+
+test("element screenshot crops, and puts back the scroll the capture moved", async () => {
+  let captured;
+  const handles = {
+    "#badge": {
+      evaluate: async () => LIVE,
+      boundingBox: async () => ({ x: 10, y: 20, width: 120, height: 40 }),
+      screenshot: async (options) => {
+        captured = options;
+        // Playwright scrolls the element into view itself and does not restore afterwards.
+        fake.scroll.y = 2475;
+        return Buffer.from("element-png");
+      },
+    },
+  };
+  const fake = screenshotPage(handles);
   const browser = new ChromiumFishBrowser(config);
-  browser.page = async () => page;
+  browser.page = async () => fake.page;
 
   const png = await browser.takeScreenshot({ target: "#badge" });
   assert.equal(png.toString(), "element-png");
   assert.deepEqual(captured, { type: "png" });
+  // take_screenshot is annotated readOnlyHint, and viewport coordinates the caller already
+  // holds would silently address the wrong pixels if the page stayed where the capture left it.
+  assert.deepEqual(fake.scroll, { x: 0, y: 0 });
 
   await assert.rejects(
     browser.takeScreenshot({ target: "#badge", fullPage: true }),
@@ -1042,30 +1067,41 @@ test("element screenshot crops instead of returning the viewport", async () => {
   );
 });
 
+test("element screenshot restores the scroll even when the capture fails", async () => {
+  const handles = {
+    "#badge": {
+      evaluate: async () => LIVE,
+      boundingBox: async () => ({ x: 10, y: 20, width: 120, height: 40 }),
+      screenshot: async () => {
+        fake.scroll.y = 900;
+        throw new Error("Target closed");
+      },
+    },
+  };
+  const fake = screenshotPage(handles);
+  fake.scroll.y = 120;
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+
+  await assert.rejects(browser.takeScreenshot({ target: "#badge" }), /Target closed/);
+  assert.deepEqual(fake.scroll, { x: 0, y: 120 });
+});
+
 test("element screenshot rejects an invisible element and honors the pixel budget", async () => {
   const boxes = { "#hidden": null, "#huge": { x: 0, y: 0, width: 9_000, height: 9_000 } };
-  const makeHandle = (selector) => ({
+  const handles = Object.fromEntries(Object.entries(boxes).map(([selector, box]) => [selector, {
     evaluate: async () => LIVE,
-    scrollIntoViewIfNeeded: async () => undefined,
-    boundingBox: async () => boxes[selector],
+    boundingBox: async () => box,
     screenshot: async () => assert.fail("must not capture past the budget check"),
-  });
-  const main = {
-    url: () => "https://example.com/",
-    name: () => "",
-    parentFrame: () => null,
-    locator: (selector) => ({ first: () => ({ elementHandle: async () => makeHandle(selector) }) }),
-  };
-  const page = {
-    frames: () => [main],
-    mainFrame: () => main,
-    // Scale 2 turns a 9000px box into 18000px of PNG.
-    evaluate: async () => 2,
-    viewportSize: () => ({ width: 1280, height: 720 }),
-  };
+  }]));
+  // Scale 2 turns a 9000px box into 18000px of PNG.
+  const fake = screenshotPage(handles, { scale: 2 });
   const browser = new ChromiumFishBrowser(config);
-  browser.page = async () => page;
+  browser.page = async () => fake.page;
 
+  // A display:none target reports a null box straight away. Scrolling first would instead
+  // spend the whole locator timeout inside Playwright before failing with its own error.
   await assert.rejects(browser.takeScreenshot({ target: "#hidden" }), /no visible box/);
   await assert.rejects(browser.takeScreenshot({ target: "#huge" }), /18000x18000/);
+  assert.deepEqual(fake.scroll, { x: 0, y: 0 });
 });
