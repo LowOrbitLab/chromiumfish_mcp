@@ -65,7 +65,7 @@ Targeting
 
 Action results
 - navigate, click, hover, type_text, select_option, set_checked, press_key, scroll,
-  wait_for, and click_at return the resulting url and title plus navigated and newPages.
+  wait_for, click_at, and drag return the resulting url and title plus navigated and newPages.
   Read those instead of calling snapshot reflexively: re-snapshot only when navigated is
   true or the part of the DOM you need has changed.
 - navigate, navigate_back, navigate_forward, and reload always report navigated: true.
@@ -83,7 +83,8 @@ Challenges
 
 Cost
 - Prefer snapshot and get_text over take_screenshot; use screenshots only for questions
-  that genuinely need pixels.`;
+  that genuinely need pixels. When one is needed, take_screenshot with target crops to a
+  single element and costs a fraction of a viewport image.`;
 
 const READ_ONLY = {
   readOnlyHint: true,
@@ -268,14 +269,20 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   server.registerTool(
     "take_screenshot",
     {
-      description: "Capture the current viewport or the full page as a PNG image.",
-      inputSchema: { fullPage: z.boolean().default(false) },
+      description:
+        "Capture the viewport, the full page, or a single element as a PNG image. Pass target "
+        + "to crop to one element, which costs far fewer tokens than a full viewport image.",
+      inputSchema: {
+        fullPage: z.boolean().default(false),
+        target: z.string().min(1).optional(),
+        frameId: z.string().min(1).optional(),
+      },
       annotations: READ_ONLY,
     },
-    async ({ fullPage }) => ({
+    async ({ fullPage, target, frameId }) => ({
       content: [{
         type: "image" as const,
-        data: (await browser.takeScreenshot(fullPage)).toString("base64"),
+        data: (await browser.takeScreenshot({ fullPage, target, frameId })).toString("base64"),
         mimeType: "image/png",
       }],
     }),
@@ -328,6 +335,30 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       annotations: MUTATING,
     },
     async ({ x, y, returnSnapshot }) => action(await browser.clickAt(x, y, { returnSnapshot })),
+  );
+
+  server.registerTool(
+    "drag",
+    {
+      description:
+        "Press on an element, move with a human-like curved path, and release. Give exactly one "
+        + "destination: toTarget to drop onto another element, or dx/dy to drag by a pixel offset "
+        + "(what slider controls need). Both ends must be on screen at once. Returns the from and "
+        + "to points actually used.",
+      inputSchema: {
+        target: z.string().min(1),
+        toTarget: z.string().min(1).optional(),
+        dx: z.number().finite().optional(),
+        dy: z.number().finite().optional(),
+        frameId: z.string().min(1).optional(),
+        ...returnSnapshotInput,
+      },
+      annotations: MUTATING,
+    },
+    async ({ target, toTarget, dx, dy, frameId, returnSnapshot }) => action({
+      ...await browser.drag(target, { toTarget, dx, dy }, frameId, { returnSnapshot }),
+      target,
+    }),
   );
 
   server.registerTool(
@@ -477,6 +508,30 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       kind: condition.kind,
     }),
   );
+
+  if (config.uploadDirs.length > 0) {
+    server.registerTool(
+      "upload_file",
+      {
+        description:
+          "Attach local files to a file input. Target the input[type=file] itself, by ref or "
+          + "CSS selector; a hidden input works, so a styled upload button usually means "
+          + "targeting the input it wraps. Paths must resolve inside a directory the server "
+          + "was started with via --upload-dir. Registered only when --upload-dir is set.",
+        inputSchema: {
+          target: z.string().min(1),
+          paths: z.array(z.string().min(1)).min(1).max(10),
+          frameId: z.string().min(1).optional(),
+          ...returnSnapshotInput,
+        },
+        annotations: MUTATING,
+      },
+      async ({ target, paths, frameId, returnSnapshot }) => action({
+        ...await browser.uploadFile(target, paths, frameId, { returnSnapshot }),
+        target,
+      }),
+    );
+  }
 
   if (config.allowEval) {
     server.registerTool(
