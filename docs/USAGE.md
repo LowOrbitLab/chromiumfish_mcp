@@ -15,6 +15,9 @@ The browser starts lazily on the first tool call that needs a page, and is clean
 - `navigated` is true when the URL changed within the action's settle window. Actions that start a navigation later than that report it on the next call, and same-URL navigations are not detected. `navigate`, `navigate_back`, `navigate_forward`, and `reload` are the exception: they report `navigated: true` unconditionally, because they invalidate element references even when the URL does not change.
 - `newPages` lists pages the action opened, such as a `target="_blank"` link. The current page never switches automatically — use `select_page` to move to one.
 - A detected navigation invalidates element references, exactly as `navigate` does.
+- `navigationPending: true` appears when the action started a top-level navigation that had not committed within ten seconds — a slow login POST, a long redirect chain. `url` and `title` still describe the page being left, and `navigated` is still `false`, so read this field before concluding the action did nothing. The action itself succeeded: follow it with `wait_for` on the destination URL or an element there. Repeating the action instead would submit a login or a purchase twice.
+
+An action that navigates waits for the new document to commit before reporting, so `url`, `title`, and `navigated` describe the page you arrived on rather than the one you left. Reads issued while a navigation is committing — `snapshot` and `get_text` — retry once against the new document instead of failing with `Execution context was destroyed`.
 
 Set `returnSnapshot: true` on any of those tools to receive the action result and a fresh snapshot in a single call. The snapshot arrives as a separate plain-text content block rather than a JSON-escaped string, and — like every snapshot — it renumbers element references.
 
@@ -33,6 +36,10 @@ Set `returnSnapshot: true` on any of those tools to receive the action result an
 Pass `e1` to `type_text`, `e2` to `click`, or `e4` to `select_option`. References belong to the latest snapshot of the current page and selected frame — request a new snapshot after the page changes.
 
 Reference numbers are identifiers, not positions, and are **never reused**. Snapshots keep counting up rather than restarting at `e1`, so a reference held from an earlier snapshot fails with an explicit error instead of silently resolving to whatever element now occupies that slot. Nothing about document order can be inferred from the number.
+
+Because the counter never resets, **every snapshot numbers its output afresh even when the page has not changed** — the same three unchanged controls print as `e1 e2 e3`, then `e4 e5 e6`. Renumbering between two snapshots therefore says nothing about whether anything moved; it is not a signal to read.
+
+A reference also dies when the element behind it is replaced, which some forms do on every keystroke. Re-snapshotting after each interaction works but costs a full snapshot each time; for a form that re-renders, build a `role=` selector once from what the snapshot already printed and reuse it, as below.
 
 ## Targeting without a reference
 
