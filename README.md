@@ -43,8 +43,9 @@ To run from GitHub instead of a global install, set `"command": "npx"` and prepe
 | `list_pages`, `open_page`, `select_page`, `close_page` | Manage pages by stable `pageId` |
 | `navigate`, `navigate_back`, `navigate_forward`, `reload` | Navigate and use page history |
 | `snapshot` | List visible interactive elements with `e1`/`e2` references |
-| `get_text`, `take_screenshot` | Retrieve page or frame content |
+| `get_text`, `take_screenshot` | Retrieve page or frame content; `take_screenshot` crops to one element with `target` |
 | `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for` | Interact with the page |
+| `drag` | Drag onto another element or by a pixel offset, with a human-like path |
 | `upload_file` | Attach local files to a file input — requires `--upload-dir` |
 | `click_at` | Click absolute coordinates (for widgets `snapshot` cannot see) |
 | `list_frames` | List frames/iframes with stable IDs |

@@ -6,7 +6,7 @@ The browser starts lazily on the first tool call that needs a page, and is clean
 
 ## Action results
 
-`navigate`, `navigate_back`, `navigate_forward`, `reload`, `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for`, and `click_at` report the state they produced, so a follow-up `snapshot` or `get_text` is only needed when something actually changed:
+`navigate`, `navigate_back`, `navigate_forward`, `reload`, `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for`, `click_at`, `drag`, and `upload_file` report the state they produced, so a follow-up `snapshot` or `get_text` is only needed when something actually changed:
 
 ```json
 { "ok": true, "url": "https://example.com/done", "title": "Done", "navigated": true, "newPages": ["page-2"], "target": "e4" }
@@ -56,9 +56,19 @@ Resolving a target — reference or selector — is bounded at five seconds, so 
 
 `take_screenshot` rejects captures larger than 25 million pixels or 20,000 pixels on either axis. Reduce `--window-size`, or capture the viewport instead of the full page, when an image exceeds that budget.
 
+Pass `target` (a reference or CSS selector, plus `frameId` for a selector inside a frame) to crop to a single element. The element is scrolled into view first, so the capture does not depend on the current scroll position. This is dramatically cheaper than a full image — a small control measured at roughly 250 tokens against about 6,000 for the same page's viewport — so prefer it whenever the question is about one component. `target` cannot be combined with `fullPage`.
+
 ## Frames and form controls
 
-`list_frames` returns a stable `frameId` for each frame in the current page. Bounding boxes are omitted by default; set `includeBox: true` only for coordinate interaction. Pass a frame ID to `snapshot` or `get_text` to inspect that frame. Element references created by a frame snapshot work with `click`, `hover`, `type_text`, `select_option`, `set_checked`, and `wait_for`; when using a CSS selector instead of a reference, pass the same `frameId` to the action. Refresh `list_frames` after navigation because detached child frames receive new IDs.
+`list_frames` returns a stable `frameId` for each frame in the current page. Bounding boxes are omitted by default; set `includeBox: true` only for coordinate interaction. Pass a frame ID to `snapshot` or `get_text` to inspect that frame. Element references created by a frame snapshot work with `click`, `hover`, `type_text`, `select_option`, `set_checked`, `drag`, `upload_file`, `take_screenshot`, and `wait_for`; when using a CSS selector instead of a reference, pass the same `frameId` to the action. Refresh `list_frames` after navigation because detached child frames receive new IDs.
+
+## Dragging
+
+`drag` presses on `target`, moves along the same curved, jittered path the challenge clicks use, and releases. Give exactly one destination: `toTarget` to drop onto another element, or `dx`/`dy` to drag by a pixel offset. The offset form is what slider controls need, since there is no element to drop onto.
+
+Both ends must be on screen at once. The source is scrolled into view, but the destination deliberately is not — scrolling mid-drag would slide the source out from under the cursor — so a destination outside the viewport is rejected rather than dragged to the wrong place. The result reports the `from` and `to` points actually used.
+
+Real mouse events drive both mouse-event drag implementations and HTML5 `draggable`/`drop` handlers.
 
 ## File uploads
 
