@@ -49,7 +49,7 @@ To run from GitHub instead of a global install, set `"command": "npx"` and prepe
 | `upload_file` | Attach local files to a file input — requires `--upload-dir` |
 | `click_at` | Click absolute coordinates (for widgets `snapshot` cannot see) |
 | `list_frames` | List frames/iframes with stable IDs |
-| `find_challenge`, `solve_challenge` | Detect and clear interstitial / framed challenges |
+| `find_challenge`, `solve_challenge` | Detect and clear interstitial / framed challenges; the result says whether one was observed, interacted with, and verified |
 | `evaluate` | Run arbitrary JavaScript — requires `--allow-eval` |
 | `run_task` | Native ChromiumFish agent — requires `--allow-native-agent` |
 
@@ -83,6 +83,7 @@ Proxy credentials can be embedded in the proxy URL, but are then exposed in the 
 - `--allowed-host example.com` restricts top-level HTTP/HTTPS navigation (redirects, links, form posts, popups) to a host and its subdomains. Third-party subframes and page assets remain reachable — it is a navigation guard, not a network egress filter.
 - `upload_file` sends host files to whatever origin the page posts to, so it is unregistered until `--upload-dir` names at least one directory, and every path must resolve inside one. Both the path and the roots are resolved through symlinks first, so a link planted inside a root cannot reach outside it. Scope the roots to the files a task actually needs — a page can influence which file the model picks.
 - Clients can click and type with real side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
+- `solve_challenge` returns `ok: true` whenever the page is not blocked, including on pages that were never challenged. Read `challengeObserved`, `interactionPerformed`, and `clearanceVerified` before recording or reporting that a challenge was cleared — `ok` alone will overstate what happened.
 - Each process runs an independent browser context; this is not a shared multi-tenant service.
 
 ## Development

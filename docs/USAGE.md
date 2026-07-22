@@ -105,7 +105,17 @@ Ordinary frames can be inspected by `frameId`, including cross-origin applicatio
 3. `solve_challenge` — automatic clicks near the widget checkbox region + clearance polling
 4. Or `list_frames` + `click_at` for manual coordinate control
 
-`solve_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, and `clicks`. Treat `ok: false` as a hard failure and fall back (retry, a different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
+`solve_challenge` returns JSON with `ok`, `method`, `attempts`, `widgetState`, `tokenPresent`, `widget`, `clicks`, and three flags describing what actually happened. Treat `ok: false` as a hard failure and fall back (retry, a different network path, or another interaction strategy). Embedded widgets are confirmed via response token / widget state, not main-document text alone. Results still depend on page structure and environment.
+
+`ok: true` means the page is not blocked and work can continue. **It does not mean a challenge was defeated**, and the tool returns it on a page that never had one. Report what happened from the flags instead:
+
+| flag | true when |
+|------|-----------|
+| `challengeObserved` | a challenge was actually detected |
+| `interactionPerformed` | at least one click was performed — derived from `clicks`, so it cannot claim one that did not happen |
+| `clearanceVerified` | clearance was positively confirmed by a response token, a widget success state, or leaving the interstitial |
+
+Finding no challenge is not confirmation of anything, so an unchallenged page returns `ok: true` with all three flags `false` and `method: "already_clear"`. A challenge that completes its own automatic check while the call is running returns `method: "self_cleared"` with `interactionPerformed: false` and `clearanceVerified: true`. Only `method: "click"` involved clicking.
 
 Do **not** read challenge-frame document text or probe `cf-turnstile-response` / `cf-chl-widget*` inputs while still on the gate page; that can collapse interactive clearance rates.
 

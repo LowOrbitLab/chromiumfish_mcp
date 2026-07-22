@@ -83,6 +83,9 @@ Challenges
   lowers clearance rates and DOM access to those frames is blocked.
 - solve_challenge ok: false is terminal. Change network path or strategy rather than
   retrying in a loop.
+- ok: true only means the page is not blocked. Never describe a challenge as solved or
+  bypassed unless clearanceVerified is true, and never describe one as encountered unless
+  challengeObserved is true - on an unchallenged page ok is true with both false.
 
 Cost
 - Prefer snapshot and get_text over take_screenshot; use screenshots only for questions
@@ -394,7 +397,12 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "solve_challenge",
     {
       description:
-        "Use human-like coordinate clicks on a standard checkbox inside a cross-origin challenge frame, then poll until clearance is confirmed by a response token, widget success state, or interstitial exit. Does not require a vision model; use the JSON ok field as the result.",
+        "Use human-like coordinate clicks on a standard checkbox inside a cross-origin challenge "
+        + "frame, then poll until clearance is confirmed by a response token, widget success state, "
+        + "or interstitial exit. Does not require a vision model. ok means the page is not blocked "
+        + "and you may continue - it does not mean a challenge was defeated. Report what happened "
+        + "from challengeObserved, interactionPerformed, and clearanceVerified: on a page that was "
+        + "never challenged all three are false while ok is true.",
       inputSchema: {
         timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
         maxClicks: z.number().int().min(1).max(30).default(6),
