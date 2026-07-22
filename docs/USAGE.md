@@ -56,7 +56,7 @@ Resolving a target — reference or selector — is bounded at five seconds, so 
 
 `take_screenshot` rejects captures larger than 25 million pixels or 20,000 pixels on either axis. Reduce `--window-size`, or capture the viewport instead of the full page, when an image exceeds that budget.
 
-Pass `target` (a reference or CSS selector, plus `frameId` for a selector inside a frame) to crop to a single element. The element is scrolled into view first, so the capture does not depend on the current scroll position. This is dramatically cheaper than a full image — a small control measured at roughly 250 tokens against about 6,000 for the same page's viewport — so prefer it whenever the question is about one component. `target` cannot be combined with `fullPage`.
+Pass `target` (a reference or CSS selector, plus `frameId` for a selector inside a frame) to crop to a single element. An element below the fold is captured correctly, and the page is left at the scroll offset it had before the call, so viewport coordinates held from an earlier `list_frames` or `find_challenge` stay valid. This is dramatically cheaper than a full image — a small control measured at roughly 250 tokens against about 6,000 for the same page's viewport — so prefer it whenever the question is about one component. `target` cannot be combined with `fullPage`.
 
 ## Frames and form controls
 

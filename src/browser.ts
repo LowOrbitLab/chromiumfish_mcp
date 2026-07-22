@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative } from "node:path";
 import { buildArgs, ChromiumFish } from "chromiumfish";
@@ -239,6 +240,13 @@ export interface BrowserApi {
 
 type InteractiveHandle = ElementHandle<HTMLElement | SVGElement>;
 
+/** Facts the single staleness evaluate collects, shared by every resolveTarget caller. */
+interface TargetInfo {
+  connected: boolean;
+  fileInput: boolean;
+  multiple: boolean;
+}
+
 const INTERACTIVE_SELECTOR = [
   "a[href]",
   "button",
@@ -327,19 +335,27 @@ export function assertNavigationUrl(rawUrl: string, allowedHosts: string[]): URL
  * for ~/.ssh/id_rsa. Both the candidate and each root are realpath'd before comparison:
  * resolving only one side lets a symlink inside a root point anywhere on the disk, and
  * leaves roots that are themselves symlinks (macOS /tmp) failing to match their own files.
+ *
+ * Returns the size alongside the path so the caller does not stat the same file again.
  */
-export async function assertUploadPath(rawPath: string, uploadDirs: string[]): Promise<string> {
+export async function assertUploadPath(
+  rawPath: string,
+  uploadDirs: string[],
+): Promise<{ path: string; bytes: number }> {
   if (uploadDirs.length === 0) {
     throw new Error("Uploads are disabled; start the server with --upload-dir to enable them");
   }
 
   let file: string;
+  let info: Stats;
   try {
     file = await realpath(rawPath);
+    // Inside the same guard as realpath: the file can be removed between the two calls, and
+    // a raw ENOENT here would bypass the message this function exists to produce.
+    info = await stat(file);
   } catch {
     throw new Error(`Upload path does not exist: ${rawPath}`);
   }
-  const info = await stat(file);
   if (!info.isFile()) {
     throw new Error(`Upload path is not a regular file: ${rawPath}`);
   }
@@ -349,7 +365,7 @@ export async function assertUploadPath(rawPath: string, uploadDirs: string[]): P
     const root = await realpath(dir).catch(() => undefined);
     if (root === undefined) continue;
     const rel = relative(root, file);
-    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) return file;
+    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) return { path: file, bytes: info.size };
   }
   throw new Error(
     `Upload path ${rawPath} is outside every --upload-dir root (${uploadDirs.join(", ")}); `
@@ -925,12 +941,21 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   /**
    * Crop to one element instead of shipping a whole viewport PNG to answer a question about
-   * a single control. The element is scrolled in first, so the capture does not depend on
-   * where the page happens to be scrolled.
+   * a single control.
+   *
+   * The element is deliberately not scrolled into view here. boundingBox reports the same
+   * width and height whether or not the element is on screen, and those are the only figures
+   * the budget needs, so scrolling would buy nothing — while making a display:none target
+   * spend the full locator timeout before failing, instead of failing at once on a null box.
+   *
+   * Playwright's own screenshot does scroll, and does not put the page back, so the scroll
+   * offset is captured and restored around it. take_screenshot is annotated readOnlyHint,
+   * and viewport coordinates the caller already holds — a widget box from find_challenge,
+   * a frame box from list_frames — silently address the wrong pixels once the page moves
+   * under them.
    */
   private async elementScreenshot(page: Page, target: string, frameId?: string): Promise<Buffer> {
     const handle = await this.resolveTarget(page, target, frameId);
-    await handle.scrollIntoViewIfNeeded({ timeout: LOCATOR_TIMEOUT_MS });
     const box = await handle.boundingBox();
     if (!box || box.width <= 0 || box.height <= 0) {
       throw new Error(`Target ${target} has no visible box to capture`);
@@ -949,7 +974,18 @@ export class ChromiumFishBrowser implements BrowserApi {
         `Element screenshot is too large (${width}x${height}); capture a smaller descendant instead`,
       );
     }
-    return handle.screenshot({ type: "png" });
+
+    const origin = await page.evaluate(() => [window.scrollX, window.scrollY] as [number, number])
+      .catch(() => undefined);
+    try {
+      return await handle.screenshot({ type: "png" });
+    } finally {
+      // Best effort: a capture that succeeded must still be returned even if the page went
+      // away before the scroll could be put back.
+      if (origin) {
+        await page.evaluate(([x, y]) => window.scrollTo(x, y), origin).catch(() => undefined);
+      }
+    }
   }
 
   /** Reference numbers are never reused, so an unknown one is always from an earlier snapshot. */
@@ -985,6 +1021,19 @@ export class ChromiumFishBrowser implements BrowserApi {
     frameId?: string,
     options: { rejectFileInput?: boolean } = {},
   ): Promise<InteractiveHandle> {
+    return (await this.resolveTargetWithInfo(page, target, frameId, options)).handle;
+  }
+
+  /**
+   * As resolveTarget, but hands back the facts the staleness evaluate already gathered so a
+   * caller that needs them does not pay a second round trip to ask the same element again.
+   */
+  private async resolveTargetWithInfo(
+    page: Page,
+    target: string,
+    frameId?: string,
+    options: { rejectFileInput?: boolean } = {},
+  ): Promise<{ handle: InteractiveHandle; info: TargetInfo }> {
     const ref = this.refs.get(page)?.get(target);
     if (ref && frameId) {
       const requestedFrame = this.resolveFrame(page, frameId);
@@ -997,15 +1046,20 @@ export class ChromiumFishBrowser implements BrowserApi {
     const handle = ref ?? await this.resolveFrame(page, frameId).locator(target).first()
       .elementHandle({ timeout: LOCATOR_TIMEOUT_MS });
     if (!handle) throw new Error(`Target ${target} not found; call snapshot again after the page changes`);
-    // One round trip carries both facts; the staleness check already cost an evaluate, so
-    // the file-input guard rides along instead of adding latency to every click.
-    const info = await handle.evaluate((element) => ({
-      connected: element.isConnected,
-      fileInput: element instanceof HTMLInputElement && element.type.toLowerCase() === "file",
-    })).catch(() => null);
+    // One round trip carries every fact; the staleness check already cost an evaluate, so
+    // the file-input guard and upload_file's multiple check ride along rather than each
+    // adding a round trip of their own.
+    const info = await handle.evaluate((element) => {
+      const input = element instanceof HTMLInputElement ? element : undefined;
+      return {
+        connected: element.isConnected,
+        fileInput: input?.type.toLowerCase() === "file",
+        multiple: Boolean(input?.multiple),
+      };
+    }).catch(() => null);
     if (!info?.connected) throw new Error(`Target ${target} is stale; call snapshot again`);
     if (info.fileInput && options.rejectFileInput) throw this.fileInputClickError(target);
-    return handle as InteractiveHandle;
+    return { handle: handle as InteractiveHandle, info };
   }
 
   private async moveMouse(page: Page, x: number, y: number, steps = 12): Promise<void> {
@@ -1114,15 +1168,8 @@ export class ChromiumFishBrowser implements BrowserApi {
     options?: ActionOptions,
   ): Promise<UploadFileResult> {
     const page = await this.page();
-    const handle = await this.resolveTarget(page, target, frameId);
-    const info = await handle.evaluate((element) => {
-      const input = element instanceof HTMLInputElement ? element : undefined;
-      return {
-        isFile: input?.type.toLowerCase() === "file",
-        multiple: Boolean(input?.multiple),
-      };
-    });
-    if (!info.isFile) {
+    const { handle, info } = await this.resolveTargetWithInfo(page, target, frameId);
+    if (!info.fileInput) {
       throw new Error(
         `Target ${target} is not a file input. Target the input[type=file] itself — a hidden `
         + "one is still reachable by CSS selector, since attaching does not require visibility.",
@@ -1136,8 +1183,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     // bad entry attaches nothing rather than half of what was asked for.
     const files: { path: string; bytes: number }[] = [];
     for (const path of paths) {
-      const resolved = await assertUploadPath(path, this.config.uploadDirs);
-      files.push({ path: resolved, bytes: (await stat(resolved)).size });
+      files.push(await assertUploadPath(path, this.config.uploadDirs));
     }
 
     const baseline = this.actionBaseline(page);
