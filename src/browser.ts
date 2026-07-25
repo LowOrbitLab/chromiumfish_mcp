@@ -24,6 +24,8 @@ import {
   isVerifyingPhase,
   looksCleared,
   snippet,
+  SOLVE_MAX_CLICKS,
+  SOLVE_TIMEOUT_MS,
   warmUpPath,
   type ChallengeDetection,
   type ChallengeKind,
@@ -284,6 +286,7 @@ const LOCATOR_TIMEOUT_MS = 5_000;
 /** Navigation is legitimately slower than element resolution, so it gets its own bound. */
 const NAVIGATION_TIMEOUT_MS = 30_000;
 const SNAPSHOT_TRUNCATION_MARKER = "narrow scope or adjust maxElements/maxChars";
+const LINE_TRUNCATION_SUFFIX = " [line truncated]";
 /** Window an action gets to start a navigation before its result is read. */
 const ACTION_SETTLE_MS = 150;
 /** Upper bound on waiting for a navigation the action did start to become readable. */
@@ -336,6 +339,11 @@ function jsonValue(value: unknown): string {
   if (typeof value === "string") return value;
   const encoded = JSON.stringify(value);
   return encoded ?? String(value);
+}
+
+/** The line snapshot appends when its output was cut short, counting what it did report. */
+function truncationMarker(elements: number): string {
+  return `[Snapshot truncated after ${elements} elements; ${SNAPSHOT_TRUNCATION_MARKER}]`;
 }
 
 export function assertNavigationUrl(rawUrl: string, allowedHosts: string[]): URL {
@@ -873,7 +881,8 @@ export class ChromiumFishBrowser implements BrowserApi {
     );
     const refs = new Map<string, InteractiveHandle>();
     const retained = new Set<InteractiveHandle>();
-    const lines: string[] = [];
+    /** Committed lines, each paired with what dropping it again would have to release. */
+    const printed: Array<{ text: string; ref: string; handle: InteractiveHandle }> = [];
     let outputChars = 0;
     let truncated = false;
     let completed = false;
@@ -982,9 +991,14 @@ export class ChromiumFishBrowser implements BrowserApi {
             .filter(Boolean)
             .join(" ");
           let line = `[${ref}] ${snapshotRole(info)} ${JSON.stringify(info.label)}${suffix ? ` ${suffix}` : ""}`;
-          const separatorChars = lines.length > 0 ? 1 : 0;
-          if (line.length + separatorChars > maxChars && lines.length === 0) {
-            line = `${line.slice(0, Math.max(0, maxChars - 18))} [line truncated]`;
+          const separatorChars = printed.length > 0 ? 1 : 0;
+          if (line.length + separatorChars > maxChars && printed.length === 0) {
+            // The marker is appended unconditionally below, so its budget has to come out of
+            // this line. Sizing the line to maxChars alone leaves the pair over budget, and
+            // the loop that enforces the budget would then drop the only line there is —
+            // returning a bare marker that reports an element the caller never saw.
+            const room = maxChars - truncationMarker(1).length - 1 - LINE_TRUNCATION_SUFFIX.length;
+            line = `${line.slice(0, Math.max(0, room))}${LINE_TRUNCATION_SUFFIX}`;
             truncated = true;
           } else if (outputChars + separatorChars + line.length > maxChars) {
             truncated = true;
@@ -993,7 +1007,7 @@ export class ChromiumFishBrowser implements BrowserApi {
 
           refs.set(ref, handle);
           retained.add(handle);
-          lines.push(line);
+          printed.push({ text: line, ref, handle });
           outputChars += separatorChars + line.length;
           if (truncated) break outer;
         }
@@ -1001,17 +1015,27 @@ export class ChromiumFishBrowser implements BrowserApi {
 
       this.refs.set(page, refs);
       completed = true;
+      const render = () => (printed.length > 0
+        ? `${printed.map((entry) => entry.text).join("\n")}\n${truncationMarker(printed.length)}`
+        : truncationMarker(0));
       if (!truncated) {
         // Per-line accounting already kept the body within maxChars.
-        return lines.length > 0 ? lines.join("\n") : "(No visible interactive elements)";
+        return printed.length > 0
+          ? printed.map((entry) => entry.text).join("\n")
+          : "(No visible interactive elements)";
       }
-      // Append the marker and, if the body was char-bound, drop trailing lines so the
-      // marker always survives the budget instead of being clipped away.
-      const marker = `[Snapshot truncated after ${refs.size} elements; ${SNAPSHOT_TRUNCATION_MARKER}]`;
-      let output = lines.length > 0 ? `${lines.join("\n")}\n${marker}` : marker;
-      while (output.length > maxChars && lines.length > 0) {
-        lines.pop();
-        output = lines.length > 0 ? `${lines.join("\n")}\n${marker}` : marker;
+      // Append the marker and, if the body is still char-bound, drop trailing lines so the
+      // marker survives the budget instead of being clipped away. Dropping a line releases
+      // its reference too: one the caller never sees is a handle held for nothing, and it
+      // would leave the marker's count describing more than was actually reported.
+      let output = render();
+      while (output.length > maxChars && printed.length > 0) {
+        const dropped = printed.pop();
+        if (dropped) {
+          refs.delete(dropped.ref);
+          retained.delete(dropped.handle);
+        }
+        output = render();
       }
       return output;
     } finally {
@@ -1110,6 +1134,19 @@ export class ChromiumFishBrowser implements BrowserApi {
       );
     }
 
+    // Playwright scrolls every ancestor scroll container on the way to the element, not just
+    // the window, so putting back window.scrollX/Y alone still leaves a target inside an
+    // overflow container displaced. Capture the ancestor chain in the element's own frame,
+    // and the main frame's window separately, since the element's frame may not be the main
+    // one. A scrolled frame between those two is not restored — nesting that deep is rare
+    // enough not to be worth walking the frame tree for.
+    const inner = await handle.evaluate((element) => {
+      const chain: Array<[number, number]> = [];
+      for (let node: Element | null = element; node; node = node.parentElement) {
+        chain.push([node.scrollLeft, node.scrollTop]);
+      }
+      return { chain, window: [window.scrollX, window.scrollY] as [number, number] };
+    }).catch(() => undefined);
     const origin = await page.evaluate(() => [window.scrollX, window.scrollY] as [number, number])
       .catch(() => undefined);
     try {
@@ -1117,6 +1154,19 @@ export class ChromiumFishBrowser implements BrowserApi {
     } finally {
       // Best effort: a capture that succeeded must still be returned even if the page went
       // away before the scroll could be put back.
+      if (inner) {
+        await handle.evaluate((element, saved) => {
+          let index = 0;
+          for (let node: Element | null = element; node && index < saved.chain.length; node = node.parentElement) {
+            const position = saved.chain[index];
+            index += 1;
+            if (!position) continue;
+            node.scrollLeft = position[0];
+            node.scrollTop = position[1];
+          }
+          window.scrollTo(saved.window[0], saved.window[1]);
+        }, inner).catch(() => undefined);
+      }
       if (origin) {
         await page.evaluate(([x, y]) => window.scrollTo(x, y), origin).catch(() => undefined);
       }
@@ -1640,8 +1690,18 @@ export class ChromiumFishBrowser implements BrowserApi {
   private async solveChallengeLocked(
     options: ChallengeSolveOptions = {},
   ): Promise<ChallengeSolveResult> {
-    const timeoutMs = Math.min(Math.max(options.timeoutMs ?? 45_000, 3_000), 180_000);
-    const maxClicks = Math.min(Math.max(options.maxClicks ?? 12, 1), 30);
+    const timeoutMs = clampInteger(
+      options.timeoutMs,
+      SOLVE_TIMEOUT_MS.default,
+      SOLVE_TIMEOUT_MS.min,
+      SOLVE_TIMEOUT_MS.max,
+    );
+    const maxClicks = clampInteger(
+      options.maxClicks,
+      SOLVE_MAX_CLICKS.default,
+      SOLVE_MAX_CLICKS.min,
+      SOLVE_MAX_CLICKS.max,
+    );
     const started = Date.now();
     const clicks: Array<{ x: number; y: number }> = [];
     const page = await this.page();
@@ -1949,11 +2009,9 @@ export class ChromiumFishBrowser implements BrowserApi {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
     const baseline = this.actionBaseline(page);
-    await this.moveTo(page, handle);
-    await page.mouse.click(
-      this.mousePositions.get(page)?.x ?? 0,
-      this.mousePositions.get(page)?.y ?? 0,
-    );
+    // clickHandle rather than mouse.click: the latter presses and releases with no gap,
+    // which is the one synthetic click this server would otherwise still emit.
+    await this.clickHandle(page, handle);
     if (clear) {
       await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
       await page.keyboard.press("Backspace");

@@ -3,6 +3,9 @@ import { z } from "zod";
 import type { BrowserApi } from "./browser.js";
 import type { ServerConfig } from "./config.js";
 import { VERSION } from "./config.js";
+// turnstile.ts is a pure module with no Playwright imports, so depending on it here keeps
+// the browser-free testability this file relies on.
+import { SOLVE_MAX_CLICKS, SOLVE_TIMEOUT_MS } from "./turnstile.js";
 
 const text = (value: unknown) => ({
   content: [{
@@ -404,8 +407,10 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         + "from challengeObserved, interactionPerformed, and clearanceVerified: on a page that was "
         + "never challenged all three are false while ok is true.",
       inputSchema: {
-        timeoutMs: z.number().int().min(3_000).max(180_000).default(45_000),
-        maxClicks: z.number().int().min(1).max(30).default(6),
+        timeoutMs: z.number().int()
+          .min(SOLVE_TIMEOUT_MS.min).max(SOLVE_TIMEOUT_MS.max).default(SOLVE_TIMEOUT_MS.default),
+        maxClicks: z.number().int()
+          .min(SOLVE_MAX_CLICKS.min).max(SOLVE_MAX_CLICKS.max).default(SOLVE_MAX_CLICKS.default),
       },
       annotations: MUTATING,
     },

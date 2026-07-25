@@ -466,6 +466,114 @@ test("snapshot scans past hidden elements, reports truncation, and releases unus
   assert.equal(disposed.length, 253);
 });
 
+test("a single line wider than maxChars still reports its element", async () => {
+  // A <select multiple> with 20 long options and 20 selected values overruns a 5000-char
+  // budget on its own. The line has to be cut to fit the truncation marker alongside it:
+  // reserving nothing for the marker made the budget loop drop the only line there was,
+  // returning a bare marker that claimed an element the caller could not see or use.
+  const options = Array.from({ length: 20 }, (_, index) => ({
+    value: `option-value-${index}-`.padEnd(120, "x"),
+    label: `Option label ${index} `.padEnd(80, "y"),
+  }));
+  const disposed = [];
+  const wide = {
+    isVisible: async () => true,
+    dispose: async () => disposed.push("wide"),
+    evaluate: async () => ({
+      tag: "select",
+      explicitRole: "",
+      hasList: false,
+      multiple: true,
+      size: 4,
+      label: "Choose warehouses",
+      href: "",
+      disabled: false,
+      type: "",
+      value: null,
+      passwordSet: false,
+      checked: null,
+      selected: options.map((option) => option.value),
+      selectedCount: 20,
+      options,
+      optionCount: 20,
+      expanded: null,
+    }),
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ elementHandles: async () => [wide] }),
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => ({ frames: () => [main], mainFrame: () => main, ...NO_NAV });
+
+  const result = await browser.snapshot({ maxChars: 5000 });
+  assert.ok(result.length <= 5000, `output was ${result.length} chars`);
+  assert.match(result, /^\[e1\] listbox "Choose warehouses"/);
+  assert.match(result, / \[line truncated\]$/m);
+  assert.match(result, /Snapshot truncated after 1 elements/);
+  // The reference is usable precisely because it was printed; the handle stays alive for it.
+  assert.deepEqual(disposed, []);
+});
+
+test("type_text clears, types, submits, and presses through the humanized click path", async () => {
+  const events = [];
+  const handle = {
+    evaluate: async () => LIVE,
+    scrollIntoViewIfNeeded: async () => undefined,
+    boundingBox: async () => ({ x: 100, y: 200, width: 240, height: 32 }),
+  };
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({ first: () => ({ elementHandle: async () => handle }) }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    ...NO_NAV,
+    url: () => "https://example.com/",
+    title: async () => "Example",
+    viewportSize: () => ({ width: 1280, height: 720 }),
+    mouse: {
+      move: async () => events.push("move"),
+      down: async () => events.push("down"),
+      up: async () => events.push("up"),
+      // The old path called mouse.click, which presses and releases with no gap.
+      click: async () => events.push("click"),
+    },
+    keyboard: {
+      press: async (key) => events.push(`press:${key}`),
+      type: async (value, options) => events.push(`type:${value}:${options?.delay}`),
+    },
+    waitForTimeout: async () => events.push("wait"),
+    waitForLoadState: async () => undefined,
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const result = await browser.typeText("#email", "user@example.com", true, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.navigated, false);
+
+  assert.ok(!events.includes("click"), "type_text must not emit a gapless mouse.click");
+  // down and up separated by a wait is what clickHandle contributes over mouse.click.
+  const down = events.indexOf("down");
+  assert.ok(down > 0 && events[down - 1] === "move");
+  assert.equal(events[down + 1], "wait");
+  assert.equal(events[down + 2], "up");
+
+  const afterClick = events.slice(events.indexOf("up") + 1);
+  assert.deepEqual(afterClick.slice(0, 2), [
+    `press:${process.platform === "darwin" ? "Meta+A" : "Control+A"}`,
+    "press:Backspace",
+  ]);
+  assert.equal(afterClick[2], "type:user@example.com:45");
+  assert.equal(afterClick[3], "press:Enter");
+});
+
 test("element targeting bounds Playwright's otherwise unlimited auto-wait", async () => {
   const seen = {};
   const handle = {
@@ -955,7 +1063,12 @@ function draggableHandle(box) {
   };
 }
 
-test("drag presses, follows a curved path, and releases in order", async () => {
+test("drag presses, follows a curved path, and releases in order", async (t) => {
+  // moveMouse offsets its control point by (Math.random() - 0.5) * 80, so an axis-aligned
+  // drag whose draw lands near 0.5 bows by less than the half pixel asserted below and the
+  // path reads as straight. Pin the draw: the assertion is about the curve moveMouse builds
+  // from a given offset, not about how often the offset happens to be large enough.
+  t.mock.method(Math, "random", () => 0.9);
   const handles = { "#slider": draggableHandle({ x: 100, y: 300, width: 40, height: 40 }) };
   const { events, page } = draggablePage(handles);
   const browser = new ChromiumFishBrowser(config);
@@ -1025,6 +1138,38 @@ test("drag rejects an ambiguous or out-of-viewport destination", async () => {
  * No handle here exposes scrollIntoViewIfNeeded: element capture must not call it, and the
  * missing method turns a regression into a failure instead of a silently passing test.
  */
+/**
+ * Element handle for the screenshot tests, modelling one scrollable ancestor. Playwright's
+ * own scrollIntoView moves containers as well as the window, so the restore has to be
+ * observable on both.
+ *
+ * The window this handle reports is its own frame's, deliberately not the page fake's: an
+ * element in a child frame has two windows to put back, and a restore that covers only one
+ * of them has to fail a test rather than pass because both happened to read the same.
+ */
+function screenshotHandle({ box, container, screenshot }) {
+  const frameWindow = { x: 0, y: 0 };
+  return {
+    boundingBox: async () => box,
+    screenshot,
+    evaluate: async (callback, arg) => {
+      const source = String(callback);
+      if (source.includes("isConnected")) return LIVE;
+      // Capture reads scrollX; restore writes through scrollTo. Same split as the page fake.
+      if (source.includes("scrollX")) {
+        return { chain: [[0, 0], [container.x, container.y]], window: [frameWindow.x, frameWindow.y] };
+      }
+      if (source.includes("scrollTo")) {
+        const [, ancestor] = arg.chain;
+        [container.x, container.y] = ancestor;
+        [frameWindow.x, frameWindow.y] = arg.window;
+        return undefined;
+      }
+      return assert.fail(`unexpected handle.evaluate: ${source}`);
+    },
+  };
+}
+
 function screenshotPage(handles, { scale = 1 } = {}) {
   const scroll = { x: 0, y: 0 };
   const main = {
@@ -1057,17 +1202,20 @@ function screenshotPage(handles, { scale = 1 } = {}) {
 
 test("element screenshot crops, and puts back the scroll the capture moved", async () => {
   let captured;
+  const container = { x: 0, y: 0 };
   const handles = {
-    "#badge": {
-      evaluate: async () => LIVE,
-      boundingBox: async () => ({ x: 10, y: 20, width: 120, height: 40 }),
+    "#badge": screenshotHandle({
+      box: { x: 10, y: 20, width: 120, height: 40 },
+      container,
       screenshot: async (options) => {
         captured = options;
-        // Playwright scrolls the element into view itself and does not restore afterwards.
+        // Playwright scrolls the element into view itself and does not restore afterwards —
+        // and it scrolls the containing overflow box, not only the window.
         fake.scroll.y = 2475;
+        container.y = 640;
         return Buffer.from("element-png");
       },
-    },
+    }),
   };
   const fake = screenshotPage(handles);
   const browser = new ChromiumFishBrowser(config);
@@ -1079,6 +1227,9 @@ test("element screenshot crops, and puts back the scroll the capture moved", asy
   // take_screenshot is annotated readOnlyHint, and viewport coordinates the caller already
   // holds would silently address the wrong pixels if the page stayed where the capture left it.
   assert.deepEqual(fake.scroll, { x: 0, y: 0 });
+  // A target inside an overflow container is displaced by the container's scroll, which the
+  // window offset says nothing about.
+  assert.deepEqual(container, { x: 0, y: 0 });
 
   await assert.rejects(
     browser.takeScreenshot({ target: "#badge", fullPage: true }),
@@ -1087,15 +1238,17 @@ test("element screenshot crops, and puts back the scroll the capture moved", asy
 });
 
 test("element screenshot restores the scroll even when the capture fails", async () => {
+  const container = { x: 0, y: 0 };
   const handles = {
-    "#badge": {
-      evaluate: async () => LIVE,
-      boundingBox: async () => ({ x: 10, y: 20, width: 120, height: 40 }),
+    "#badge": screenshotHandle({
+      box: { x: 10, y: 20, width: 120, height: 40 },
+      container,
       screenshot: async () => {
         fake.scroll.y = 900;
+        container.y = 300;
         throw new Error("Target closed");
       },
-    },
+    }),
   };
   const fake = screenshotPage(handles);
   fake.scroll.y = 120;
@@ -1104,6 +1257,7 @@ test("element screenshot restores the scroll even when the capture fails", async
 
   await assert.rejects(browser.takeScreenshot({ target: "#badge" }), /Target closed/);
   assert.deepEqual(fake.scroll, { x: 0, y: 120 });
+  assert.deepEqual(container, { x: 0, y: 0 });
 });
 
 test("element screenshot rejects an invisible element and honors the pixel budget", async () => {

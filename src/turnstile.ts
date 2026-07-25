@@ -32,6 +32,15 @@ export interface ChallengeSolveOptions {
   maxClicks?: number;
 }
 
+/**
+ * Bounds and defaults for solve_challenge, shared by the tool schema and the solver.
+ * They had drifted apart — the schema defaulted to 6 clicks and the solver to 12 — so a
+ * caller holding BrowserApi directly got a different click budget than one arriving over
+ * MCP, with neither number written down anywhere.
+ */
+export const SOLVE_TIMEOUT_MS = { min: 3_000, max: 180_000, default: 45_000 } as const;
+export const SOLVE_MAX_CLICKS = { min: 1, max: 30, default: 6 } as const;
+
 export interface ChallengeSolveResult {
   /**
    * The page is not blocked and work can continue. It does **not** mean a challenge was

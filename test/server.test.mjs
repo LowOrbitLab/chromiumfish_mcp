@@ -217,6 +217,18 @@ test("solve_challenge and click_at return structured results", async (context) =
   assert.equal(clicked.structuredContent.x, 10);
 });
 
+test("solve_challenge forwards the same defaults the solver falls back to", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  await client.callTool({ name: "solve_challenge", arguments: {} });
+  // The schema default and ChromiumFishBrowser's own fallback both come from
+  // SOLVE_TIMEOUT_MS / SOLVE_MAX_CLICKS; they used to disagree on the click budget.
+  assert.deepEqual(browser.calls[0], ["solveChallenge", { timeoutMs: 45_000, maxClicks: 6 }]);
+});
+
 test("list_frames supports includeBox", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {
