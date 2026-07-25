@@ -76,6 +76,14 @@ export interface ChallengeSolveResult {
 /** Host used by Cloudflare challenge / Turnstile frames. */
 const CF_CHALLENGE_HOST_RE = /challenges\.cloudflare\.com/i;
 const INTERSTITIAL_TITLE_RE = /just a moment|checking your browser|performing security verification/i;
+/**
+ * Titles that mean the browser is still sitting on a gate page. Deliberately wider than
+ * INTERSTITIAL_TITLE_RE (it also matches the localized Chinese "security verification"): this one guards token
+ * probing, where a miss costs clearance rather than accuracy, so it errs toward "still
+ * gated". Both live here so the two decisions cannot drift apart unnoticed again.
+ */
+const GATE_TITLE_RE =
+  /just a moment|checking your browser|performing security verification|\u5b89\u5168\u9a8c\u8bc1/i;
 const INTERSTITIAL_BODY_RE =
   /verify(?:ing)? you are human|performing security verification|checking your browser before accessing|needs to review the security|this may take a few seconds/i;
 /** Post-click verifying copy on managed interstitials. */
@@ -86,6 +94,11 @@ const STRONG_SUCCESS_BODY_RE = /captcha is passed successfully|verification succ
 
 export function isCloudflareFrameUrl(url: string): boolean {
   return CF_CHALLENGE_HOST_RE.test(url);
+}
+
+/** Whether a title says the browser has not left the challenge gate yet. */
+export function isGateTitle(title: string): boolean {
+  return GATE_TITLE_RE.test(title);
 }
 
 export function snippet(text: string, max = 280): string {
@@ -246,12 +259,10 @@ export function looksCleared(input: {
   const kind = input.kind ?? "unknown";
   const embedded = kind === "turnstile";
 
-  // Embedded Turnstile: never trust main-document "looks normal".
-  if (embedded) {
-    if (input.widgetState === "checkbox" || input.widgetState === "verifying") return false;
-    if (input.hasChallengeFrame && !input.tokenPresent) return false;
-    return false;
-  }
+  // Embedded Turnstile: never trust main-document "looks normal". The only confirmation
+  // that counts is the token / widget-success check above, so nothing observable here can
+  // clear it — widgetState and hasChallengeFrame are deliberately not consulted.
+  if (embedded) return false;
 
   // Managed / full-page interstitial: leaving the gate is success.
   if (/__cf_chl_rt_tk=|cf-browser-verification/i.test(input.url) && INTERSTITIAL_BODY_RE.test(input.bodyText)) {

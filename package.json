@@ -3,12 +3,16 @@
   "version": "0.4.0",
   "description": "A secure, session-aware MCP server for ChromiumFish.",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
   "exports": {
     ".": {
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js"
     },
     "./config": {
       "types": "./dist/config.d.ts",

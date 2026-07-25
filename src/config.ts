@@ -63,6 +63,43 @@ export function parseProxy(value: string): NonNullable<LaunchOptions["proxy"]> {
   return proxy;
 }
 
+/**
+ * Normalize one --allowed-host value.
+ *
+ * Matching happens against URL.hostname, which carries no scheme, no path and no port, so
+ * every form below would compare against something hostname never contains and block every
+ * navigation instead. That fails closed, which is safe but indistinguishable from a broken
+ * server: rejecting it at startup turns a silent misconfiguration into a message that names
+ * the problem.
+ */
+export function parseAllowedHost(value: string): string {
+  const host = value.trim().toLowerCase();
+  if (!host) throw new Error("--allowed-host requires a host name");
+  if (host.includes("://") || host.includes("/")) {
+    throw new Error(`--allowed-host takes a bare host name, not a URL: ${value}`);
+  }
+  if (host.startsWith(".")) {
+    throw new Error(
+      `--allowed-host ${value} must not start with a dot; a host already matches its subdomains`,
+    );
+  }
+  if (host.includes("*")) {
+    throw new Error(
+      `--allowed-host ${value} does not support wildcards; a host already matches its subdomains`,
+    );
+  }
+  // A bracketed IPv6 literal is exactly what URL.hostname reports, so it is the one colon
+  // that belongs here.
+  const ipv6 = host.startsWith("[") && host.endsWith("]");
+  if (!ipv6 && host.includes(":")) {
+    throw new Error(
+      `--allowed-host ${value} must not include a port; matching is on host name alone, so `
+      + "the host without its port already covers every port",
+    );
+  }
+  return host;
+}
+
 export function parseCli(argv: string[]): ParsedCli {
   const config: ServerConfig = {
     headless: true,
@@ -132,7 +169,7 @@ export function parseCli(argv: string[]): ParsedCli {
         break;
       }
       case "--allowed-host":
-        config.allowedHosts.push(readValue(argv, index, arg).toLowerCase());
+        config.allowedHosts.push(parseAllowedHost(readValue(argv, index, arg)));
         index += 1;
         break;
       case "--upload-dir":
@@ -169,7 +206,7 @@ Options:
   --window-size WIDTHxHEIGHT Set the window size (default: 1920x1080)
   --timezone ZONE            Use an IANA time zone, auto, or system (default: auto)
   --proxy URL                Route browser traffic through a proxy
-  --allowed-host HOST        Allow navigation to a host; repeatable
+  --allowed-host HOST        Allow navigation to a bare host and its subdomains; repeatable
   --max-text-chars N         Set the text and snapshot hard limit (default: 50000)
   --upload-dir PATH          Allow upload_file to read this directory; repeatable
   --allow-eval               Enable the arbitrary JavaScript execution tool

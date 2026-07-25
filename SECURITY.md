@@ -10,6 +10,7 @@ Privately report vulnerabilities that could expose browser data, proxy credentia
 - Do not expose the Chromium DevTools port or this MCP server directly to the public internet.
 - Keep `evaluate` and the native browser agent disabled by default.
 - Treat `--allowed-host` as a top-level navigation guard, not a network egress filter; page assets and subframes may contact other hosts.
+- `--allow-native-agent` forwards `OPENAI_API_KEY` to the browser as a command-line argument, where any local process that can list command lines is able to read it. Use a key scoped to this purpose and revoke it rather than sharing one with other systems, and keep the flag off on multi-user machines.
 - Use a separate, least-privilege browser account with revocable credentials.
 - Require human confirmation before automating purchases, publishing, deletion, or permission changes.
 

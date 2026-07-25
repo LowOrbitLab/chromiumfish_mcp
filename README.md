@@ -67,7 +67,7 @@ Snapshot references, frame-aware interaction, waiting, and the cross-origin chal
 --window-size WIDTHxHEIGHT Set the browser window size
 --timezone ZONE            Use an IANA time zone, auto, or system (default: auto)
 --proxy URL                Route browser traffic through a proxy
---allowed-host HOST        Allow top-level navigation to a host and its subdomains; repeatable
+--allowed-host HOST        Allow top-level navigation to a bare host and its subdomains; repeatable
 --max-text-chars N         Set the hard limit for text and snapshot output
 --upload-dir PATH          Allow upload_file to read this directory; repeatable
 --allow-eval               Enable arbitrary JavaScript execution
@@ -80,7 +80,7 @@ Proxy credentials can be embedded in the proxy URL, but are then exposed in the 
 
 - stdio only — do not expose the Chromium DevTools endpoint to the public internet.
 - `evaluate` and the native agent are disabled by default; enable them only in trusted environments.
-- `--allowed-host example.com` restricts top-level HTTP/HTTPS navigation (redirects, links, form posts, popups) to a host and its subdomains. Third-party subframes and page assets remain reachable — it is a navigation guard, not a network egress filter.
+- `--allowed-host example.com` restricts top-level HTTP/HTTPS navigation (redirects, links, form posts, popups) to a host and its subdomains. Give it a bare host name: matching is on the host alone, so a scheme, path, port, leading dot, or wildcard is rejected at startup rather than quietly matching nothing. Third-party subframes and page assets remain reachable — it is a navigation guard, not a network egress filter.
 - `upload_file` sends host files to whatever origin the page posts to, so it is unregistered until `--upload-dir` names at least one directory, and every path must resolve inside one. Both the path and the roots are resolved through symlinks first, so a link planted inside a root cannot reach outside it. Scope the roots to the files a task actually needs — a page can influence which file the model picks.
 - Clients can click and type with real side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
 - `solve_challenge` returns `ok: true` whenever the page is not blocked, including on pages that were never challenged. Read `challengeObserved`, `interactionPerformed`, and `clearanceVerified` before recording or reporting that a challenge was cleared — `ok` alone will overstate what happened.

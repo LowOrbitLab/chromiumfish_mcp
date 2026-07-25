@@ -21,6 +21,7 @@ import {
   inferWidgetState,
   initialCursorPos,
   isCloudflareFrameUrl,
+  isGateTitle,
   isVerifyingPhase,
   looksCleared,
   snippet,
@@ -1535,9 +1536,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     // Avoid probing challenge-related inputs while still on a CF gate page.
     // A/B: evaluateAll on cf-turnstile-response / cf-chl-widget* before click => 0/3 pass;
     // same click path without the probe => 3/3 pass.
-    if (/just a moment|\u5b89\u5168\u9a8c\u8bc1|checking your browser|performing security verification/i.test(title)) {
-      return "";
-    }
+    if (isGateTitle(title)) return "";
 
     // Prefer a single lightweight read after leaving the gate.
     const value = await page.evaluate(() => {
