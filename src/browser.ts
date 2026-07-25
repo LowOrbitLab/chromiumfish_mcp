@@ -346,6 +346,76 @@ function truncationMarker(elements: number): string {
   return `[Snapshot truncated after ${elements} elements; ${SNAPSHOT_TRUNCATION_MARKER}]`;
 }
 
+/**
+ * The facts snapshot needs from one element, read inside the page.
+ *
+ * Raw facts only: the HTML-to-ARIA mapping lives in aria.ts so it can be unit-tested
+ * without a DOM. Lifted to module scope so a batch hands every element the same function
+ * instead of rebuilding a closure per element, and so snapshot's own budget accounting
+ * stays legible next to it.
+ */
+const snapshotElementInfo = (element: HTMLElement | SVGElement) => {
+  const html = element as HTMLElement;
+  const input = element instanceof HTMLInputElement ? element : undefined;
+  const textarea = element instanceof HTMLTextAreaElement ? element : undefined;
+  const select = element instanceof HTMLSelectElement ? element : undefined;
+  const labels = input?.labels ?? textarea?.labels ?? select?.labels;
+  const type = input?.type.toLowerCase() ?? "";
+  const label = html.getAttribute("aria-label")
+    || labels?.[0]?.textContent
+    || (["button", "submit", "reset"].includes(type) ? input?.value : "")
+    || input?.placeholder
+    || textarea?.placeholder
+    || html.innerText
+    || html.getAttribute("title")
+    || "";
+  const ariaChecked = html.getAttribute("aria-checked");
+  const ariaExpanded = html.getAttribute("aria-expanded");
+  const checked = input && ["checkbox", "radio"].includes(type)
+    ? input.checked
+    : ariaChecked === "true"
+      ? true
+      : ariaChecked === "false"
+        ? false
+        : null;
+  const value = input && !["password", "checkbox", "radio", "file", "button", "submit", "reset"].includes(type)
+    ? input.value
+    : textarea
+      ? textarea.value
+      : null;
+  return {
+    tag: html.tagName.toLowerCase().slice(0, 40),
+    explicitRole: (html.getAttribute("role") ?? "").trim().toLowerCase().slice(0, 40),
+    hasList: Boolean(input?.hasAttribute("list")),
+    multiple: Boolean(select?.multiple),
+    size: select?.size ?? 0,
+    label: label.trim().replace(/\s+/g, " ").slice(0, 120),
+    href: element instanceof HTMLAnchorElement ? element.href.slice(0, 300) : "",
+    disabled: html.getAttribute("aria-disabled") === "true"
+      || ("disabled" in html && Boolean((html as HTMLButtonElement).disabled)),
+    type,
+    value: value?.slice(0, 120) ?? null,
+    passwordSet: type === "password" && Boolean(input?.value),
+    checked,
+    selected: select
+      ? Array.from(select.selectedOptions).map((option) => option.value.slice(0, 120)).slice(0, 20)
+      : [],
+    selectedCount: select?.selectedOptions.length ?? 0,
+    options: select
+      ? Array.from(select.options).slice(0, 20).map((option) => ({
+        value: option.value.slice(0, 120),
+        label: option.label.trim().replace(/\s+/g, " ").slice(0, 80),
+      }))
+      : [],
+    optionCount: select?.options.length ?? 0,
+    expanded: ariaExpanded === "true"
+      ? true
+      : ariaExpanded === "false"
+        ? false
+        : null,
+  };
+};
+
 export function assertNavigationUrl(rawUrl: string, allowedHosts: string[]): URL {
   let url: URL;
   try {
@@ -893,79 +963,25 @@ export class ChromiumFishBrowser implements BrowserApi {
         const visible = await Promise.all(
           batch.map((handle) => handle.isVisible().catch(() => false)),
         );
-        for (let offset = 0; offset < batch.length; offset += 1) {
-          if (!visible[offset]) continue;
+        const candidates = batch.filter((handle, offset) => Boolean(handle && visible[offset]));
+        // One concurrent wave per batch instead of a round trip per element in series. A
+        // 250-element page used to cost 250 sequential CDP calls in the most frequently
+        // called tool on the surface. Each read keeps its own catch, so an element that
+        // detaches mid-read still only costs itself. Reading a few elements the budget then
+        // truncates away is bounded by the batch size and buys no extra round trips.
+        const infos = await Promise.all(
+          candidates.map((handle) => handle.evaluate(snapshotElementInfo).catch(() => null)),
+        );
+
+        for (let offset = 0; offset < candidates.length; offset += 1) {
           if (refs.size >= maxElements) {
             truncated = true;
             break outer;
           }
 
-          const handle = batch[offset];
-          if (!handle) continue;
-          const info = await handle.evaluate((element) => {
-            const html = element as HTMLElement;
-            const input = element instanceof HTMLInputElement ? element : undefined;
-            const textarea = element instanceof HTMLTextAreaElement ? element : undefined;
-            const select = element instanceof HTMLSelectElement ? element : undefined;
-            const labels = input?.labels ?? textarea?.labels ?? select?.labels;
-            const type = input?.type.toLowerCase() ?? "";
-            const label = html.getAttribute("aria-label")
-              || labels?.[0]?.textContent
-              || (["button", "submit", "reset"].includes(type) ? input?.value : "")
-              || input?.placeholder
-              || textarea?.placeholder
-              || html.innerText
-              || html.getAttribute("title")
-              || "";
-            const ariaChecked = html.getAttribute("aria-checked");
-            const ariaExpanded = html.getAttribute("aria-expanded");
-            const checked = input && ["checkbox", "radio"].includes(type)
-              ? input.checked
-              : ariaChecked === "true"
-                ? true
-                : ariaChecked === "false"
-                  ? false
-                  : null;
-            const value = input && !["password", "checkbox", "radio", "file", "button", "submit", "reset"].includes(type)
-              ? input.value
-              : textarea
-                ? textarea.value
-                : null;
-            return {
-              // Raw facts only; the HTML-to-ARIA mapping lives in aria.ts so it can be
-              // unit-tested without a DOM.
-              tag: html.tagName.toLowerCase().slice(0, 40),
-              explicitRole: (html.getAttribute("role") ?? "").trim().toLowerCase().slice(0, 40),
-              hasList: Boolean(input?.hasAttribute("list")),
-              multiple: Boolean(select?.multiple),
-              size: select?.size ?? 0,
-              label: label.trim().replace(/\s+/g, " ").slice(0, 120),
-              href: element instanceof HTMLAnchorElement ? element.href.slice(0, 300) : "",
-              disabled: html.getAttribute("aria-disabled") === "true"
-                || ("disabled" in html && Boolean((html as HTMLButtonElement).disabled)),
-              type,
-              value: value?.slice(0, 120) ?? null,
-              passwordSet: type === "password" && Boolean(input?.value),
-              checked,
-              selected: select
-                ? Array.from(select.selectedOptions).map((option) => option.value.slice(0, 120)).slice(0, 20)
-                : [],
-              selectedCount: select?.selectedOptions.length ?? 0,
-              options: select
-                ? Array.from(select.options).slice(0, 20).map((option) => ({
-                  value: option.value.slice(0, 120),
-                  label: option.label.trim().replace(/\s+/g, " ").slice(0, 80),
-                }))
-                : [],
-              optionCount: select?.options.length ?? 0,
-              expanded: ariaExpanded === "true"
-                ? true
-                : ariaExpanded === "false"
-                  ? false
-                  : null,
-            };
-          }).catch(() => null);
-          if (!info) continue;
+          const handle = candidates[offset];
+          const info = infos[offset];
+          if (!handle || !info) continue;
 
           // Monotonic across every snapshot and page: a number is never reused, so a
           // reference held from an earlier snapshot fails loudly in resolveTarget instead
@@ -1710,6 +1726,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const maxStuckVerifyingRounds = 2;
     /** Latched by observe(): whether a challenge was ever actually seen on this page. */
     let challengeObserved = false;
+    type Observation = Awaited<ReturnType<ChromiumFishBrowser["observeChallenge"]>>;
 
     /**
      * Every observation in this method goes through here so challengeObserved cannot drift
@@ -1722,6 +1739,13 @@ export class ChromiumFishBrowser implements BrowserApi {
       return result;
     };
 
+    /**
+     * `latest` hands over an observation the return site has just taken. Observing costs
+     * four round trips — title, body text, the token field, the frame list — and taken
+     * back to back with no wait in between the second one cannot see anything the first
+     * did not. Return sites that waited or clicked since their last look omit it and get a
+     * fresh read.
+     */
     const finish = async (
       partial: Omit<
         ChallengeSolveResult,
@@ -1731,8 +1755,9 @@ export class ChromiumFishBrowser implements BrowserApi {
         widgetState?: WidgetState;
         tokenPresent?: boolean;
       },
+      latest?: Observation,
     ): Promise<ChallengeSolveResult> => {
-      const observed = await this.observeChallenge(page);
+      const observed = latest ?? await this.observeChallenge(page);
       return {
         ...partial,
         // Derived here rather than passed in. A return site that spelled these out could
@@ -1751,7 +1776,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
 
     const clearanceInput = (
-      observed: Awaited<ReturnType<ChromiumFishBrowser["observeChallenge"]>>,
+      observed: Observation,
       kind: ChallengeKind,
     ) => ({
       title: observed.detection.title,
@@ -1826,7 +1851,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         clicks,
         widgetState: observed.widgetState,
         tokenPresent: observed.tokenPresent,
-      });
+      }, observed);
     }
 
     const kind = observed.kind;
@@ -1845,7 +1870,7 @@ export class ChromiumFishBrowser implements BrowserApi {
           clicks,
           widgetState: observed.widgetState,
           tokenPresent: observed.tokenPresent,
-        });
+        }, observed);
       }
       widget = observed.detection.widget;
     }
@@ -1859,7 +1884,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         clicks,
         reason: "not_found",
         error: "Cross-origin challenge control area not found",
-      });
+      }, observed);
     }
 
     widget = await this.ensureWidgetInViewport(page, widget);
@@ -1963,6 +1988,8 @@ export class ChromiumFishBrowser implements BrowserApi {
       }
     }
 
+    // This observation is the one the verdict below is drawn from, so it is also the one
+    // reported: re-reading in finish would describe a page the verdict never looked at.
     observed = await observe();
     const cleared = looksCleared(clearanceInput(observed, kind));
     if (cleared) {
@@ -1975,7 +2002,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         widget,
         widgetState: observed.widgetState,
         tokenPresent: observed.tokenPresent,
-      });
+      }, observed);
     }
     const stuck = isVerifyingPhase({
       widgetState: observed.widgetState,
@@ -1995,7 +2022,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       error: stuck
         ? "The page remained in the Verifying state too long; stopped clicking"
         : "Could not confirm challenge clearance before the timeout",
-    });
+    }, observed);
   }
 
   async typeText(
