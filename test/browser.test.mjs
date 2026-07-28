@@ -87,6 +87,82 @@ test("closePage selects and reports a remaining page", async () => {
   assert.equal(result.pages[0].current, true);
 });
 
+test("concurrent callers join the browser start already running", async () => {
+  // MCP dispatches tool calls concurrently, so two of them routinely arrive while the
+  // browser is still launching. Each starting its own leaves the loser's browser running
+  // for the life of the process: close() only ever knew about the last one assigned.
+  let starts = 0;
+  const context = { pages: () => [] };
+  const browser = new ChromiumFishBrowser(config);
+  browser.startContext = async () => {
+    starts += 1;
+    await new Promise((resolve) => setImmediate(resolve));
+    browser.browser = { isConnected: () => true };
+    browser.context = context;
+    return context;
+  };
+
+  const [first, second] = await Promise.all([browser.ensureContext(), browser.ensureContext()]);
+  assert.equal(starts, 1);
+  assert.equal(first, context);
+  assert.equal(second, context);
+
+  // A failed start must not be cached, or one bad launch would poison every later call.
+  const failing = new ChromiumFishBrowser(config);
+  let attempts = 0;
+  failing.startContext = async () => {
+    attempts += 1;
+    throw new Error("browser executable is missing");
+  };
+  await assert.rejects(failing.ensureContext(), /executable is missing/);
+  await assert.rejects(failing.ensureContext(), /executable is missing/);
+  assert.equal(attempts, 2);
+});
+
+test("concurrent callers do not each open a tab", async () => {
+  // A freshly created context has no pages, so both callers would find nothing to reuse.
+  let opened = 0;
+  const browser = new ChromiumFishBrowser(config);
+  browser.browser = { isConnected: () => true };
+  browser.context = {
+    pages: () => [],
+    newPage: async () => {
+      opened += 1;
+      await new Promise((resolve) => setImmediate(resolve));
+      return { isClosed: () => false, once: () => undefined };
+    },
+  };
+
+  const [first, second] = await Promise.all([browser.page(), browser.page()]);
+  assert.equal(opened, 1);
+  assert.equal(first, second);
+});
+
+test("tracking a page again does not stack close listeners", async () => {
+  // page() re-tracks a tab it falls back to after the current one closed, and every extra
+  // registration is one more listener on the same event.
+  let listeners = 0;
+  const page = { once: () => { listeners += 1; }, isClosed: () => false };
+  const browser = new ChromiumFishBrowser(config);
+  browser.trackPage(page);
+  browser.trackPage(page);
+  assert.equal(listeners, 1);
+});
+
+test("--chrome-path rejects the options only the upstream launcher can honor", async () => {
+  // Both would otherwise be dropped on the floor: the local executable is the build that
+  // runs, and it cannot resolve "auto" either. process.execPath just has to exist.
+  const local = { ...config, chromePath: process.execPath };
+  await assert.rejects(
+    new ChromiumFishBrowser({ ...local, timezone: "auto" }).ensureContext(),
+    /--timezone auto/,
+  );
+  await assert.rejects(
+    new ChromiumFishBrowser({ ...local, browserVersion: "1.2.3" }).ensureContext(),
+    /--browser-version/,
+  );
+});
+
 test("navigation guard blocks disallowed top-level requests only", async () => {
   const browser = new ChromiumFishBrowser({ ...config, allowedHosts: ["example.com"] });
   let handler;
@@ -1440,6 +1516,68 @@ test("snapshot and get_text retry a read the committing navigation destroyed", a
   attempts = 0;
   assert.equal(await browser.getText({ selector: "body" }), "Account: Rebecka");
   assert.equal(attempts, 2);
+});
+
+test("snapshot re-scans a document that went away between its element reads", async () => {
+  // readThroughNavigation covers the element query; these reads happen after it, and each
+  // swallows its own error so one detached element costs only itself. A navigation fails
+  // all of them at once, and the scan would otherwise report an empty page as an answer.
+  const race = "Execution context was destroyed, most likely because of a navigation";
+  const disposed = [];
+  let scans = 0;
+  let settled = 0;
+  const handle = (id) => ({
+    isVisible: async () => {
+      if (scans === 1) throw new Error(race);
+      return true;
+    },
+    evaluate: async () => ({
+      tag: "button",
+      explicitRole: "",
+      hasList: false,
+      multiple: false,
+      size: 0,
+      label: "Continue",
+      href: "",
+      disabled: false,
+      type: "",
+      value: null,
+      passwordSet: false,
+      checked: null,
+      selected: [],
+      selectedCount: 0,
+      options: [],
+      optionCount: 0,
+      expanded: null,
+    }),
+    dispose: async () => disposed.push(id),
+  });
+  const main = {
+    url: () => "https://example.com/",
+    name: () => "",
+    parentFrame: () => null,
+    locator: () => ({
+      elementHandles: async () => {
+        scans += 1;
+        return [handle(scans)];
+      },
+    }),
+  };
+  const page = {
+    frames: () => [main],
+    mainFrame: () => main,
+    ...NO_NAV,
+    waitForLoadState: async () => { settled += 1; },
+  };
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+
+  const result = await browser.snapshot();
+  assert.match(result, /^\[e1\] button "Continue"$/);
+  assert.equal(scans, 2, "the raced scan describes a document that is gone");
+  assert.equal(settled, 1, "the retry waits for the new document first");
+  // The abandoned scan's handle is released; only the one backing e1 is still held.
+  assert.deepEqual(disposed, [1]);
 });
 
 test("a read failure that is not a navigation race still surfaces", async () => {

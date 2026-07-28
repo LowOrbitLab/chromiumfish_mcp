@@ -62,7 +62,7 @@ Snapshot references, frame-aware interaction, waiting, and the cross-origin chal
 ```text
 --persona-seed VALUE       Use a stable browser fingerprint persona
 --chrome-path PATH         Use a local ChromiumFish executable
---browser-version VERSION  Select an upstream ChromiumFish build version
+--browser-version VERSION  Select an upstream ChromiumFish build version (rejected with --chrome-path)
 --headed                   Show the browser window
 --window-size WIDTHxHEIGHT Set the browser window size
 --timezone ZONE            Use an IANA time zone, auto, or system (default: auto)

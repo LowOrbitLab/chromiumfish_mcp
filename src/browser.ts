@@ -14,6 +14,7 @@ import type {
 } from "playwright-core";
 import { chromium } from "playwright-core";
 import { snapshotRole } from "./aria.js";
+import { SNAPSHOT_CHARS, SNAPSHOT_ELEMENTS, TEXT_CHARS } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import {
   checkboxClickCandidates,
@@ -271,10 +272,6 @@ const INTERACTIVE_SELECTOR = [
   "[contenteditable=true]",
 ].join(",");
 
-const DEFAULT_SNAPSHOT_ELEMENTS = 100;
-const MAX_SNAPSHOT_ELEMENTS = 250;
-const DEFAULT_SNAPSHOT_CHARS = 20_000;
-const MIN_SNAPSHOT_CHARS = 5_000;
 const HANDLE_BATCH_SIZE = 32;
 const MAX_SCREENSHOT_PIXELS = 25_000_000;
 const MAX_SCREENSHOT_DIMENSION = 20_000;
@@ -492,12 +489,22 @@ export class ChromiumFishBrowser implements BrowserApi {
   private nextPageId = 1;
   private readonly frameIds = new WeakMap<Frame, string>();
   private nextFrameId = 1;
+  /** Pages already carrying the close listener, so trackPage cannot stack duplicates. */
+  private readonly trackedPages = new WeakSet<Page>();
   private readonly refs = new WeakMap<Page, Map<string, InteractiveHandle>>();
   /** Never reset, not even per page: reusing a number would make a stale ref resolve silently. */
   private nextRefId = 1;
   private readonly mousePositions = new WeakMap<Page, { x: number; y: number }>();
   /** Prevent concurrent solve_challenge runs from fighting over the same mouse. */
   private solveChallengeInFlight = false;
+  /**
+   * Browser start and page acquisition in flight, so concurrent tool calls join the one
+   * already running instead of each starting its own. MCP dispatches tool calls
+   * concurrently — the SDK does not await one handler before reading the next request — so
+   * two of them routinely arrive while the browser is still launching.
+   */
+  private contextStart?: Promise<BrowserContext>;
+  private pageStart?: Promise<Page>;
 
   constructor(private readonly config: ServerConfig) {}
 
@@ -511,8 +518,21 @@ export class ChromiumFishBrowser implements BrowserApi {
     ];
   }
 
+  /**
+   * Latch the launch so two callers share one browser. Without it the second call to arrive
+   * during a launch starts a browser of its own; the later assignment wins and the earlier
+   * browser is never closed, since close() only knows about this.browser. A failed start
+   * clears the latch, so the next call retries rather than joining a rejected promise.
+   */
   private async ensureContext(): Promise<BrowserContext> {
     if (this.context && this.browser?.isConnected()) return this.context;
+    this.contextStart ??= this.startContext().finally(() => {
+      this.contextStart = undefined;
+    });
+    return this.contextStart;
+  }
+
+  private async startContext(): Promise<BrowserContext> {
     const nativeAgentArgs = this.nativeAgentArgs();
     if (this.config.chromePath) {
       if (!existsSync(this.config.chromePath)) {
@@ -520,6 +540,13 @@ export class ChromiumFishBrowser implements BrowserApi {
       }
       if (this.config.timezone === "auto") {
         throw new Error("--chrome-path does not support --timezone auto; specify an IANA time zone or system");
+      }
+      // Only the upstream helper below selects a build; a local executable *is* the build.
+      // Ignoring the flag silently would launch a version the caller did not ask for.
+      if (this.config.browserVersion) {
+        throw new Error(
+          "--chrome-path does not support --browser-version; the local executable is the build that runs",
+        );
       }
       const env = this.config.timezone
         ? { ...(process.env as Record<string, string>), TZ: this.config.timezone }
@@ -584,6 +611,12 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   private trackPage(page: Page): void {
     this.pageId(page);
+    // page() re-tracks a tab it falls back to after the current one closed, so this runs
+    // more than once for the same page and would otherwise stack a close listener each
+    // time, up to Node's MaxListenersExceededWarning. pageIds cannot serve as the marker:
+    // listPages, selectPage, and closePage assign ids while scanning without tracking.
+    if (this.trackedPages.has(page)) return;
+    this.trackedPages.add(page);
     page.once("close", () => {
       void this.clearRefs(page);
       if (this.currentPage === page) this.currentPage = undefined;
@@ -634,8 +667,21 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
   }
 
+  /**
+   * Latched for the same reason as ensureContext: a fresh context has no pages, so two
+   * concurrent tool calls would each open one and leave a stray tab behind.
+   */
   private async page(): Promise<Page> {
+    if (this.currentPage && !this.currentPage.isClosed()) return this.currentPage;
+    this.pageStart ??= this.startPage().finally(() => {
+      this.pageStart = undefined;
+    });
+    return this.pageStart;
+  }
+
+  private async startPage(): Promise<Page> {
     const context = await this.ensureContext();
+    // Re-checked after the await: openPage may have selected one while the browser started.
     if (this.currentPage && !this.currentPage.isClosed()) return this.currentPage;
     const existing = context.pages().find((page) => !page.isClosed());
     if (existing) {
@@ -927,8 +973,29 @@ export class ChromiumFishBrowser implements BrowserApi {
     }
   }
 
+  /**
+   * readThroughNavigation covers the element query, but the per-element reads below it are
+   * the long part of the call, and each swallows its own error so one detached element
+   * costs only itself. A navigation committing mid-scan fails every one of them at once,
+   * and the scan would then report "(No visible interactive elements)" for a page full of
+   * them — a result that reads as an answer. So a scan that saw the document go away is
+   * thrown out and taken again against the document that replaced it.
+   */
   async snapshot(options: SnapshotOptions = {}): Promise<string> {
     const page = await this.page();
+    const first = await this.snapshotOnce(page, options);
+    if (!first.raced) return first.text;
+    await page.waitForLoadState("domcontentloaded", { timeout: ACTION_LOAD_TIMEOUT_MS })
+      .catch(() => undefined);
+    return (await this.snapshotOnce(page, options)).text;
+  }
+
+  private async snapshotOnce(
+    page: Page,
+    options: SnapshotOptions,
+  ): Promise<{ text: string; raced: boolean }> {
+    // Here rather than in snapshot(), so a retry releases the handles the first scan
+    // retained instead of abandoning them.
     await this.clearRefs(page);
     const frame = this.resolveFrame(page, options.frameId);
     const locator = options.scope
@@ -940,16 +1007,25 @@ export class ChromiumFishBrowser implements BrowserApi {
     );
     const maxElements = clampInteger(
       options.maxElements,
-      DEFAULT_SNAPSHOT_ELEMENTS,
-      1,
-      MAX_SNAPSHOT_ELEMENTS,
+      SNAPSHOT_ELEMENTS.default,
+      SNAPSHOT_ELEMENTS.min,
+      SNAPSHOT_ELEMENTS.max,
     );
     const maxChars = clampInteger(
       options.maxChars,
-      DEFAULT_SNAPSHOT_CHARS,
-      MIN_SNAPSHOT_CHARS,
+      SNAPSHOT_CHARS.default,
+      SNAPSHOT_CHARS.min,
       this.config.maxTextChars,
     );
+    /**
+     * Set when a read failed because the document went away. Every handle in one scan
+     * belongs to a single frame — locators do not descend into iframes — so one element
+     * reporting the race means the whole scan is describing a document that is gone.
+     */
+    let raced = false;
+    const noteRace = (error: unknown): void => {
+      if (isNavigationRace(error)) raced = true;
+    };
     const refs = new Map<string, InteractiveHandle>();
     const retained = new Set<InteractiveHandle>();
     /** Committed lines, each paired with what dropping it again would have to release. */
@@ -962,7 +1038,10 @@ export class ChromiumFishBrowser implements BrowserApi {
       outer: for (let start = 0; start < handles.length; start += HANDLE_BATCH_SIZE) {
         const batch = handles.slice(start, start + HANDLE_BATCH_SIZE);
         const visible = await Promise.all(
-          batch.map((handle) => handle.isVisible().catch(() => false)),
+          batch.map((handle) => handle.isVisible().catch((error: unknown) => {
+            noteRace(error);
+            return false;
+          })),
         );
         const candidates = batch.filter((handle, offset) => Boolean(handle && visible[offset]));
         // One concurrent wave per batch instead of a round trip per element in series. A
@@ -971,7 +1050,10 @@ export class ChromiumFishBrowser implements BrowserApi {
         // detaches mid-read still only costs itself. Reading a few elements the budget then
         // truncates away is bounded by the batch size and buys no extra round trips.
         const infos = await Promise.all(
-          candidates.map((handle) => handle.evaluate(snapshotElementInfo).catch(() => null)),
+          candidates.map((handle) => handle.evaluate(snapshotElementInfo).catch((error: unknown) => {
+            noteRace(error);
+            return null;
+          })),
         );
 
         for (let offset = 0; offset < candidates.length; offset += 1) {
@@ -1037,9 +1119,12 @@ export class ChromiumFishBrowser implements BrowserApi {
         : truncationMarker(0));
       if (!truncated) {
         // Per-line accounting already kept the body within maxChars.
-        return printed.length > 0
-          ? printed.map((entry) => entry.text).join("\n")
-          : "(No visible interactive elements)";
+        return {
+          text: printed.length > 0
+            ? printed.map((entry) => entry.text).join("\n")
+            : "(No visible interactive elements)",
+          raced,
+        };
       }
       // Append the marker and, if the body is still char-bound, drop trailing lines so the
       // marker survives the budget instead of being clipped away. Dropping a line releases
@@ -1054,7 +1139,7 @@ export class ChromiumFishBrowser implements BrowserApi {
         }
         output = render();
       }
-      return output;
+      return { text: output, raced };
     } finally {
       await this.disposeHandles(
         handles.filter((handle) => !completed || !retained.has(handle)),
@@ -1074,7 +1159,12 @@ export class ChromiumFishBrowser implements BrowserApi {
       // No body text is a valid answer for the default scope, but the retry has to run
       // first: catching here directly would turn a navigation race into a silent "".
       : await this.readThroughNavigation(page, read).catch(() => "");
-    const maxChars = clampInteger(options.maxChars, DEFAULT_SNAPSHOT_CHARS, 100, this.config.maxTextChars);
+    const maxChars = clampInteger(
+      options.maxChars,
+      TEXT_CHARS.default,
+      TEXT_CHARS.min,
+      this.config.maxTextChars,
+    );
     return clip(text, maxChars);
   }
 

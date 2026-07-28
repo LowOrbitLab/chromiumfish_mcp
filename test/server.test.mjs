@@ -229,6 +229,29 @@ test("solve_challenge forwards the same defaults the solver falls back to", asyn
   assert.deepEqual(browser.calls[0], ["solveChallenge", { timeoutMs: 45_000, maxClicks: 6 }]);
 });
 
+test("snapshot and get_text forward the same bounds the browser falls back to", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  await client.callTool({ name: "snapshot", arguments: {} });
+  await client.callTool({ name: "get_text", arguments: {} });
+  // Both sides read SNAPSHOT_ELEMENTS / SNAPSHOT_CHARS / TEXT_CHARS, so a schema default
+  // cannot drift away from the clamp ChromiumFishBrowser applies to the same argument.
+  assert.deepEqual(browser.calls[0], ["snapshot", {
+    frameId: undefined,
+    scope: undefined,
+    maxElements: 100,
+    maxChars: 20_000,
+  }]);
+  assert.deepEqual(browser.calls[1], ["getText", {
+    frameId: undefined,
+    selector: undefined,
+    maxChars: 20_000,
+  }]);
+});
+
 test("list_frames supports includeBox", async (context) => {
   const { client, server } = await connectedClient();
   context.after(async () => {

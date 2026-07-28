@@ -3,6 +3,19 @@ import type { LaunchOptions } from "playwright-core";
 
 export const VERSION = "0.4.0";
 
+/**
+ * Bounds for snapshot and get_text output, shared by the tool schemas in server.ts and the
+ * clamps in browser.ts. Same reason SOLVE_TIMEOUT_MS / SOLVE_MAX_CLICKS live in turnstile.ts:
+ * the two sides have to agree, and writing the numbers twice is how solve_challenge's click
+ * budget drifted (schema 6, solver 12) with neither number written down anywhere.
+ *
+ * `max` bounds the tool schema; the browser clamps again by the server-wide --max-text-chars,
+ * so a direct BrowserApi caller is limited by that rather than by the number here.
+ */
+export const SNAPSHOT_ELEMENTS = { min: 1, max: 250, default: 100 } as const;
+export const SNAPSHOT_CHARS = { min: 5_000, max: 50_000, default: 20_000 } as const;
+export const TEXT_CHARS = { min: 100, max: 100_000, default: 20_000 } as const;
+
 export interface ServerConfig {
   personaSeed?: string;
   chromePath?: string;
@@ -201,7 +214,7 @@ Usage:
 Options:
   --persona-seed VALUE       Use a stable browser fingerprint persona
   --chrome-path PATH         Use a local ChromiumFish executable
-  --browser-version VERSION  Select an upstream browser build
+  --browser-version VERSION  Select an upstream browser build (not with --chrome-path)
   --headed                   Show the browser window (default: headless)
   --window-size WIDTHxHEIGHT Set the window size (default: 1920x1080)
   --timezone ZONE            Use an IANA time zone, auto, or system (default: auto)

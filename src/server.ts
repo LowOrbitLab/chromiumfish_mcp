@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { BrowserApi } from "./browser.js";
 import type { ServerConfig } from "./config.js";
-import { VERSION } from "./config.js";
+import { SNAPSHOT_CHARS, SNAPSHOT_ELEMENTS, TEXT_CHARS, VERSION } from "./config.js";
 // turnstile.ts is a pure module with no Playwright imports, so depending on it here keeps
 // the browser-free testability this file relies on.
 import { SOLVE_MAX_CLICKS, SOLVE_TIMEOUT_MS } from "./turnstile.js";
@@ -244,8 +244,10 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {
         frameId: z.string().min(1).optional(),
         scope: z.string().min(1).optional(),
-        maxElements: z.number().int().min(1).max(250).default(100),
-        maxChars: z.number().int().min(5_000).max(50_000).default(20_000),
+        maxElements: z.number().int()
+          .min(SNAPSHOT_ELEMENTS.min).max(SNAPSHOT_ELEMENTS.max).default(SNAPSHOT_ELEMENTS.default),
+        maxChars: z.number().int()
+          .min(SNAPSHOT_CHARS.min).max(SNAPSHOT_CHARS.max).default(SNAPSHOT_CHARS.default),
       },
       annotations: READ_ONLY,
     },
@@ -264,7 +266,8 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
       inputSchema: {
         frameId: z.string().min(1).optional(),
         selector: z.string().min(1).optional(),
-        maxChars: z.number().int().min(100).max(100_000).default(20_000),
+        maxChars: z.number().int()
+          .min(TEXT_CHARS.min).max(TEXT_CHARS.max).default(TEXT_CHARS.default),
       },
       annotations: READ_ONLY,
     },
