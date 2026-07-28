@@ -105,6 +105,20 @@ function fakeBrowser() {
         box: { x: 0, y: 0, width: 100, height: 100 },
       }];
     },
+    handleDialog: async (accept, promptText) => {
+      calls.push(["handleDialog", accept, promptText]);
+      return { pageId: "page-1", accept, ...(promptText === undefined ? {} : { promptText }) };
+    },
+    listDownloads: async () => {
+      calls.push(["listDownloads"]);
+      return [{
+        url: "https://example.com/report.pdf",
+        suggestedFilename: "report.pdf",
+        file: "report.pdf",
+        bytes: 2048,
+        state: "saved",
+      }];
+    },
     findChallenge: async () => ({
       present: false,
       kind: "none",
@@ -182,6 +196,7 @@ test("default tool set has a stable annotated contract", async (context) => {
     "click_at",
     "drag",
     "list_frames",
+    "handle_dialog",
     "find_challenge",
     "solve_challenge",
     "type_text",
@@ -395,6 +410,52 @@ test("registers dangerous tools when explicitly enabled", async (context) => {
   const names = (await client.listTools()).tools.map((tool) => tool.name);
   assert.ok(names.includes("evaluate"));
   assert.ok(names.includes("run_task"));
+});
+
+test("handle_dialog forwards the armed answer", async (context) => {
+  const { browser, client, server } = await connectedClient();
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const accepted = await client.callTool({
+    name: "handle_dialog",
+    arguments: { accept: true, promptText: "Rebecka" },
+  });
+  assert.equal(accepted.structuredContent.accept, true);
+  assert.equal(accepted.structuredContent.promptText, "Rebecka");
+  assert.deepEqual(browser.calls[0], ["handleDialog", true, "Rebecka"]);
+
+  await client.callTool({ name: "handle_dialog", arguments: { accept: false } });
+  assert.deepEqual(browser.calls[1], ["handleDialog", false, undefined]);
+});
+
+test("list_downloads is registered only once --download-dir is set", async (context) => {
+  const { client: bare, server: bareServer } = await connectedClient();
+  context.after(async () => {
+    await bare.close();
+    await bareServer.close();
+  });
+  const withoutDir = (await bare.listTools()).tools.map((tool) => tool.name);
+  assert.ok(!withoutDir.includes("list_downloads"));
+
+  const { client, server } = await connectedClient({ downloadDir: "/tmp/downloads" });
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  const names = (await client.listTools()).tools.map((tool) => tool.name);
+  assert.ok(names.includes("list_downloads"));
+
+  const result = await client.callTool({ name: "list_downloads", arguments: {} });
+  assert.deepEqual(result.structuredContent.downloads, [{
+    url: "https://example.com/report.pdf",
+    suggestedFilename: "report.pdf",
+    file: "report.pdf",
+    bytes: 2048,
+    state: "saved",
+  }]);
 });
 
 test("upload_file is registered and forwards its arguments once --upload-dir is set", async (context) => {

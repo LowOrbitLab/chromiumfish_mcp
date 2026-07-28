@@ -30,6 +30,11 @@ export interface ServerConfig {
   allowedHosts: string[];
   /** Absolute directories upload_file may read from; empty leaves the tool unregistered. */
   uploadDirs: string[];
+  /**
+   * Absolute directory downloads are saved into. Unset discards them instead: the browser
+   * still accepts the transfer, so the page's own flow is unchanged, but nothing is kept.
+   */
+  downloadDir?: string;
 }
 
 export interface ParsedCli {
@@ -185,6 +190,12 @@ export function parseCli(argv: string[]): ParsedCli {
         config.allowedHosts.push(parseAllowedHost(readValue(argv, index, arg)));
         index += 1;
         break;
+      case "--download-dir":
+        // One destination, not a list: uploads pick a file out of any allowed root, but a
+        // download has to land somewhere specific, and several roots would only be ambiguous.
+        config.downloadDir = resolve(readValue(argv, index, arg));
+        index += 1;
+        break;
       case "--upload-dir":
         // Absolute here so the root does not move with the process working directory;
         // symlinks stay unresolved until upload time, where the file is realpath'd too.
@@ -222,6 +233,7 @@ Options:
   --allowed-host HOST        Allow navigation to a bare host and its subdomains; repeatable
   --max-text-chars N         Set the text and snapshot hard limit (default: 50000)
   --upload-dir PATH          Allow upload_file to read this directory; repeatable
+  --download-dir PATH        Save downloads here; without it they are discarded
   --allow-eval               Enable the arbitrary JavaScript execution tool
   --allow-native-agent       Enable the native browser agent tool
   --help                     Show help

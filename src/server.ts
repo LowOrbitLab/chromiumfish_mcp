@@ -73,12 +73,26 @@ Action results
   true or the part of the DOM you need has changed.
 - navigate, navigate_back, navigate_forward, and reload always report navigated: true.
   They invalidate refs even when the URL is unchanged, so always re-snapshot after one.
+- Those four also report the HTTP status. A 404 or a 500 loads like any other page and many
+  sites answer both with something that reads like content, so check status before treating
+  the body as the page you asked for.
 - navigationPending: true means the action started a navigation that had not landed yet, so
   url and title still describe the page being left. The action itself worked - wait_for the
   destination rather than repeating it, which on a login or a purchase would submit twice.
 - Pass returnSnapshot: true to get the action result and a fresh snapshot in one call.
 - newPages lists tabs the action opened. The current page never switches automatically;
   use select_page to move to one.
+
+Dialogs and downloads
+- A JavaScript dialog is answered the instant it opens: a page left waiting on one freezes,
+  and no later tool call would finish. Unarmed, the answer is dismiss - so a click that
+  raised confirm("Delete?") did NOT delete. Action results list what opened in dialogs;
+  read it before concluding an action took effect.
+- To accept one, call handle_dialog and then repeat the action. It arms the next dialog;
+  it cannot change an answer already given.
+- Downloads appear in downloads on the action result. They are kept only when the server
+  was started with --download-dir, and report state: "discarded" otherwise. A large file is
+  still "pending" when the action returns - call list_downloads to see it settle.
 
 Challenges
 - On Cloudflare or "Just a moment" pages call find_challenge, then solve_challenge.
@@ -389,6 +403,26 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   server.registerTool(
+    "handle_dialog",
+    {
+      description:
+        "Arm the answer for the next JavaScript dialog (alert, confirm, prompt, beforeunload) "
+        + "on the current page. Dialogs are answered the instant they open, because a page "
+        + "waiting on one freezes and no later call could finish — so this is set before the "
+        + "action that raises one, not after. Left unarmed, a dialog is dismissed, and the "
+        + "action result reports it under dialogs so a click that only raised a confirm is not "
+        + "mistaken for one that went through.",
+      inputSchema: {
+        accept: z.boolean(),
+        promptText: z.string().max(1_000).optional()
+          .describe("Text to enter when accepting a prompt; ignored for other dialog types."),
+      },
+      annotations: IDEMPOTENT_MUTATION,
+    },
+    async ({ accept, promptText }) => structured(await browser.handleDialog(accept, promptText)),
+  );
+
+  server.registerTool(
     "find_challenge",
     {
       description:
@@ -549,6 +583,23 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         ...await browser.uploadFile(target, paths, frameId, { returnSnapshot }),
         target,
       }),
+    );
+  }
+
+  if (config.downloadDir) {
+    server.registerTool(
+      "list_downloads",
+      {
+        description:
+          "List the downloads this session started: the name actually written, its size, and "
+          + "state (saved, pending, failed). A large transfer is still pending when the action "
+          + "that started it returns, so call this again to see it settle. Registered only when "
+          + "--download-dir is set; without it downloads are reported on the action result as "
+          + "discarded and nothing is written.",
+        inputSchema: {},
+        annotations: READ_ONLY,
+      },
+      async () => structured({ downloads: await browser.listDownloads() }),
     );
   }
 

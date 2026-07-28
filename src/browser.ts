@@ -1,16 +1,18 @@
 import { existsSync } from "node:fs";
 import type { Stats } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, relative } from "node:path";
+import { mkdir, realpath, stat } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { buildArgs, ChromiumFish } from "chromiumfish";
 import type {
   Browser,
   BrowserContext,
   CDPSession,
+  Download,
   ElementHandle,
   Frame,
   Page,
   Request as PlaywrightRequest,
+  Response as PlaywrightResponse,
 } from "playwright-core";
 import { chromium } from "playwright-core";
 import { snapshotRole } from "./aria.js";
@@ -51,6 +53,36 @@ export interface PageSummary {
   current: boolean;
   title: string;
   url: string;
+  /** HTTP status of the document, when this summary came from opening a URL. */
+  status?: number;
+}
+
+/**
+ * A JavaScript dialog that opened and was answered. Dialogs are answered the moment they
+ * open — Playwright freezes the page until a listener responds, so holding one open would
+ * hang every later call — which makes this a record of what happened, not a prompt.
+ */
+export interface DialogRecord {
+  type: string;
+  message: string;
+  /** True when the dialog was accepted; false when dismissed (cancel). */
+  accepted: boolean;
+  /** Text supplied to a prompt, when one was accepted with a value. */
+  promptText?: string;
+}
+
+export type DownloadState = "saved" | "pending" | "failed" | "discarded";
+
+export interface DownloadRecord {
+  url: string;
+  /** The name the server suggested, before it was made safe to write. */
+  suggestedFilename: string;
+  /** Base name actually written. Absent while pending, or when nothing was kept. */
+  file?: string;
+  bytes?: number;
+  state: DownloadState;
+  /** Why a download failed, or why it was not kept. */
+  error?: string;
 }
 
 /** Shared options for tools that change page state. */
@@ -84,6 +116,22 @@ export interface ActionResult {
    * wait_for the destination rather than treating it as a no-op or retrying the action.
    */
   navigationPending?: boolean;
+  /**
+   * HTTP status of the document this action loaded. Only the navigation tools carry one:
+   * they hold the response object. A 404 or a 500 loads like any other page, so without
+   * this an error page reads as a successful navigation.
+   */
+  status?: number;
+  /**
+   * Dialogs that opened during the action, already answered. An unarmed confirm is
+   * dismissed, so a click that raised one did *not* do what the button said — read this
+   * before concluding the action took effect. Use handle_dialog to answer the next one.
+   */
+  dialogs?: DialogRecord[];
+  /** Dialogs beyond the reported ones; a page looping alert() is the usual cause. */
+  dialogsOmitted?: number;
+  /** Downloads the action started. State may still be pending; list_downloads settles it. */
+  downloads?: DownloadRecord[];
   snapshot?: string;
 }
 
@@ -108,6 +156,13 @@ export interface UploadFileResult extends ActionResult {
 export interface PageListResult {
   running: boolean;
   pages: PageSummary[];
+}
+
+/** Confirmation that the next dialog's answer is armed, and on which page. */
+export interface DialogArmed {
+  pageId: string;
+  accept: boolean;
+  promptText?: string;
 }
 
 export interface NativeTaskResult {
@@ -231,6 +286,8 @@ export interface BrowserApi {
     options?: ActionOptions,
   ): Promise<DragResult>;
   listFrames(options?: { includeBox?: boolean }): Promise<FrameSummary[]>;
+  handleDialog(accept: boolean, promptText?: string): Promise<DialogArmed>;
+  listDownloads(): Promise<DownloadRecord[]>;
   findChallenge(): Promise<ChallengeDetection>;
   solveChallenge(options?: ChallengeSolveOptions): Promise<ChallengeSolveResult>;
   typeText(
@@ -296,6 +353,25 @@ const ACTION_LOAD_TIMEOUT_MS = 2_000;
  */
 const ACTION_NAV_COMMIT_TIMEOUT_MS = 10_000;
 
+/** How many dialogs one action reports before it starts counting them instead. */
+const MAX_REPORTED_DIALOGS = 5;
+/** Dialog message text kept per record; a page can put a novel in one. */
+const MAX_DIALOG_MESSAGE = 300;
+/** Cap on the session download log, so a page downloading in a loop cannot grow it forever. */
+const MAX_DOWNLOAD_LOG = 100;
+
+/**
+ * Collects what a page did to itself while one action was running. Dialogs and downloads
+ * arrive on context events with no tie to the call that caused them, so an open window is
+ * how a result learns that its own click raised a confirm.
+ */
+interface SideEffectSink {
+  page: Page;
+  dialogs: DialogRecord[];
+  dialogCount: number;
+  downloads: DownloadRecord[];
+}
+
 /** Page state captured before an action so the result can report what changed. */
 interface ActionBaseline {
   url: string;
@@ -304,6 +380,8 @@ interface ActionBaseline {
   committed: Promise<void>;
   /** A top-level navigation has been requested but has not committed yet. */
   pending: () => boolean;
+  /** Dialogs answered and downloads started while this window was open. */
+  sink: SideEffectSink;
   /** Detaches the listeners; every actionResult must call it. */
   release: () => void;
 }
@@ -481,6 +559,52 @@ export async function assertUploadPath(
   );
 }
 
+/**
+ * Reduce a server-suggested download name to something safe to write.
+ *
+ * suggestedFilename derives from the remote origin's Content-Disposition, so its content is
+ * chosen by whoever the page decided to fetch from. Chromium does normalize it first —
+ * measured against a server sending `../../../evil:name.pdf`, what arrives here is already
+ * `_.._.._evil_name.pdf` — but that is Chromium's behavior, not a guarantee Playwright
+ * makes, and its own docs only say the name is "typically computed by the browser". A
+ * download name that reaches the filesystem unchecked is not the place to inherit someone
+ * else's invariant.
+ *
+ * Both separators are stripped regardless of host platform, since the name travels from a
+ * Linux server to a Windows disk as easily as the reverse, and what survives is filtered to
+ * a conservative allowed set rather than checked against a list of known-bad characters.
+ *
+ * The caller still confirms the resolved path sits inside the download root: this function
+ * is the first of two checks, not the only one.
+ */
+export function safeDownloadName(suggested: string): string {
+  const base = suggested.split(/[/\\]/).pop() ?? "";
+  const cleaned = base
+    // Control characters, the set Windows forbids outright, and anything else exotic.
+    .replace(/[ -<>:"|?*]/g, "")
+    // Leading dots would hide the file; trailing dots and spaces are dropped by Windows
+    // anyway, which would silently change the name out from under the reported one.
+    .replace(/^[.\s]+/, "")
+    .replace(/[.\s]+$/, "")
+    .slice(0, 100);
+  if (!cleaned) return "download";
+  // CON.txt still resolves to the console device on Windows, extension and all.
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(cleaned)) return `download-${cleaned}`;
+  return cleaned;
+}
+
+/** First free name in dir: "report.pdf", then "report (2).pdf", and so on. */
+async function uniqueDownloadPath(dir: string, name: string): Promise<string> {
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const extension = dot > 0 ? name.slice(dot) : "";
+  for (let index = 1; index < 1_000; index += 1) {
+    const candidate = join(dir, index === 1 ? name : `${stem} (${index})${extension}`);
+    if (!existsSync(candidate)) return candidate;
+  }
+  throw new Error(`Too many downloads already named ${name}`);
+}
+
 export class ChromiumFishBrowser implements BrowserApi {
   private browser?: Browser;
   private context?: BrowserContext;
@@ -505,6 +629,12 @@ export class ChromiumFishBrowser implements BrowserApi {
    */
   private contextStart?: Promise<BrowserContext>;
   private pageStart?: Promise<Page>;
+  /** Answer armed by handle_dialog for the next dialog on that page; consumed once. */
+  private readonly armedDialogs = new WeakMap<Page, { accept: boolean; promptText?: string }>();
+  /** Active action windows collecting what happened while they are open. */
+  private readonly sideEffectSinks = new Set<SideEffectSink>();
+  /** Everything downloaded this session, newest last. */
+  private readonly downloadLog: DownloadRecord[] = [];
 
   constructor(private readonly config: ServerConfig) {}
 
@@ -583,8 +713,147 @@ export class ChromiumFishBrowser implements BrowserApi {
     // without it playwright-core would wait forever. Navigation keeps a looser bound.
     this.context.setDefaultTimeout(LOCATOR_TIMEOUT_MS);
     this.context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+    // Both are registered unconditionally. The dialog listener has to be, or Playwright
+    // goes on silently dismissing; the download listener has to be, or a discarded
+    // download is never reported as having happened at all.
+    this.installDialogHandler(this.context);
+    this.installDownloadHandler(this.context);
     await this.installNavigationGuard(this.context);
     return this.context;
+  }
+
+  /**
+   * Answer every JavaScript dialog the moment it opens, and record what was answered.
+   *
+   * Playwright dismisses dialogs only while nothing is listening; the instant a listener
+   * exists it owns the response, and a listener that returns without answering freezes the
+   * page — "actions like click will never finish", per its own docs. So this never awaits
+   * anything before responding and never throws: the fallback dismiss below runs even if
+   * reading the dialog's own fields fails.
+   *
+   * The default answer is dismiss, which is what an unlistened dialog already got, so
+   * nothing about page behavior changes here. What changes is that the answer is now
+   * reported: a confirm() dismissed behind a click means the click did not do what its
+   * label said, and that used to surface as an ordinary successful action.
+   */
+  private installDialogHandler(context: BrowserContext): void {
+    context.on("dialog", (dialog) => {
+      let record: DialogRecord = { type: "unknown", message: "", accepted: false };
+      let armed: { accept: boolean; promptText?: string } | undefined;
+      try {
+        const page = dialog.page();
+        armed = page ? this.armedDialogs.get(page) : undefined;
+        if (page && armed) this.armedDialogs.delete(page);
+        record = {
+          type: dialog.type(),
+          // beforeunload is the one dialog Playwright accepts by default, because
+          // dismissing it cancels the navigation the caller just asked for.
+          accepted: armed?.accept ?? dialog.type() === "beforeunload",
+          message: dialog.message().slice(0, MAX_DIALOG_MESSAGE),
+        };
+        if (armed?.accept && armed.promptText !== undefined) record.promptText = armed.promptText;
+      } catch {
+        // Fall through to the dismiss below; an unanswered dialog is the one outcome that
+        // cannot be allowed, and a half-built record is still worth reporting.
+      }
+      for (const sink of this.sideEffectSinks) {
+        if (sink.page !== dialog.page()) continue;
+        sink.dialogCount += 1;
+        if (sink.dialogs.length < MAX_REPORTED_DIALOGS) sink.dialogs.push(record);
+      }
+      const answer = record.accepted
+        ? dialog.accept(record.promptText)
+        : dialog.dismiss();
+      answer.catch(() => undefined);
+    });
+  }
+
+  async handleDialog(accept: boolean, promptText?: string): Promise<DialogArmed> {
+    const page = await this.page();
+    const armed: { accept: boolean; promptText?: string } = { accept };
+    if (promptText !== undefined) armed.promptText = promptText;
+    this.armedDialogs.set(page, armed);
+    return { pageId: this.pageId(page), ...armed };
+  }
+
+  /**
+   * Open a window over the side effects a page produces on its own. Every caller must
+   * close it, or the sink outlives the action and collects someone else's dialogs.
+   */
+  private openSideEffectSink(page: Page): { sink: SideEffectSink; close: () => void } {
+    const sink: SideEffectSink = { page, dialogs: [], dialogCount: 0, downloads: [] };
+    this.sideEffectSinks.add(sink);
+    return { sink, close: () => this.sideEffectSinks.delete(sink) };
+  }
+
+  /** Copy a sink's findings onto a result, leaving the fields off when nothing happened. */
+  private applySideEffects(result: ActionResult, sink: SideEffectSink): void {
+    if (sink.dialogs.length > 0) result.dialogs = sink.dialogs;
+    if (sink.dialogCount > sink.dialogs.length) {
+      result.dialogsOmitted = sink.dialogCount - sink.dialogs.length;
+    }
+    if (sink.downloads.length > 0) result.downloads = sink.downloads;
+  }
+
+  /**
+   * Record every download, and keep it only when a root was configured.
+   *
+   * The transfer itself is always accepted, so a page whose flow depends on one behaves the
+   * same either way; what --download-dir decides is whether the bytes survive. A server
+   * without it used to leave downloads in Playwright's temp directory to be deleted on
+   * close, which from the caller's side is indistinguishable from the click doing nothing.
+   */
+  private installDownloadHandler(context: BrowserContext): void {
+    context.on("download", (download) => {
+      const suggested = download.suggestedFilename();
+      const record: DownloadRecord = {
+        url: download.url(),
+        suggestedFilename: suggested,
+        state: this.config.downloadDir ? "pending" : "discarded",
+      };
+      if (!this.config.downloadDir) {
+        record.error = "Downloads are discarded; start the server with --download-dir to keep them";
+      }
+      this.downloadLog.push(record);
+      if (this.downloadLog.length > MAX_DOWNLOAD_LOG) this.downloadLog.shift();
+      for (const sink of this.sideEffectSinks) {
+        if (sink.page === download.page()) sink.downloads.push(record);
+      }
+      // Mutated in place afterwards, so a record already handed to an action result settles
+      // to saved or failed rather than staying pending in a caller's hands.
+      void this.saveDownload(download, record);
+    });
+  }
+
+  private async saveDownload(download: Download, record: DownloadRecord): Promise<void> {
+    const dir = this.config.downloadDir;
+    if (!dir) {
+      await download.delete().catch(() => undefined);
+      return;
+    }
+    try {
+      await mkdir(dir, { recursive: true });
+      const target = await uniqueDownloadPath(dir, safeDownloadName(record.suggestedFilename));
+      // Second check, after the name was already reduced to a bare base name: nothing built
+      // from remote input reaches saveAs without being proven to land inside the root.
+      const root = await realpath(dir);
+      const rel = relative(root, resolve(target));
+      if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+        throw new Error(`refused to write outside ${dir}`);
+      }
+      await download.saveAs(target);
+      const info = await stat(target);
+      record.file = basename(target);
+      record.bytes = info.size;
+      record.state = "saved";
+    } catch (error) {
+      record.state = "failed";
+      record.error = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async listDownloads(): Promise<DownloadRecord[]> {
+    return this.downloadLog.map((record) => ({ ...record }));
   }
 
   private async installNavigationGuard(context: BrowserContext): Promise<void> {
@@ -652,7 +921,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return frame;
   }
 
-  private async pageSummary(page: Page): Promise<PageSummary> {
+  private async pageSummary(page: Page, status?: number): Promise<PageSummary> {
     let title = "";
     try {
       title = await page.title();
@@ -664,6 +933,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       current: page === this.currentPage,
       title,
       url: page.url(),
+      ...(status === undefined ? {} : { status }),
     };
   }
 
@@ -711,7 +981,10 @@ export class ChromiumFishBrowser implements BrowserApi {
     this.currentPage = page;
     if (rawUrl) {
       const url = assertNavigationUrl(rawUrl, this.config.allowedHosts);
-      await page.goto(url.href, { waitUntil: "domcontentloaded" });
+      // Reported for the same reason the navigation tools report it: an error page loads
+      // like any other, so without the status this reads as having opened the real thing.
+      const response = await page.goto(url.href, { waitUntil: "domcontentloaded" });
+      return this.pageSummary(page, response?.status());
     }
     return this.pageSummary(page);
   }
@@ -758,6 +1031,8 @@ export class ChromiumFishBrowser implements BrowserApi {
     page: Page,
     priorPages: Page[],
     options: ActionOptions = {},
+    sink?: SideEffectSink,
+    response?: PlaywrightResponse | null,
   ): Promise<ActionResult> {
     const opened = this.openPages().filter((candidate) => !priorPages.includes(candidate));
     for (const candidate of opened) this.trackPage(candidate);
@@ -768,9 +1043,36 @@ export class ChromiumFishBrowser implements BrowserApi {
       title: await page.title().catch(() => ""),
       navigated: true,
     };
+    // Playwright resolves goto without complaint on a 404 or a 500 — only a network-level
+    // failure throws — and plenty of sites answer both with a page that reads like content.
+    // Null is normal: a same-document hash change, or a back with no history behind it.
+    if (response) result.status = response.status();
     if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
+    if (sink) this.applySideEffects(result, sink);
     if (options.returnSnapshot) result.snapshot = await this.snapshot();
     return result;
+  }
+
+  /**
+   * The shared body of the four navigation tools: clear refs, watch for what the page does
+   * to itself while it moves, and report the response the move produced.
+   */
+  private async navigationAction(
+    page: Page,
+    options: ActionOptions | undefined,
+    run: () => Promise<PlaywrightResponse | null>,
+  ): Promise<ActionResult> {
+    // Captured after the caller resolved the page, so the page a lazy browser start just
+    // created is not reported as one this navigation opened.
+    const priorPages = this.openPages();
+    await this.clearRefs(page);
+    const { sink, close } = this.openSideEffectSink(page);
+    try {
+      const response = await run();
+      return await this.navigationResult(page, priorPages, options, sink, response);
+    } finally {
+      close();
+    }
   }
 
   /**
@@ -804,6 +1106,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
     page.on("request", onRequest);
     page.on("framenavigated", onNavigated);
+    const { sink, close } = this.openSideEffectSink(page);
 
     let attached = true;
     const detach = () => {
@@ -811,6 +1114,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       attached = false;
       page.off("request", onRequest);
       page.off("framenavigated", onNavigated);
+      close();
     };
     // These listeners cannot change any outcome once the commit window has closed, so that
     // window is their lifetime. Enforcing it here rather than relying on release() alone is
@@ -824,6 +1128,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       pages: this.openPages(),
       committed,
       pending: () => started && !done,
+      sink,
       release: () => {
         clearTimeout(expiry);
         detach();
@@ -904,6 +1209,9 @@ export class ChromiumFishBrowser implements BrowserApi {
       };
       if (navigationPending) result.navigationPending = true;
       if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
+      // Before the snapshot, so a page that raised a dialog still reports it even if the
+      // snapshot below throws.
+      this.applySideEffects(result, baseline.sink);
       if (options.returnSnapshot) result.snapshot = await this.snapshot();
       return result;
     } finally {
@@ -925,36 +1233,22 @@ export class ChromiumFishBrowser implements BrowserApi {
   async navigate(rawUrl: string, options?: ActionOptions): Promise<ActionResult> {
     const url = assertNavigationUrl(rawUrl, this.config.allowedHosts);
     const page = await this.page();
-    // Captured after page(), so the page a lazy browser start just created is not
-    // reported as one this navigation opened.
-    const priorPages = this.openPages();
-    await this.clearRefs(page);
-    await page.goto(url.href, { waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, priorPages, options);
+    return this.navigationAction(page, options, () => page.goto(url.href, { waitUntil: "domcontentloaded" }));
   }
 
   async navigateBack(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
-    const priorPages = this.openPages();
-    await this.clearRefs(page);
-    await page.goBack({ waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, priorPages, options);
+    return this.navigationAction(page, options, () => page.goBack({ waitUntil: "domcontentloaded" }));
   }
 
   async navigateForward(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
-    const priorPages = this.openPages();
-    await this.clearRefs(page);
-    await page.goForward({ waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, priorPages, options);
+    return this.navigationAction(page, options, () => page.goForward({ waitUntil: "domcontentloaded" }));
   }
 
   async reload(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
-    const priorPages = this.openPages();
-    await this.clearRefs(page);
-    await page.reload({ waitUntil: "domcontentloaded" });
-    return this.navigationResult(page, priorPages, options);
+    return this.navigationAction(page, options, () => page.reload({ waitUntil: "domcontentloaded" }));
   }
 
   private async clearRefs(page: Page): Promise<void> {

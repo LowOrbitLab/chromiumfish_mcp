@@ -46,12 +46,16 @@ To run from GitHub instead of a global install, set `"command": "npx"` and prepe
 | `get_text`, `take_screenshot` | Retrieve page or frame content; `take_screenshot` crops to one element with `target` |
 | `click`, `hover`, `type_text`, `select_option`, `set_checked`, `press_key`, `scroll`, `wait_for` | Interact with the page |
 | `drag` | Drag onto another element or by a pixel offset, with a human-like path |
+| `handle_dialog` | Arm the answer for the next `alert`/`confirm`/`prompt`/`beforeunload` |
 | `upload_file` | Attach local files to a file input — requires `--upload-dir` |
+| `list_downloads` | Report what was downloaded and where it landed — requires `--download-dir` |
 | `click_at` | Click absolute coordinates (for widgets `snapshot` cannot see) |
 | `list_frames` | List frames/iframes with stable IDs |
 | `find_challenge`, `solve_challenge` | Detect and clear interstitial / framed challenges; the result says whether one was observed, interacted with, and verified |
 | `evaluate` | Run arbitrary JavaScript — requires `--allow-eval` |
 | `run_task` | Native ChromiumFish agent — requires `--allow-native-agent` |
+
+A JavaScript dialog is answered the instant it opens, because a page left waiting on one freezes and no later call could finish. Unarmed the answer is dismiss — which is what Playwright already did silently — so a click that only raised `confirm("Delete?")` did not delete, and the action result now says so under `dialogs`. Call `handle_dialog` to arm the next answer, then repeat the action. The four navigation tools also report the HTTP `status`, since a 404 or a 500 loads like any other page.
 
 Every navigation and interaction tool reports the resulting `url`, `title`, `navigated`, and any `newPages`, so a client only needs a follow-up `snapshot` when the page actually changed; `returnSnapshot: true` returns the action result and a fresh snapshot in one call. An action that navigates waits for the new document before reporting, so those fields describe the page it arrived on; one whose navigation is still in flight after ten seconds reports `navigationPending: true` rather than describing the page being left as though nothing happened. Reference numbers are never reused, so one held across a snapshot fails with an error instead of acting on a different element; `snapshot` also reports ARIA roles, so `role=button[name="Submit"]` works in any `target` field as a re-render-proof alternative. The server ships MCP `instructions` describing this workflow, reference lifetime, and the challenge sequence.
 
@@ -70,6 +74,7 @@ Snapshot references, frame-aware interaction, waiting, and the cross-origin chal
 --allowed-host HOST        Allow top-level navigation to a bare host and its subdomains; repeatable
 --max-text-chars N         Set the hard limit for text and snapshot output
 --upload-dir PATH          Allow upload_file to read this directory; repeatable
+--download-dir PATH        Save downloads here; without it they are discarded
 --allow-eval               Enable arbitrary JavaScript execution
 --allow-native-agent       Enable the native ChromiumFish browser agent
 ```
@@ -82,6 +87,8 @@ Proxy credentials can be embedded in the proxy URL, but are then exposed in the 
 - `evaluate` and the native agent are disabled by default; enable them only in trusted environments.
 - `--allowed-host example.com` restricts top-level HTTP/HTTPS navigation (redirects, links, form posts, popups) to a host and its subdomains. Give it a bare host name: matching is on the host alone, so a scheme, path, port, leading dot, or wildcard is rejected at startup rather than quietly matching nothing. Third-party subframes and page assets remain reachable — it is a navigation guard, not a network egress filter.
 - `upload_file` sends host files to whatever origin the page posts to, so it is unregistered until `--upload-dir` names at least one directory, and every path must resolve inside one. Both the path and the roots are resolved through symlinks first, so a link planted inside a root cannot reach outside it. Scope the roots to the files a task actually needs — a page can influence which file the model picks.
+- Downloads are written only when `--download-dir` names a directory; without it the transfer still runs (so the page's own flow is unchanged) but nothing is kept, and the action result says `discarded`. The file name comes from the remote server's `Content-Disposition`, so it is reduced to a bare base name and the resolved path is checked against the root before anything is written.
+- A page can raise `confirm()` to guard a destructive action. Unarmed dialogs are dismissed, so that guard holds by default; `handle_dialog` with `accept: true` deliberately answers the next one. Keep human confirmation in front of it for anything irreversible.
 - Clients can click and type with real side effects. Keep human confirmation for purchases, publishing, deletion, and permission changes.
 - `solve_challenge` returns `ok: true` whenever the page is not blocked, including on pages that were never challenged. Read `challengeObserved`, `interactionPerformed`, and `clearanceVerified` before recording or reporting that a challenge was cleared — `ok` alone will overstate what happened.
 - Each process runs an independent browser context; this is not a shared multi-tenant service.

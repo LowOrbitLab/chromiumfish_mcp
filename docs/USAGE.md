@@ -13,6 +13,9 @@ The browser starts lazily on the first tool call that needs a page, and is clean
 ```
 
 - `navigated` is true when the URL changed within the action's settle window. Actions that start a navigation later than that report it on the next call, and same-URL navigations are not detected. `navigate`, `navigate_back`, `navigate_forward`, and `reload` are the exception: they report `navigated: true` unconditionally, because they invalidate element references even when the URL does not change.
+- `status` is the HTTP status of the document, reported by `navigate`, `navigate_back`, `navigate_forward`, `reload`, and `open_page`. Playwright only rejects on a network-level failure, so a 404 or a 500 arrives as an ordinary successful navigation — and plenty of sites answer both with a page that reads like real content. It is absent when there was no response to report: a same-document hash change, or a `navigate_back` with nothing behind it.
+- `dialogs` lists JavaScript dialogs the action raised, already answered. See below.
+- `downloads` lists downloads the action started.
 - `newPages` lists pages the action opened, such as a `target="_blank"` link. The current page never switches automatically — use `select_page` to move to one.
 - A detected navigation invalidates element references, exactly as `navigate` does.
 - `navigationPending: true` appears when the action started a top-level navigation that had not committed within ten seconds — a slow login POST, a long redirect chain. `url` and `title` still describe the page being left, and `navigated` is still `false`, so read this field before concluding the action did nothing. The action itself succeeded: follow it with `wait_for` on the destination URL or an element there. Repeating the action instead would submit a login or a purchase twice.
@@ -84,6 +87,43 @@ Real mouse events drive both mouse-event drag implementations and HTML5 `draggab
 Target the `input[type=file]` itself. Attaching does not require visibility, so the common "styled button in front of a `display:none` input" pattern works by passing the CSS selector of the hidden input — it will not appear in `snapshot`, which lists visible elements only. Pass more than one path only when the input is marked `multiple`. The result reports `files` as base names with byte sizes.
 
 `click` refuses a file input rather than acting on it. Clicking one cannot open anything, because the chooser is only intercepted while a listener is registered and this server registers none; a headless click would otherwise report an ordinary success and leave you waiting on an upload that never started.
+
+## Dialogs
+
+`alert`, `confirm`, `prompt`, and `beforeunload` are answered the instant they open. That is not a preference: Playwright freezes the page until a listener responds, and a dialog left open would hang every later tool call, `click` included.
+
+The default answer is **dismiss** — the same answer Playwright gives when nothing is listening, so no page behaves differently than before. What changed is that the answer is now reported:
+
+```json
+{ "ok": true, "url": "https://example.com/", "navigated": false,
+  "dialogs": [{ "type": "confirm", "message": "Delete everything?", "accepted": false }] }
+```
+
+Read that field before concluding an action took effect. A click that raised `confirm("Delete everything?")` and had it dismissed **did not delete anything**, and every other field in that result looks like an ordinary successful click.
+
+To answer differently, call `handle_dialog` first and then repeat the action:
+
+```json
+{ "accept": true }
+{ "accept": true, "promptText": "Rebecka" }
+```
+
+It arms exactly one dialog on the current page and is consumed by it, so a single call cannot go on authorizing every `confirm` that follows. Arming after a dialog has already been answered changes nothing — the answer was given the moment it opened.
+
+`beforeunload` is the one exception to the dismiss default: it is accepted, because dismissing it would cancel the navigation that was just requested. That means navigating away from a form with unsaved changes discards them, exactly as clicking "Leave" would.
+
+## Downloads
+
+Downloads are always accepted, so a page whose flow depends on one behaves the same either way. Whether the bytes are kept depends on `--download-dir`:
+
+```json
+{ "downloads": [{ "url": "https://example.com/report.pdf", "suggestedFilename": "report.pdf",
+                  "file": "report.pdf", "bytes": 20480, "state": "saved" }] }
+```
+
+`state` is `saved`, `pending`, `failed`, or `discarded`. A large transfer is still `pending` when the action that started it returns — call `list_downloads` to see it settle. Without `--download-dir` every download reports `discarded`, which is the honest version of the old behavior: the file went to a temporary directory and was deleted on exit, so the click appeared to do nothing at all.
+
+The written name is not the name the server asked for. `suggestedFilename` comes from the remote origin's `Content-Disposition` header, so it is chosen by whoever the page fetched from; it is reduced to a bare base name, stripped of characters that are illegal or hidden on the target filesystem, and the resolved path is checked against the root before anything is written. A name that collides with an existing file gets a ` (2)` suffix rather than overwriting it. `file` reports what was actually written.
 
 ## Waiting
 

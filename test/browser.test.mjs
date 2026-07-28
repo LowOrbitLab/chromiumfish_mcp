@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
-import { assertUploadPath, ChromiumFishBrowser } from "../dist/browser.js";
+import { assertUploadPath, ChromiumFishBrowser, safeDownloadName } from "../dist/browser.js";
 
 const config = {
   headless: true,
@@ -161,6 +161,192 @@ test("--chrome-path rejects the options only the upstream launcher can honor", a
     new ChromiumFishBrowser({ ...local, browserVersion: "1.2.3" }).ensureContext(),
     /--browser-version/,
   );
+});
+
+/** Register the dialog handler against a fake context and hand back the way to fire it. */
+function dialogHandler(browser) {
+  let fire;
+  browser.installDialogHandler({
+    on: (event, listener) => {
+      if (event === "dialog") fire = listener;
+    },
+  });
+  return fire;
+}
+
+function fakeDialog(page, { type = "confirm", message = "Delete everything?" } = {}) {
+  const answers = [];
+  return {
+    answers,
+    type: () => type,
+    message: () => message,
+    page: () => page,
+    accept: async (text) => { answers.push(["accept", text]); },
+    dismiss: async () => { answers.push(["dismiss"]); },
+  };
+}
+
+test("an unarmed dialog is dismissed, and the action that raised it says so", async () => {
+  // Playwright dismisses dialogs only while nothing listens; the answer is the same as
+  // before, but a click that merely raised confirm("Delete?") no longer reads as a click
+  // that deleted something.
+  const page = {};
+  const browser = new ChromiumFishBrowser(config);
+  const fire = dialogHandler(browser);
+  const { sink } = browser.openSideEffectSink(page);
+
+  const dialog = fakeDialog(page);
+  fire(dialog);
+  assert.deepEqual(dialog.answers, [["dismiss"]]);
+  assert.deepEqual(sink.dialogs, [{
+    type: "confirm",
+    message: "Delete everything?",
+    accepted: false,
+  }]);
+
+  const result = { ok: true, url: "", title: "", navigated: false };
+  browser.applySideEffects(result, sink);
+  assert.equal(result.dialogs.length, 1);
+  assert.equal(result.dialogsOmitted, undefined);
+});
+
+test("handle_dialog arms one answer, and beforeunload defaults to accept", async () => {
+  const page = {};
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => page;
+  const fire = dialogHandler(browser);
+
+  assert.deepEqual(await browser.handleDialog(true, "Rebecka"), {
+    pageId: "page-1",
+    accept: true,
+    promptText: "Rebecka",
+  });
+  const prompt = fakeDialog(page, { type: "prompt", message: "Your name?" });
+  fire(prompt);
+  assert.deepEqual(prompt.answers, [["accept", "Rebecka"]]);
+
+  // Armed once, consumed once: the next dialog is back to the dismiss default, or a single
+  // handle_dialog would silently authorize every confirm that follows it.
+  const second = fakeDialog(page);
+  fire(second);
+  assert.deepEqual(second.answers, [["dismiss"]]);
+
+  // Dismissing beforeunload would cancel the navigation the caller just asked for.
+  const leaving = fakeDialog(page, { type: "beforeunload", message: "" });
+  fire(leaving);
+  assert.deepEqual(leaving.answers, [["accept", undefined]]);
+});
+
+test("a dialog is answered even when reading it fails", async () => {
+  // The one outcome that cannot be allowed: Playwright freezes the page until a listener
+  // answers, so an exception on the way to the answer would hang every later tool call.
+  const page = {};
+  const browser = new ChromiumFishBrowser(config);
+  const fire = dialogHandler(browser);
+  const answers = [];
+  fire({
+    type: () => { throw new Error("dialog went away"); },
+    message: () => "",
+    page: () => page,
+    accept: async () => { answers.push("accept"); },
+    dismiss: async () => { answers.push("dismiss"); },
+  });
+  assert.deepEqual(answers, ["dismiss"]);
+});
+
+test("only the reported dialogs are listed, and the rest are counted", async () => {
+  const page = {};
+  const browser = new ChromiumFishBrowser(config);
+  const fire = dialogHandler(browser);
+  const { sink } = browser.openSideEffectSink(page);
+  for (let index = 0; index < 8; index += 1) fire(fakeDialog(page, { type: "alert" }));
+
+  const result = { ok: true, url: "", title: "", navigated: false };
+  browser.applySideEffects(result, sink);
+  assert.equal(result.dialogs.length, 5);
+  assert.equal(result.dialogsOmitted, 3);
+});
+
+test("a closed side-effect window collects nothing further", async () => {
+  const page = {};
+  const browser = new ChromiumFishBrowser(config);
+  const fire = dialogHandler(browser);
+  const { sink, close } = browser.openSideEffectSink(page);
+  close();
+  fire(fakeDialog(page));
+  assert.deepEqual(sink.dialogs, []);
+});
+
+test("safeDownloadName reduces a server-chosen name to something writable", () => {
+  // What Chromium actually hands over for a server sending "../../../evil:name.pdf",
+  // measured against Chrome: it normalizes first, and this is already safe to write.
+  assert.equal(safeDownloadName("_.._.._evil_name.pdf"), "_.._.._evil_name.pdf");
+  // The rest is the case Chromium's normalization is not promised to cover. Playwright
+  // only documents the name as "typically computed by the browser".
+  assert.equal(safeDownloadName("../../../.ssh/authorized_keys"), "authorized_keys");
+  assert.equal(safeDownloadName("..\\..\\Windows\\System32\\drivers\\etc\\hosts"), "hosts");
+  assert.equal(safeDownloadName("report.pdf"), "report.pdf");
+  assert.equal(safeDownloadName(".."), "download");
+  assert.equal(safeDownloadName(""), "download");
+  assert.equal(safeDownloadName("   "), "download");
+  assert.equal(safeDownloadName(".bashrc"), "bashrc");
+  // Still the console device on Windows, extension or not.
+  assert.equal(safeDownloadName("CON.txt"), "download-CON.txt");
+  assert.equal(safeDownloadName("in:va|lid?.txt"), "invalid.txt");
+  assert.equal(safeDownloadName("trailing.  "), "trailing");
+  assert.ok(safeDownloadName("x".repeat(400)).length <= 100);
+});
+
+test("a download lands in the configured root, and a repeat does not overwrite it", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "cfmcp-dl-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const browser = new ChromiumFishBrowser({ ...config, downloadDir: root });
+
+  const download = (name) => ({
+    url: () => `https://example.com/${name}`,
+    suggestedFilename: () => name,
+    saveAs: async (target) => { await writeFile(target, "report"); },
+    delete: async () => assert.fail("a kept download must not be deleted"),
+  });
+
+  const first = { url: "", suggestedFilename: "../../report.pdf", state: "pending" };
+  await browser.saveDownload(download("../../report.pdf"), first);
+  assert.equal(first.state, "saved");
+  assert.equal(first.file, "report.pdf");
+  assert.equal(first.bytes, 6);
+  assert.equal(await readFile(join(root, "report.pdf"), "utf8"), "report");
+
+  const second = { url: "", suggestedFilename: "report.pdf", state: "pending" };
+  await browser.saveDownload(download("report.pdf"), second);
+  assert.equal(second.file, "report (2).pdf");
+});
+
+test("without --download-dir a download is discarded and reported as such", async () => {
+  const page = {};
+  const browser = new ChromiumFishBrowser(config);
+  let fire;
+  browser.installDownloadHandler({
+    on: (event, listener) => {
+      if (event === "download") fire = listener;
+    },
+  });
+  const { sink } = browser.openSideEffectSink(page);
+  let deleted = false;
+  fire({
+    url: () => "https://example.com/invoice.pdf",
+    suggestedFilename: () => "invoice.pdf",
+    page: () => page,
+    delete: async () => { deleted = true; },
+    saveAs: async () => assert.fail("nothing may be written without a root"),
+  });
+
+  assert.equal(sink.downloads.length, 1);
+  assert.equal(sink.downloads[0].state, "discarded");
+  assert.match(sink.downloads[0].error, /--download-dir/);
+  // The click did something; a caller that only saw ok: true would conclude it did not.
+  assert.deepEqual(await browser.listDownloads(), sink.downloads);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deleted, true);
 });
 
 test("navigation guard blocks disallowed top-level requests only", async () => {
@@ -844,8 +1030,16 @@ test("takeScreenshot budget accounts for the device scale factor", async () => {
 test("navigateForward and reload wait for DOMContentLoaded", async () => {
   const calls = [];
   const page = {
-    goForward: async (options) => calls.push(["goForward", options]),
-    reload: async (options) => calls.push(["reload", options]),
+    // goForward answers null when there is nothing ahead in history, exactly as a
+    // same-document hash change does, so status is genuinely absent rather than zero.
+    goForward: async (options) => {
+      calls.push(["goForward", options]);
+      return null;
+    },
+    reload: async (options) => {
+      calls.push(["reload", options]);
+      return { status: () => 503 };
+    },
     title: async () => "Example",
     url: () => "https://example.com/next",
   };
@@ -858,11 +1052,13 @@ test("navigateForward and reload wait for DOMContentLoaded", async () => {
     url: "https://example.com/next",
     navigated: true,
   });
+  // A 503 loads like any other document; without the status it reads as a good page.
   assert.deepEqual(await browser.reload(), {
     ok: true,
     title: "Example",
     url: "https://example.com/next",
     navigated: true,
+    status: 503,
   });
   assert.deepEqual(calls, [
     ["goForward", { waitUntil: "domcontentloaded" }],

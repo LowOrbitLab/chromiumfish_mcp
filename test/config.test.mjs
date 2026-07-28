@@ -83,6 +83,17 @@ test("leaves uploads disabled without --upload-dir", () => {
   assert.throws(() => parseCli(["--upload-dir"]), /requires a value/);
 });
 
+test("resolves --download-dir to one absolute destination", () => {
+  const { config } = parseCli(["--download-dir", "out"]);
+  assert.equal(config.downloadDir, resolve("out"));
+  assert.equal(isAbsolute(config.downloadDir), true);
+  // One destination rather than a list: a download has to land somewhere specific, so the
+  // later flag wins instead of leaving the target ambiguous.
+  assert.equal(parseCli(["--download-dir", "a", "--download-dir", "b"]).config.downloadDir, resolve("b"));
+  assert.equal(parseCli([]).config.downloadDir, undefined);
+  assert.throws(() => parseCli(["--download-dir"]), /requires a value/);
+});
+
 test("rejects --allowed-host forms that would silently match nothing", () => {
   // Every one of these compares against something URL.hostname never contains, so the guard
   // would block all navigation while looking configured.
