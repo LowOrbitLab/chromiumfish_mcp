@@ -138,6 +138,34 @@ test("concurrent callers do not each open a tab", async () => {
   assert.equal(first, second);
 });
 
+test("close waits for a launch already in flight instead of leaking it", async () => {
+  // The shutdown edge of the race above. close() used to null the fields and return while
+  // a launch was still running; that launch then assigned this.browser on its way out, and
+  // nothing ever closed it. SIGINT during the first tool call is the way to hit it.
+  let closedBrowser = false;
+  let closedContext = false;
+  const browser = new ChromiumFishBrowser(config);
+  const context = { pages: () => [], close: async () => { closedContext = true; } };
+  browser.startContext = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    browser.browser = { isConnected: () => true, close: async () => { closedBrowser = true; } };
+    browser.context = context;
+    return context;
+  };
+
+  const launching = browser.ensureContext();
+  await browser.close();
+
+  assert.equal(closedBrowser, true, "the in-flight launch's browser must be closed");
+  assert.equal(closedContext, true);
+  assert.equal(browser.browser, undefined);
+  assert.equal(browser.context, undefined);
+  await launching;
+
+  // And nothing starts a replacement afterwards: the shutdown is not a restart trigger.
+  await assert.rejects(browser.ensureContext(), /shutting down/);
+});
+
 test("tracking a page again does not stack close listeners", async () => {
   // page() re-tracks a tab it falls back to after the current one closed, and every extra
   // registration is one more listener on the same event.
@@ -1558,7 +1586,7 @@ test("element screenshot rejects an invisible element and honors the pixel budge
  * what made actionResult describe the wrong page.
  */
 function navigatingPage({ commitAfterMs = 40, from = "https://example.com/login", to = "https://example.com/clientarea" } = {}) {
-  const listeners = { request: [], framenavigated: [] };
+  const listeners = { request: [], framenavigated: [], requestfailed: [] };
   const main = {
     url: () => state.url,
     name: () => "",
@@ -1590,15 +1618,20 @@ function navigatingPage({ commitAfterMs = 40, from = "https://example.com/login"
     // Resolves at once: the current document is the old one, and it finished loading long ago.
     waitForLoadState: async () => undefined,
   };
+  let navigationRequest;
   return {
     page,
     listeners,
     state,
     /** Drive the navigation the way the browser would once the click lands. */
     start() {
-      for (const fn of listeners.request) {
-        fn({ isNavigationRequest: () => true, frame: () => main });
-      }
+      navigationRequest = {
+        isNavigationRequest: () => true,
+        frame: () => main,
+        url: () => to,
+        failure: () => ({ errorText: "net::ERR_FAILED" }),
+      };
+      for (const fn of listeners.request) fn(navigationRequest);
       if (commitAfterMs !== null) {
         setTimeout(() => {
           state.url = to;
@@ -1606,6 +1639,11 @@ function navigatingPage({ commitAfterMs = 40, from = "https://example.com/login"
           for (const fn of [...listeners.framenavigated]) fn(main);
         }, commitAfterMs);
       }
+    },
+    /** Cancel it the way a blocked route or a download conversion would. */
+    fail(errorText = "net::ERR_BLOCKED_BY_CLIENT") {
+      navigationRequest.failure = () => ({ errorText });
+      for (const fn of [...listeners.requestfailed]) fn(navigationRequest);
     },
   };
 }
@@ -1649,6 +1687,87 @@ test("a navigation that outlasts the bound is reported, not silently read as a n
   // Chromium's "Loading <url>" placeholder is not a title and must not be passed off as one.
   assert.equal(result.title, "");
   assert.equal(fake.listeners.request.length, 0);
+});
+
+test("a cancelled navigation is reported as cancelled, not left pending", async () => {
+  // Never commits, exactly like the slow case above — the difference is only that the
+  // request dies, which is what --allowed-host does to every blocked link.
+  const fake = navigatingPage({ commitAfterMs: null });
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+  fake.page.mouse.down = async () => {
+    fake.start();
+    // Lands inside actionResult's commit race rather than before it, so this also proves
+    // the race returns on the failure instead of running out the ten-second bound.
+    setTimeout(() => fake.fail(), 200);
+  };
+
+  const started = Date.now();
+  const result = await browser.click("#external-link");
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.ok, true);
+  assert.equal(result.navigated, false);
+  // The one that used to be wrong: a navigation that is never coming was reported as one
+  // still on its way, which tells the model to go wait for a page that will never load.
+  assert.equal(result.navigationPending, undefined);
+  assert.deepEqual(result.navigationFailed, {
+    url: "https://example.com/clientarea",
+    reason: "net::ERR_BLOCKED_BY_CLIENT",
+  });
+  // ACTION_NAV_COMMIT_TIMEOUT_MS is 10s; anywhere near it means the race never woke up.
+  assert.ok(elapsed < 3_000, `expected the failure to end the wait, took ${elapsed}ms`);
+  assert.equal(fake.listeners.request.length, 0);
+  assert.equal(fake.listeners.requestfailed.length, 0);
+});
+
+test("a navigation that turned into a download is not reported as a failure", async () => {
+  const fake = navigatingPage({ commitAfterMs: null });
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+  fake.page.mouse.down = async () => {
+    fake.start();
+    // Chromium aborts the navigation and hands the transfer to the download manager, so
+    // the download arrives on the open side-effect window while the request fails.
+    for (const sink of browser.sideEffectSinks) {
+      sink.downloads.push({
+        url: "https://example.com/report.pdf",
+        suggestedFilename: "report.pdf",
+        state: "pending",
+      });
+    }
+    fake.fail("net::ERR_ABORTED");
+  };
+
+  const result = await browser.click("#download-link");
+
+  assert.equal(result.navigationPending, undefined);
+  // The download worked. Calling its aborted navigation a failure would describe a
+  // successful transfer as a dead end.
+  assert.equal(result.navigationFailed, undefined);
+  assert.equal(result.downloads?.length, 1);
+});
+
+test("a navigation that retries after a failed attempt is not reported as failed", async () => {
+  const fake = navigatingPage({ commitAfterMs: null });
+  const browser = new ChromiumFishBrowser(config);
+  browser.page = async () => fake.page;
+  fake.page.mouse.down = async () => {
+    fake.start();
+    fake.fail("net::ERR_NAME_NOT_RESOLVED");
+    // The second attempt lands, so the first one's failure describes nothing that stuck.
+    setTimeout(() => {
+      fake.state.url = "https://example.com/clientarea";
+      fake.state.committed = true;
+      for (const fn of [...fake.listeners.framenavigated]) fn(fake.page.mainFrame());
+    }, 50);
+  };
+
+  const result = await browser.click("#retrying");
+
+  assert.equal(result.navigated, true);
+  assert.equal(result.navigationFailed, undefined);
+  assert.equal(result.navigationPending, undefined);
 });
 
 test("an action that navigates nothing does not pay the navigation wait", async () => {
@@ -1806,7 +1925,7 @@ test("a read failure that is not a navigation race still surfaces", async () => 
 });
 
 test("navigation listeners come off the page whether the action succeeds or throws", async (t) => {
-  const counts = { request: 0, framenavigated: 0 };
+  const counts = { request: 0, framenavigated: 0, requestfailed: 0 };
   const main = {
     url: () => "https://example.com/",
     name: () => "",
@@ -1835,7 +1954,11 @@ test("navigation listeners come off the page whether the action succeeds or thro
   browser.page = async () => page;
 
   await browser.pressKey("Enter");
-  assert.deepEqual(counts, { request: 0, framenavigated: 0 }, "released as soon as the result is built");
+  assert.deepEqual(
+    counts,
+    { request: 0, framenavigated: 0, requestfailed: 0 },
+    "released as soon as the result is built",
+  );
 
   // An action that throws never reaches actionResult, so release() never runs for it. The
   // listeners still have to go: without a bound, a session of failing actions accumulates a
@@ -1847,7 +1970,11 @@ test("navigation listeners come off the page whether the action succeeds or thro
   }
   assert.equal(counts.request, 5, "still attached while the commit window is open");
   t.mock.timers.tick(20_000);
-  assert.deepEqual(counts, { request: 0, framenavigated: 0 }, "detached once the window closes");
+  assert.deepEqual(
+    counts,
+    { request: 0, framenavigated: 0, requestfailed: 0 },
+    "detached once the window closes",
+  );
 });
 
 /**

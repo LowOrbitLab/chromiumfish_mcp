@@ -79,6 +79,10 @@ Action results
 - navigationPending: true means the action started a navigation that had not landed yet, so
   url and title still describe the page being left. The action itself worked - wait_for the
   destination rather than repeating it, which on a login or a purchase would submit twice.
+- navigationFailed means the opposite: the navigation the action started is never arriving,
+  because it was blocked, the host did not resolve, or the browser handed the URL to
+  another application. The page did not move and waiting for it would wait forever. It
+  carries the URL and the browser's own reason; net::ERR_BLOCKED_BY_CLIENT is --allowed-host.
 - Pass returnSnapshot: true to get the action result and a fresh snapshot in one call.
 - newPages lists tabs the action opened. The current page never switches automatically;
   use select_page to move to one.
@@ -185,7 +189,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "open_page",
     {
       description: "Create and select a new page, optionally opening an HTTP/HTTPS URL.",
-      inputSchema: { url: z.string().url().optional() },
+      inputSchema: { url: z.url().optional() },
       annotations: MUTATING,
     },
     async ({ url }) => structured(await browser.openPage(url)),
@@ -215,7 +219,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     "navigate",
     {
       description: "Open an HTTP/HTTPS URL in the current page and wait for DOMContentLoaded.",
-      inputSchema: { url: z.string().url(), ...returnSnapshotInput },
+      inputSchema: { url: z.url(), ...returnSnapshotInput },
       annotations: MUTATING,
     },
     async ({ url, returnSnapshot }) => action(await browser.navigate(url, { returnSnapshot })),
@@ -622,7 +626,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
         description: "Delegate a complete goal to the native ChromiumFish browser agent. Requires an OpenAI-compatible endpoint configured through environment variables.",
         inputSchema: {
           task: z.string().min(1),
-          url: z.string().url().optional(),
+          url: z.url().optional(),
           maxSteps: z.number().int().min(1).max(100).default(25),
         },
         annotations: DESTRUCTIVE,

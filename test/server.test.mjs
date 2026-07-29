@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { z } from "zod";
 import { createServer } from "../dist/server.js";
 
 const config = {
@@ -652,4 +653,263 @@ test("take_screenshot forwards the element crop", async (context) => {
     "takeScreenshot",
     { fullPage: false, target: undefined, frameId: undefined },
   ]);
+});
+
+/**
+ * The result contracts, described here rather than in the tool definitions.
+ *
+ * ActionResult is called a contract in four places — README, docs/USAGE.md, INSTRUCTIONS,
+ * and the interface in browser.ts — and nothing checked that a tool actually returned it.
+ * Declaring outputSchema on the tools themselves would have the SDK enforce it, but that
+ * ships every shape to the client on tools/list: measured at 4,210 tokens without and
+ * 10,912 with, a fixed 6.7k per session that most clients do not read. Checking it here
+ * catches the same drift in CI and costs a caller nothing.
+ *
+ * Shapes are strict on purpose. A field the implementation gained but nobody documented is
+ * exactly the drift worth failing on, so adding one has to touch this table too.
+ */
+const point = z.strictObject({ x: z.number(), y: z.number() });
+
+const pageSummary = z.strictObject({
+  pageId: z.string(),
+  current: z.boolean(),
+  title: z.string(),
+  url: z.string(),
+  status: z.number().int().optional(),
+});
+
+const pageList = z.strictObject({ running: z.boolean(), pages: z.array(pageSummary) });
+
+const downloadRecord = z.strictObject({
+  url: z.string(),
+  suggestedFilename: z.string(),
+  file: z.string().optional(),
+  bytes: z.number().optional(),
+  state: z.enum(["saved", "pending", "failed", "discarded"]),
+  error: z.string().optional(),
+});
+
+/** Every mutating tool returns this, so a client never branches on which one it called. */
+const ACTION = {
+  ok: z.literal(true),
+  url: z.string(),
+  title: z.string(),
+  navigated: z.boolean(),
+  newPages: z.array(z.string()).optional(),
+  navigationPending: z.boolean().optional(),
+  navigationFailed: z.strictObject({ url: z.string(), reason: z.string() }).optional(),
+  status: z.number().int().optional(),
+  dialogs: z.array(z.strictObject({
+    type: z.string(),
+    message: z.string(),
+    accepted: z.boolean(),
+    promptText: z.string().optional(),
+  })).optional(),
+  dialogsOmitted: z.number().int().optional(),
+  downloads: z.array(downloadRecord).optional(),
+};
+
+const TARGETED = { ...ACTION, target: z.string() };
+
+const widgetState = z.enum(["absent", "checkbox", "verifying", "success", "unknown"]);
+const widgetBox = z.strictObject({
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+  frameUrl: z.string(),
+});
+
+/** Tool name -> the exact shape of its structuredContent. */
+const RESULT_SHAPES = {
+  list_pages: pageList,
+  close_page: pageList,
+  open_page: pageSummary,
+  select_page: pageSummary,
+  navigate: z.strictObject(ACTION),
+  navigate_back: z.strictObject(ACTION),
+  navigate_forward: z.strictObject(ACTION),
+  reload: z.strictObject(ACTION),
+  click: z.strictObject(TARGETED),
+  hover: z.strictObject(TARGETED),
+  click_at: z.strictObject({ ...ACTION, x: z.number(), y: z.number() }),
+  drag: z.strictObject({ ...TARGETED, from: point, to: point }),
+  type_text: z.strictObject({ ...TARGETED, submitted: z.boolean() }),
+  select_option: z.strictObject({ ...TARGETED, selectedValues: z.array(z.string()) }),
+  set_checked: z.strictObject({ ...TARGETED, checked: z.boolean() }),
+  upload_file: z.strictObject({
+    ...TARGETED,
+    files: z.array(z.strictObject({ name: z.string(), bytes: z.number() })),
+  }),
+  press_key: z.strictObject({ ...ACTION, key: z.string() }),
+  scroll: z.strictObject({ ...ACTION, deltaX: z.number(), deltaY: z.number() }),
+  wait_for: z.strictObject({
+    ...ACTION,
+    kind: z.enum(["element", "text", "url", "load", "time"]),
+  }),
+  list_frames: z.strictObject({
+    frames: z.array(z.strictObject({
+      frameId: z.string(),
+      parentFrameId: z.string().optional(),
+      url: z.string(),
+      name: z.string(),
+      box: z.strictObject({
+        x: z.number(),
+        y: z.number(),
+        width: z.number(),
+        height: z.number(),
+      }).optional(),
+    })),
+  }),
+  handle_dialog: z.strictObject({
+    pageId: z.string(),
+    accept: z.boolean(),
+    promptText: z.string().optional(),
+  }),
+  list_downloads: z.strictObject({ downloads: z.array(downloadRecord) }),
+  find_challenge: z.strictObject({
+    present: z.boolean(),
+    kind: z.enum(["none", "interstitial", "turnstile", "managed", "unknown"]),
+    widgetState,
+    title: z.string(),
+    url: z.string(),
+    bodySnippet: z.string(),
+    tokenPresent: z.boolean(),
+    widget: widgetBox.optional(),
+    frames: z.array(z.strictObject({ url: z.string() })),
+  }),
+  solve_challenge: z.strictObject({
+    ok: z.boolean(),
+    method: z.enum(["already_clear", "self_cleared", "click", "not_found", "timeout", "busy"]),
+    challengeObserved: z.boolean(),
+    interactionPerformed: z.boolean(),
+    clearanceVerified: z.boolean(),
+    attempts: z.number().int(),
+    elapsedMs: z.number(),
+    title: z.string(),
+    url: z.string(),
+    bodySnippet: z.string(),
+    widgetState,
+    tokenPresent: z.boolean(),
+    widget: widgetBox.optional(),
+    clicks: z.array(point),
+    reason: z.enum(["not_found", "stuck_verifying", "timeout", "busy"]).optional(),
+    error: z.string().optional(),
+  }),
+  run_task: z.strictObject({
+    success: z.boolean(),
+    finalText: z.string(),
+    steps: z.number().int(),
+  }),
+};
+
+/** One valid call per tool, so the sweep below can reach every result shape. */
+const CALL_ARGUMENTS = {
+  list_pages: {},
+  open_page: {},
+  select_page: { pageId: "page-1" },
+  close_page: {},
+  navigate: { url: "https://example.com/" },
+  navigate_back: {},
+  navigate_forward: {},
+  reload: {},
+  snapshot: {},
+  get_text: {},
+  take_screenshot: {},
+  click: { target: "e1" },
+  hover: { target: "e1" },
+  click_at: { x: 10, y: 20 },
+  drag: { target: "e1", dx: 40, dy: 0 },
+  list_frames: {},
+  handle_dialog: { accept: true },
+  find_challenge: {},
+  solve_challenge: {},
+  type_text: { target: "e1", text: "hello" },
+  select_option: { target: "e1", values: ["us"] },
+  set_checked: { target: "e1", checked: true },
+  press_key: { key: "Enter" },
+  scroll: { deltaY: 200 },
+  wait_for: { condition: { kind: "time", timeMs: 0 } },
+  upload_file: { target: "e1", paths: ["/tmp/a.txt"] },
+  list_downloads: {},
+  evaluate: { expression: "1 + 1" },
+  run_task: { task: "book a table" },
+};
+
+test("every tool's structured result matches its declared shape", async (context) => {
+  // Every gate open, so the sweep covers the config-gated tools too.
+  const { client, server } = await connectedClient({
+    allowEval: true,
+    allowNativeAgent: true,
+    uploadDirs: ["/tmp"],
+    downloadDir: "/tmp",
+  });
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const { tools } = await client.listTools();
+  const missingArguments = tools.filter((tool) => !(tool.name in CALL_ARGUMENTS)).map((t) => t.name);
+  assert.deepEqual(
+    missingArguments,
+    [],
+    "a new tool needs an entry in CALL_ARGUMENTS, or the sweep silently skips it",
+  );
+
+  const unchecked = [];
+  const failures = [];
+  for (const tool of tools) {
+    const result = await client.callTool({
+      name: tool.name,
+      arguments: CALL_ARGUMENTS[tool.name],
+    });
+    assert.ok(!result.isError, `${tool.name} returned an error: ${JSON.stringify(result.content)}`);
+    // snapshot, get_text, evaluate return plain text and take_screenshot an image; those
+    // carry no structured result to check.
+    if (result.structuredContent === undefined) continue;
+    const shape = RESULT_SHAPES[tool.name];
+    if (!shape) {
+      unchecked.push(tool.name);
+      continue;
+    }
+    const parsed = shape.safeParse(result.structuredContent);
+    if (!parsed.success) {
+      failures.push(`${tool.name}: ${JSON.stringify(parsed.error.issues)}`);
+    }
+  }
+
+  assert.deepEqual(failures, [], "a tool returned something its contract does not describe");
+  assert.deepEqual(
+    unchecked,
+    [],
+    "a tool returns structuredContent with no shape in RESULT_SHAPES; add one so the contract "
+    + "four documents describe is actually enforced somewhere",
+  );
+});
+
+test("the contract sweep fails when a result drifts from its shape", async (context) => {
+  // The guard above is only worth having if it can fail, and a table of shapes that quietly
+  // matches everything looks exactly like one that is working.
+  const browser = fakeBrowser();
+  browser.click = async () => ({
+    ok: true,
+    url: "https://example.com/",
+    title: "Example",
+    navigated: false,
+    // Neither of these is in the contract: one renamed, one invented.
+    navigationDone: true,
+  });
+  const server = createServer(browser, config);
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  context.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const result = await client.callTool({ name: "click", arguments: { target: "e1" } });
+  const parsed = RESULT_SHAPES.click.safeParse(result.structuredContent);
+  assert.equal(parsed.success, false);
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import test from "node:test";
 import { HELP, parseAllowedHost, parseCli, parseProxy, parseWindowSize, VERSION } from "../dist/config.js";
@@ -115,6 +115,31 @@ test("VERSION tracks package.json", async () => {
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(VERSION, pkg.version);
   assert.ok(HELP.startsWith(`chromiumfish_mcp ${pkg.version}`), "--help reports the same version");
+});
+
+test("no source file carries a raw control byte", async () => {
+  // safeDownloadName's character class was written with literal NUL, 0x1F and DEL bytes
+  // rather than escapes. It compiled and behaved correctly, so nothing caught it — but a
+  // NUL makes ripgrep classify the file as binary and skip it outright, which meant
+  // src/browser.ts, the largest file here, returned no matches for any search that did not
+  // pass --text. Escapes read the same to the compiler and keep the file greppable.
+  const offenders = [];
+  for (const dir of ["src", "test", "scripts"]) {
+    const root = new URL(`../${dir}/`, import.meta.url);
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const text = await readFile(new URL(entry.name, root), "utf8");
+      const at = [...text].findIndex((char) => {
+        const code = char.charCodeAt(0);
+        return code === 0x7f || (code < 0x20 && char !== "\n" && char !== "\r" && char !== "\t");
+      });
+      if (at >= 0) {
+        const code = text.charCodeAt(at).toString(16).padStart(4, "0");
+        offenders.push(`${dir}/${entry.name}: U+${code} at offset ${at}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], "write control characters as \\xNN escapes");
 });
 
 test("separates proxy credentials from the server URL", () => {

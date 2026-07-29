@@ -117,6 +117,14 @@ export interface ActionResult {
    */
   navigationPending?: boolean;
   /**
+   * The action started a top-level navigation that is never arriving: blocked by
+   * --allowed-host, a host that does not resolve, a scheme handed off to another
+   * application. The action ran; the page simply did not move, and waiting for the
+   * destination would wait forever. Without this the result is an ordinary
+   * ok / navigated: false, which reads as though the click did nothing at all.
+   */
+  navigationFailed?: { url: string; reason: string };
+  /**
    * HTTP status of the document this action loaded. Only the navigation tools carry one:
    * they hold the response object. A 404 or a 500 loads like any other page, so without
    * this an error page reads as a successful navigation.
@@ -376,10 +384,12 @@ interface SideEffectSink {
 interface ActionBaseline {
   url: string;
   pages: Page[];
-  /** Resolves once the main frame commits a new document. */
-  committed: Promise<void>;
+  /** Resolves once the main frame commits a new document, or the navigation is cancelled. */
+  settled: Promise<void>;
   /** A top-level navigation has been requested but has not committed yet. */
   pending: () => boolean;
+  /** The top-level navigation the action started, and why it never arrived. */
+  failure: () => { url: string; reason: string } | undefined;
   /** Dialogs answered and downloads started while this window was open. */
   sink: SideEffectSink;
   /** Detaches the listeners; every actionResult must call it. */
@@ -581,7 +591,10 @@ export function safeDownloadName(suggested: string): string {
   const base = suggested.split(/[/\\]/).pop() ?? "";
   const cleaned = base
     // Control characters, the set Windows forbids outright, and anything else exotic.
-    .replace(/[ -<>:"|?*]/g, "")
+    // Written as escapes, not as the bytes themselves: a literal NUL here made ripgrep
+    // classify this whole file as binary and skip it, so searches for anything in it came
+    // back empty rather than failing. test/config.test.mjs guards against writing them back.
+    .replace(/[\x00-\x1f\x7f<>:"|?*]/g, "")
     // Leading dots would hide the file; trailing dots and spaces are dropped by Windows
     // anyway, which would silently change the name out from under the reported one.
     .replace(/^[.\s]+/, "")
@@ -629,6 +642,8 @@ export class ChromiumFishBrowser implements BrowserApi {
    */
   private contextStart?: Promise<BrowserContext>;
   private pageStart?: Promise<Page>;
+  /** Set by close(), so a tool call arriving during shutdown cannot start a new browser. */
+  private closing = false;
   /** Answer armed by handle_dialog for the next dialog on that page; consumed once. */
   private readonly armedDialogs = new WeakMap<Page, { accept: boolean; promptText?: string }>();
   /** Active action windows collecting what happened while they are open. */
@@ -655,6 +670,7 @@ export class ChromiumFishBrowser implements BrowserApi {
    * clears the latch, so the next call retries rather than joining a rejected promise.
    */
   private async ensureContext(): Promise<BrowserContext> {
+    if (this.closing) throw new Error("Browser is shutting down");
     if (this.context && this.browser?.isConnected()) return this.context;
     this.contextStart ??= this.startContext().finally(() => {
       this.contextStart = undefined;
@@ -856,6 +872,19 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.downloadLog.map((record) => ({ ...record }));
   }
 
+  /**
+   * Second enforcement point for --allowed-host, behind the per-tool assertNavigationUrl:
+   * this one catches navigations the page starts on its own — a redirect, a link, a form
+   * post, a popup — which no tool call passes through.
+   *
+   * Interception is not free, and the cost is not only latency. Playwright's own note on
+   * route is "Enabling routing disables http cache", so every subresource on every page
+   * round-trips through Node and nothing survives to the next visit. On a browser whose
+   * reason to exist is looking ordinary to a challenge, that second part is the one that
+   * matters: a real browser caches, and one that re-fetches everything it already has is
+   * anomalous. The route is still worth it — a navigation guard that only covers tool calls
+   * is not a guard — but it stays off entirely unless a host list was configured.
+   */
   private async installNavigationGuard(context: BrowserContext): Promise<void> {
     if (this.config.allowedHosts.length === 0) return;
     await context.route("**/*", async (route) => {
@@ -1083,29 +1112,52 @@ export class ChromiumFishBrowser implements BrowserApi {
    * torn down before the first read, and by then the only evidence has already gone past.
    */
   private actionBaseline(page: Page): ActionBaseline {
-    let commit!: () => void;
-    const committed = new Promise<void>((resolve) => {
-      commit = resolve;
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
     });
-    let started = false;
+    /** The main-frame navigation request this action started, until it commits or dies. */
+    let navigation: PlaywrightRequest | undefined;
     let done = false;
+    let failure: { url: string; reason: string } | undefined;
     const onRequest = (request: PlaywrightRequest) => {
-      if (started || !request.isNavigationRequest()) return;
+      if (navigation || done || !request.isNavigationRequest()) return;
       // frame() throws once a frame is detached, which only means this is not the main one.
       try {
         if (request.frame() !== page.mainFrame()) return;
       } catch {
         return;
       }
-      started = true;
+      navigation = request;
     };
     const onNavigated = (frame: Frame) => {
       if (frame !== page.mainFrame()) return;
       done = true;
-      commit();
+      // A retried navigation whose first attempt failed did arrive after all.
+      failure = undefined;
+      settle();
+    };
+    /**
+     * A cancelled navigation never fires framenavigated, and without this listener it is
+     * indistinguishable from one that is merely slow: the wait in actionResult would run to
+     * its full ten seconds and then report navigationPending on a navigation that is never
+     * coming — which the instructions tell the model means "it worked, wait for the
+     * destination", so it goes on to spend a wait_for timeout on a page that will never
+     * load. --allowed-host aborts one on every blocked link, Chromium aborts one whenever a
+     * navigation turns out to be a download, and an unresolvable host does the same.
+     */
+    const onRequestFailed = (request: PlaywrightRequest) => {
+      if (done || request !== navigation) return;
+      navigation = undefined;
+      failure = { url: request.url(), reason: request.failure()?.errorText ?? "unknown" };
+      // settled only ever resolves once, so a page that fails one navigation and then starts
+      // another gets reported as pending without a second wait. That is the rare case, and
+      // it still beats the ten seconds every cancelled navigation used to cost.
+      settle();
     };
     page.on("request", onRequest);
     page.on("framenavigated", onNavigated);
+    page.on("requestfailed", onRequestFailed);
     const { sink, close } = this.openSideEffectSink(page);
 
     let attached = true;
@@ -1114,20 +1166,22 @@ export class ChromiumFishBrowser implements BrowserApi {
       attached = false;
       page.off("request", onRequest);
       page.off("framenavigated", onNavigated);
+      page.off("requestfailed", onRequestFailed);
       close();
     };
     // These listeners cannot change any outcome once the commit window has closed, so that
     // window is their lifetime. Enforcing it here rather than relying on release() alone is
     // what keeps an action that throws on its way to actionResult — a setInputFiles timeout,
-    // a failed selectOption — from leaving a pair attached for the rest of the session.
+    // a failed selectOption — from leaving a set attached for the rest of the session.
     const expiry = setTimeout(detach, ACTION_NAV_COMMIT_TIMEOUT_MS + ACTION_LOAD_TIMEOUT_MS);
     expiry.unref?.();
 
     return {
       url: page.url(),
       pages: this.openPages(),
-      committed,
-      pending: () => started && !done,
+      settled,
+      pending: () => navigation !== undefined && !done,
+      failure: () => failure,
       sink,
       release: () => {
         clearTimeout(expiry);
@@ -1183,7 +1237,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       // nothing still returns in the settle window.
       if (baseline.pending()) {
         await Promise.race([
-          baseline.committed,
+          baseline.settled,
           page.waitForTimeout(ACTION_NAV_COMMIT_TIMEOUT_MS).catch(() => undefined),
         ]).catch(() => undefined);
       }
@@ -1193,6 +1247,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       // Still in flight after the bound above: a slow endpoint or a redirect chain. Report
       // that rather than let the stale reads below read as "the action did nothing".
       const navigationPending = baseline.pending();
+      const failure = baseline.failure();
       const url = page.url();
       const navigated = url !== baseline.url;
       // The previous document is gone; its handles would only fail the staleness check later.
@@ -1208,6 +1263,12 @@ export class ChromiumFishBrowser implements BrowserApi {
         navigated,
       };
       if (navigationPending) result.navigationPending = true;
+      // A navigation that became a download did not fail: Chromium aborts the request and
+      // hands the transfer to the download manager, and downloads below already says so.
+      // Reporting it as a failed navigation would describe a working download as a dead end.
+      const becameDownload = baseline.sink.downloads.length > 0
+        && failure?.reason.includes("ERR_ABORTED") === true;
+      if (failure && !navigationPending && !becameDownload) result.navigationFailed = failure;
       if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
       // Before the snapshot, so a page that raised a dialog still reports it even if the
       // snapshot below throws.
@@ -2559,6 +2620,15 @@ export class ChromiumFishBrowser implements BrowserApi {
   }
 
   async close(): Promise<void> {
+    // Set before the awaits below, so a tool call that arrives during shutdown does not
+    // start a browser this close() has already stopped waiting for.
+    this.closing = true;
+    // A launch already in flight resolves after this point and assigns this.browser and
+    // this.context on its way out. Tearing down first would run against the very fields
+    // that launch is about to repopulate, leaving a browser process nothing holds a
+    // reference to any more — the shutdown edge of the same race the start latches exist
+    // to prevent. allSettled because a launch that failed is one less thing to close.
+    await Promise.allSettled([this.contextStart, this.pageStart]);
     const context = this.context;
     const browser = this.browser;
     this.context = undefined;
