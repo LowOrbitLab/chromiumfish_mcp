@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
+import { Readable } from "node:stream";
 import { assertUploadPath, ChromiumFishBrowser, safeDownloadName } from "../dist/browser.js";
 
 const config = {
@@ -333,8 +334,8 @@ test("a download lands in the configured root, and a repeat does not overwrite i
   const download = (name) => ({
     url: () => `https://example.com/${name}`,
     suggestedFilename: () => name,
-    saveAs: async (target) => { await writeFile(target, "report"); },
-    delete: async () => assert.fail("a kept download must not be deleted"),
+    createReadStream: async () => Readable.from(["report"]),
+    delete: async () => undefined,
   });
 
   const first = { url: "", suggestedFilename: "../../report.pdf", state: "pending" };
@@ -381,6 +382,7 @@ test("navigation guard blocks disallowed top-level requests only", async () => {
   const browser = new ChromiumFishBrowser({ ...config, allowedHosts: ["example.com"] });
   let handler;
   await browser.installNavigationGuard({
+    on: () => undefined,
     route: async (pattern, callback) => {
       assert.equal(pattern, "**/*");
       handler = callback;
@@ -389,6 +391,8 @@ test("navigation guard blocks disallowed top-level requests only", async () => {
 
   function mockRoute(url, { navigation = true, topLevel = true, frameError = false } = {}) {
     const actions = [];
+    const page = {};
+    browser.redirectGuards.set(page, Promise.resolve());
     return {
       actions,
       request: () => ({
@@ -396,7 +400,7 @@ test("navigation guard blocks disallowed top-level requests only", async () => {
         url: () => url,
         frame: () => {
           if (frameError) throw new Error("Frame unavailable");
-          return { parentFrame: () => topLevel ? null : {} };
+          return { parentFrame: () => topLevel ? null : {}, page: () => page };
         },
       }),
       continue: async () => actions.push("continue"),
@@ -573,6 +577,7 @@ test("frame snapshot references support hover, selectOption, and setChecked", as
     scrollIntoViewIfNeeded: async () => undefined,
     boundingBox: async () => ({ x: 30, y: 90, width: 20, height: 20 }),
     isChecked: async () => checked,
+    click: async () => { checked = true; },
   };
   child.locator = () => ({
     elementHandles: async () => [selectHandle, checkboxHandle],
@@ -630,6 +635,7 @@ test("actions report navigation, opened pages, and an opt-in snapshot", async ()
     evaluate: async () => LIVE,
     scrollIntoViewIfNeeded: async () => undefined,
     boundingBox: async () => ({ x: 10, y: 10, width: 40, height: 20 }),
+    click: async () => page.mouse.up(),
   };
   const main = {
     url: () => currentUrl,
@@ -807,12 +813,19 @@ test("a single line wider than maxChars still reports its element", async () => 
   assert.deepEqual(disposed, []);
 });
 
-test("type_text clears, types, submits, and presses through the humanized click path", async () => {
+test("type_text checks the target before clearing, typing, and submitting", async () => {
   const events = [];
   const handle = {
     evaluate: async () => LIVE,
     scrollIntoViewIfNeeded: async () => undefined,
     boundingBox: async () => ({ x: 100, y: 200, width: 240, height: 32 }),
+    click: async (options) => {
+      assert.ok(options.delay >= 45 && options.delay <= 115);
+      assert.ok(options.timeout > 0);
+      assert.equal(options.force, undefined);
+      assert.equal(options.noWaitAfter, true);
+      events.push("checked-click");
+    },
   };
   const main = {
     url: () => "https://example.com/",
@@ -849,13 +862,9 @@ test("type_text clears, types, submits, and presses through the humanized click 
   assert.equal(result.navigated, false);
 
   assert.ok(!events.includes("click"), "type_text must not emit a gapless mouse.click");
-  // down and up separated by a wait is what clickHandle contributes over mouse.click.
-  const down = events.indexOf("down");
-  assert.ok(down > 0 && events[down - 1] === "move");
-  assert.equal(events[down + 1], "wait");
-  assert.equal(events[down + 2], "up");
-
-  const afterClick = events.slice(events.indexOf("up") + 1);
+  const click = events.indexOf("checked-click");
+  assert.ok(click > 0 && events[click - 1] === "move");
+  const afterClick = events.slice(click + 1);
   assert.deepEqual(afterClick.slice(0, 2), [
     `press:${process.platform === "darwin" ? "Meta+A" : "Control+A"}`,
     "press:Backspace",
@@ -1599,6 +1608,10 @@ function navigatingPage({ commitAfterMs = 40, from = "https://example.com/login"
     boundingBox: async () => ({ x: 10, y: 10, width: 40, height: 20 }),
   };
   const state = { url: from, committed: false, titleReads: [] };
+  handle.click = async () => {
+    await page.mouse.down();
+    await page.mouse.up();
+  };
   const page = {
     frames: () => [main],
     mainFrame: () => main,

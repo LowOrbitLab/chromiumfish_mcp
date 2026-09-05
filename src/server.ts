@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { BrowserApi } from "./browser.js";
 import type { ServerConfig } from "./config.js";
@@ -6,6 +7,7 @@ import { SNAPSHOT_CHARS, SNAPSHOT_ELEMENTS, TEXT_CHARS, VERSION } from "./config
 // turnstile.ts is a pure module with no Playwright imports, so depending on it here keeps
 // the browser-free testability this file relies on.
 import { SOLVE_MAX_CLICKS, SOLVE_TIMEOUT_MS } from "./turnstile.js";
+import { withOperationSignal } from "./operation-queue.js";
 
 const text = (value: unknown) => ({
   content: [{
@@ -42,6 +44,9 @@ const returnSnapshotInput = {
 };
 
 const INSTRUCTIONS = `Drives one persistent ChromiumFish browser context over MCP.
+
+Page actions in one browser session run serially in arrival order; page selection and
+snapshots queue too.
 
 Workflow: navigate -> snapshot -> act on refs (e1, e2, ...) -> act again.
 
@@ -84,6 +89,8 @@ Action results
   another application. The page did not move and waiting for it would wait forever. It
   carries the URL and the browser's own reason; net::ERR_BLOCKED_BY_CLIENT is --allowed-host.
 - Pass returnSnapshot: true to get the action result and a fresh snapshot in one call.
+- snapshotError means the action completed but the follow-up snapshot failed. Keep the
+  action result and retry only the read; do not repeat a click, submit, or upload over it.
 - newPages lists tabs the action opened. The current page never switches automatically;
   use select_page to move to one.
 
@@ -175,7 +182,14 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     { instructions: INSTRUCTIONS },
   );
 
-  server.registerTool(
+  const registerTool = <Args extends z.ZodRawShape>(
+    name: string,
+    definition: { description: string; inputSchema: Args; annotations: Record<string, boolean> },
+    callback: ToolCallback<Args>,
+  ) => server.registerTool(name, definition, ((args, extra) =>
+    withOperationSignal(extra.signal, () => callback(args, extra))) as ToolCallback<Args>);
+
+  registerTool(
     "list_pages",
     {
       description: "Report browser running state and list open pages without starting the browser.",
@@ -185,7 +199,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async () => structured(await browser.listPages()),
   );
 
-  server.registerTool(
+  registerTool(
     "open_page",
     {
       description: "Create and select a new page, optionally opening an HTTP/HTTPS URL.",
@@ -195,7 +209,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ url }) => structured(await browser.openPage(url)),
   );
 
-  server.registerTool(
+  registerTool(
     "select_page",
     {
       description: "Select the current page by a pageId returned from list_pages.",
@@ -205,7 +219,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ pageId }) => structured(await browser.selectPage(pageId)),
   );
 
-  server.registerTool(
+  registerTool(
     "close_page",
     {
       description: "Close the specified page, or the current page when pageId is omitted.",
@@ -215,7 +229,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ pageId }) => structured(await browser.closePage(pageId)),
   );
 
-  server.registerTool(
+  registerTool(
     "navigate",
     {
       description: "Open an HTTP/HTTPS URL in the current page and wait for DOMContentLoaded.",
@@ -225,7 +239,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ url, returnSnapshot }) => action(await browser.navigate(url, { returnSnapshot })),
   );
 
-  server.registerTool(
+  registerTool(
     "navigate_back",
     {
       description: "Navigate the current page to its previous history entry.",
@@ -235,7 +249,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ returnSnapshot }) => action(await browser.navigateBack({ returnSnapshot })),
   );
 
-  server.registerTool(
+  registerTool(
     "navigate_forward",
     {
       description: "Navigate the current page to its next history entry.",
@@ -245,7 +259,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ returnSnapshot }) => action(await browser.navigateForward({ returnSnapshot })),
   );
 
-  server.registerTool(
+  registerTool(
     "reload",
     {
       description: "Reload the current page and wait for DOMContentLoaded.",
@@ -255,7 +269,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ returnSnapshot }) => action(await browser.reload({ returnSnapshot })),
   );
 
-  server.registerTool(
+  registerTool(
     "snapshot",
     {
       description: "List visible interactive elements in the main document or a frame, with bounded output and temporary references.",
@@ -277,7 +291,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     })),
   );
 
-  server.registerTool(
+  registerTool(
     "get_text",
     {
       description: "Read visible text from the first matching region in the main document or a frame, bounded by maxChars and --max-text-chars.",
@@ -296,7 +310,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     })),
   );
 
-  server.registerTool(
+  registerTool(
     "take_screenshot",
     {
       description:
@@ -318,7 +332,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "click",
     {
       description: "Click an element reference returned by snapshot or a CSS selector. Use frameId with selectors inside a frame. Returns the resulting url, title, navigated, and any newPages.",
@@ -335,7 +349,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "hover",
     {
       description: "Move the mouse over an element reference or CSS selector without clicking.",
@@ -352,7 +366,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "click_at",
     {
       description:
@@ -367,7 +381,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ x, y, returnSnapshot }) => action(await browser.clickAt(x, y, { returnSnapshot })),
   );
 
-  server.registerTool(
+  registerTool(
     "drag",
     {
       description:
@@ -391,7 +405,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "list_frames",
     {
       description:
@@ -406,7 +420,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "handle_dialog",
     {
       description:
@@ -426,7 +440,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async ({ accept, promptText }) => structured(await browser.handleDialog(accept, promptText)),
   );
 
-  server.registerTool(
+  registerTool(
     "find_challenge",
     {
       description:
@@ -437,7 +451,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     async () => structured(await browser.findChallenge()),
   );
 
-  server.registerTool(
+  registerTool(
     "solve_challenge",
     {
       description:
@@ -460,7 +474,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     ),
   );
 
-  server.registerTool(
+  registerTool(
     "type_text",
     {
       description: "Focus an element and enter text, optionally clearing its current value and pressing Enter afterward. Use frameId with selectors inside a frame.",
@@ -481,7 +495,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "select_option",
     {
       description: "Select one or more native dropdown options by value or label.",
@@ -500,7 +514,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "set_checked",
     {
       description: "Set a checkbox state, or select a radio element with checked=true. Radios cannot be unchecked directly.",
@@ -518,7 +532,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "press_key",
     {
       description: "Press a key in the current page, such as Enter, Escape, ArrowDown, or Control+A.",
@@ -531,7 +545,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "scroll",
     {
       description: "Scroll the current page; positive deltaY scrolls down and negative deltaY scrolls up.",
@@ -549,7 +563,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
     }),
   );
 
-  server.registerTool(
+  registerTool(
     "wait_for",
     {
       description: "Wait for one typed condition: element, text, URL glob, page load state, or duration.",
@@ -567,7 +581,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   );
 
   if (config.uploadDirs.length > 0) {
-    server.registerTool(
+    registerTool(
       "upload_file",
       {
         description:
@@ -591,7 +605,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   }
 
   if (config.downloadDir) {
-    server.registerTool(
+    registerTool(
       "list_downloads",
       {
         description:
@@ -608,7 +622,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   }
 
   if (config.allowEval) {
-    server.registerTool(
+    registerTool(
       "evaluate",
       {
         description: "Execute arbitrary JavaScript in the current page. This high-risk tool is registered only when --allow-eval is enabled.",
@@ -620,7 +634,7 @@ export function createServer(browser: BrowserApi, config: ServerConfig): McpServ
   }
 
   if (config.allowNativeAgent) {
-    server.registerTool(
+    registerTool(
       "run_task",
       {
         description: "Delegate a complete goal to the native ChromiumFish browser agent. Requires an OpenAI-compatible endpoint configured through environment variables.",

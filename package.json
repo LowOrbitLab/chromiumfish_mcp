@@ -33,6 +33,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
+    "test:integration": "npm run build && node --test test/integration/p1.test.mjs",
     "prepare": "npm run build",
     "prepublishOnly": "npm test"
   },

@@ -25,6 +25,10 @@ An action that navigates waits for the new document to commit before reporting, 
 
 Set `returnSnapshot: true` on any of those tools to receive the action result and a fresh snapshot in a single call. The snapshot arrives as a separate plain-text content block rather than a JSON-escaped string, and — like every snapshot — it renumbers element references.
 
+If the snapshot taken after a completed action fails, the action still returns `ok: true` and describes the read error in `snapshotError`; navigation, dialog, and download results are kept. Retry only the snapshot read, never the action.
+
+Page actions in one session run serially in arrival order; page selection and snapshots queue too. A call cancelled while queued is skipped; cancelling an action that has already started does not undo page side effects that already happened. Closing the session rejects any operations still queued.
+
 ## Snapshots and element references
 
 `snapshot` lists visible interactive elements and assigns temporary references (`e1`, `e2`, …). A call returns output like:
@@ -125,6 +129,8 @@ Downloads are always accepted, so a page whose flow depends on one behaves the s
 `state` is `saved`, `pending`, `failed`, or `discarded`. A large transfer is still `pending` when the action that started it returns — call `list_downloads` to see it settle. Without `--download-dir` every download reports `discarded`, which is the honest version of the old behavior: the file went to a temporary directory and was deleted on exit, so the click appeared to do nothing at all.
 
 The written name is not the name the server asked for. `suggestedFilename` comes from the remote origin's `Content-Disposition` header, so it is chosen by whoever the page fetched from; it is reduced to a bare base name, stripped of characters that are illegal or hidden on the target filesystem, and the resolved path is checked against the root before anything is written. A name that collides with an existing file gets a ` (2)` suffix rather than overwriting it. `file` reports what was actually written.
+
+File names are allocated by exclusive creation, so concurrent downloads never overwrite an existing file. A failed transfer removes the partial file it created; a successful save cleans up the browser's temporary copy. The download directory itself may be a symlink; the boundary check uses its real path.
 
 ## Waiting
 

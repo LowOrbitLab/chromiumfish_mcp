@@ -59,7 +59,13 @@ A JavaScript dialog is answered the instant it opens, because a page left waitin
 
 Every navigation and interaction tool reports the resulting `url`, `title`, `navigated`, and any `newPages`, so a client only needs a follow-up `snapshot` when the page actually changed; `returnSnapshot: true` returns the action result and a fresh snapshot in one call. An action that navigates waits for the new document before reporting, so those fields describe the page it arrived on; one whose navigation is still in flight after ten seconds reports `navigationPending: true` rather than describing the page being left as though nothing happened, and one whose navigation was cancelled outright — blocked by `--allowed-host`, an unresolvable host — reports `navigationFailed` with the browser's own reason instead of waiting out that bound for a page that is never coming. Reference numbers are never reused, so one held across a snapshot fails with an error instead of acting on a different element; `snapshot` also reports ARIA roles, so `role=button[name="Submit"]` works in any `target` field as a re-render-proof alternative. The server ships MCP `instructions` describing this workflow, reference lifetime, and the challenge sequence.
 
+Page actions, page switches, and snapshots in one session run serially in call order, so concurrent input cannot interleave into the same control. An MCP call cancelled while queued never runs later. Element clicks check for occlusion and actionability, and return an error when the element cannot be clicked.
+
+If the snapshot requested by `returnSnapshot: true` fails, the result keeps the action's success and adds `snapshotError`. Retry only the read; a failed snapshot is never a reason to repeat a click, submit, or upload.
+
 Snapshot references, frame-aware interaction, waiting, and the cross-origin challenge workflow are covered in **[docs/USAGE.md](docs/USAGE.md)**.
+
+With `--allowed-host`, every hop of a top-level redirect is checked at the browser's response-header stage, so an unauthorized address never receives the redirected request. This mode also disables Service Workers, which could otherwise bypass navigation interception; ordinary subframes and static assets can still reach other hosts. Download file names are allocated atomically by exclusive creation, so concurrent downloads with the same name never overwrite each other.
 
 ## Command-line options
 
@@ -102,6 +108,8 @@ node dist/index.js --help
 ```
 
 The suite uses an in-memory MCP transport to verify tool discovery, dangerous-tool opt-in, and results. It does not download or launch a browser.
+
+`npm run test:integration` runs real-browser regressions against local HTTP pages, covering redirects, occlusion, concurrent actions, and downloads. Point `CHROME_BIN` at a browser, or run `npx playwright-core install chromium` first. CI runs both the unit tests and these browser regressions.
 
 ## License
 

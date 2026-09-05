@@ -707,6 +707,7 @@ const ACTION = {
   })).optional(),
   dialogsOmitted: z.number().int().optional(),
   downloads: z.array(downloadRecord).optional(),
+  snapshotError: z.string().optional(),
 };
 
 const TARGETED = { ...ACTION, target: z.string() };

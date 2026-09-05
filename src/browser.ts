@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import type { Stats } from "node:fs";
-import { mkdir, realpath, stat } from "node:fs/promises";
+import { mkdir, open, realpath, stat, unlink } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { buildArgs, ChromiumFish } from "chromiumfish";
 import type {
@@ -16,6 +17,7 @@ import type {
 } from "playwright-core";
 import { chromium } from "playwright-core";
 import { snapshotRole } from "./aria.js";
+import { serialized } from "./operation-queue.js";
 import { SNAPSHOT_CHARS, SNAPSHOT_ELEMENTS, TEXT_CHARS } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import {
@@ -141,6 +143,8 @@ export interface ActionResult {
   /** Downloads the action started. State may still be pending; list_downloads settles it. */
   downloads?: DownloadRecord[];
   snapshot?: string;
+  /** The action completed and only the follow-up snapshot failed; callers must not redo the action. */
+  snapshotError?: string;
 }
 
 export interface SelectOptionResult extends ActionResult {
@@ -606,14 +610,18 @@ export function safeDownloadName(suggested: string): string {
   return cleaned;
 }
 
-/** First free name in dir: "report.pdf", then "report (2).pdf", and so on. */
-async function uniqueDownloadPath(dir: string, name: string): Promise<string> {
+/** Create and hold the file exclusively, so two downloads cannot both claim a target after checking it. */
+async function reserveDownload(dir: string, name: string): Promise<{ path: string; handle: FileHandle }> {
   const dot = name.lastIndexOf(".");
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const extension = dot > 0 ? name.slice(dot) : "";
   for (let index = 1; index < 1_000; index += 1) {
     const candidate = join(dir, index === 1 ? name : `${stem} (${index})${extension}`);
-    if (!existsSync(candidate)) return candidate;
+    try {
+      return { path: candidate, handle: await open(candidate, "wx", 0o600) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
   }
   throw new Error(`Too many downloads already named ${name}`);
 }
@@ -650,6 +658,7 @@ export class ChromiumFishBrowser implements BrowserApi {
   private readonly sideEffectSinks = new Set<SideEffectSink>();
   /** Everything downloaded this session, newest last. */
   private readonly downloadLog: DownloadRecord[] = [];
+  private readonly redirectGuards = new WeakMap<Page, Promise<void>>();
 
   constructor(private readonly config: ServerConfig) {}
 
@@ -720,6 +729,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       });
     }
     this.context = await this.browser.newContext({
+      ...(this.config.allowedHosts.length > 0 ? { serviceWorkers: "block" as const } : {}),
       viewport: {
         width: this.config.windowSize[0],
         height: this.config.windowSize[1],
@@ -784,6 +794,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     });
   }
 
+  @serialized
   async handleDialog(accept: boolean, promptText?: string): Promise<DialogArmed> {
     const page = await this.page();
     const armed: { accept: boolean; promptText?: string } = { accept };
@@ -847,24 +858,34 @@ export class ChromiumFishBrowser implements BrowserApi {
       await download.delete().catch(() => undefined);
       return;
     }
+    let reserved: Awaited<ReturnType<typeof reserveDownload>> | undefined;
+    let stream: Awaited<ReturnType<Download["createReadStream"]>> | undefined;
     try {
       await mkdir(dir, { recursive: true });
-      const target = await uniqueDownloadPath(dir, safeDownloadName(record.suggestedFilename));
-      // Second check, after the name was already reduced to a bare base name: nothing built
-      // from remote input reaches saveAs without being proven to land inside the root.
       const root = await realpath(dir);
-      const rel = relative(root, resolve(target));
+      const name = safeDownloadName(record.suggestedFilename);
+      const rel = relative(root, resolve(root, name));
       if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
         throw new Error(`refused to write outside ${dir}`);
       }
-      await download.saveAs(target);
-      const info = await stat(target);
-      record.file = basename(target);
+      stream = await download.createReadStream();
+      reserved = await reserveDownload(root, name);
+      await reserved.handle.writeFile(stream);
+      const info = await reserved.handle.stat();
+      await reserved.handle.close();
+      record.file = basename(reserved.path);
       record.bytes = info.size;
       record.state = "saved";
     } catch (error) {
+      if (reserved) {
+        await reserved.handle.close().catch(() => undefined);
+        await unlink(reserved.path).catch(() => undefined);
+      }
       record.state = "failed";
       record.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      stream?.destroy();
+      await download.delete().catch(() => undefined);
     }
   }
 
@@ -887,6 +908,9 @@ export class ChromiumFishBrowser implements BrowserApi {
    */
   private async installNavigationGuard(context: BrowserContext): Promise<void> {
     if (this.config.allowedHosts.length === 0) return;
+    context.on("page", (page) => {
+      void this.ensureRedirectGuard(page).catch(() => page.close().catch(() => undefined));
+    });
     await context.route("**/*", async (route) => {
       const request = route.request();
       let allow = true;
@@ -894,7 +918,12 @@ export class ChromiumFishBrowser implements BrowserApi {
         try {
           // Only top-level navigations are policed; subframes and assets pass through.
           const topLevel = request.frame().parentFrame() === null;
-          if (topLevel) assertNavigationUrl(request.url(), this.config.allowedHosts);
+          if (topLevel) {
+            assertNavigationUrl(request.url(), this.config.allowedHosts);
+            const guard = this.redirectGuards.get(request.frame().page());
+            if (!guard) throw new Error("Navigation guard is not ready");
+            await guard;
+          }
         } catch {
           allow = false;
         }
@@ -905,6 +934,47 @@ export class ChromiumFishBrowser implements BrowserApi {
         // Route already handled or the page closed mid-flight; nothing actionable.
       }
     });
+  }
+
+  /** Playwright routes do not re-intercept redirects, so the next hop is validated at the response-header stage. */
+  private ensureRedirectGuard(page: Page): Promise<void> {
+    if (this.config.allowedHosts.length === 0) return Promise.resolve();
+    let guard = this.redirectGuards.get(page);
+    if (!guard) {
+      guard = this.startRedirectGuard(page);
+      this.redirectGuards.set(page, guard);
+    }
+    return guard;
+  }
+
+  private async startRedirectGuard(page: Page): Promise<void> {
+    const session = await page.context().newCDPSession(page);
+    try {
+      const { frameTree } = await session.send("Page.getFrameTree");
+      session.on("Network.requestIntercepted", (event) => {
+        let blocked = false;
+        if (event.frameId === frameTree.frame.id && event.redirectUrl) {
+          try {
+            assertNavigationUrl(new URL(event.redirectUrl, event.request.url).href, this.config.allowedHosts);
+          } catch {
+            blocked = true;
+          }
+        }
+        void session.send("Network.continueInterceptedRequest", {
+          interceptionId: event.interceptionId,
+          ...(blocked ? { errorReason: "BlockedByClient" as const } : {}),
+        }).catch(() => page.close().catch(() => undefined));
+      });
+      await session.send("Network.enable");
+      // Network-domain response interception coexists with the Fetch-domain request interception Playwright uses.
+      await session.send("Network.setRequestInterception", {
+        patterns: [{ urlPattern: "*", resourceType: "Document", interceptionStage: "HeadersReceived" }],
+      });
+      page.once("close", () => void session.detach().catch(() => undefined));
+    } catch (error) {
+      await session.detach().catch(() => undefined);
+      throw error;
+    }
   }
 
   private trackPage(page: Page): void {
@@ -971,6 +1041,7 @@ export class ChromiumFishBrowser implements BrowserApi {
    * concurrent tool calls would each open one and leave a stray tab behind.
    */
   private async page(): Promise<Page> {
+    if (this.closing) throw new Error("Browser is shutting down");
     if (this.currentPage && !this.currentPage.isClosed()) return this.currentPage;
     this.pageStart ??= this.startPage().finally(() => {
       this.pageStart = undefined;
@@ -986,10 +1057,12 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (existing) {
       this.currentPage = existing;
       this.trackPage(existing);
+      await this.ensureRedirectGuard(existing);
       return existing;
     }
     this.currentPage = await context.newPage();
     this.trackPage(this.currentPage);
+    await this.ensureRedirectGuard(this.currentPage);
     return this.currentPage;
   }
 
@@ -1003,11 +1076,13 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { running: true, pages };
   }
 
+  @serialized
   async openPage(rawUrl?: string): Promise<PageSummary> {
     const context = await this.ensureContext();
     const page = await context.newPage();
     this.trackPage(page);
     this.currentPage = page;
+    await this.ensureRedirectGuard(page);
     if (rawUrl) {
       const url = assertNavigationUrl(rawUrl, this.config.allowedHosts);
       // Reported for the same reason the navigation tools report it: an error page loads
@@ -1018,16 +1093,19 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.pageSummary(page);
   }
 
+  @serialized
   async selectPage(pageId: string): Promise<PageSummary> {
     const context = this.context;
     if (!context || !this.browser?.isConnected()) throw new Error("Browser is not running");
     const page = context.pages().find((candidate) => this.pageId(candidate) === pageId && !candidate.isClosed());
     if (!page) throw new Error(`Page ${pageId} not found`);
+    await this.ensureRedirectGuard(page);
     this.currentPage = page;
     await page.bringToFront();
     return this.pageSummary(page);
   }
 
+  @serialized
   async closePage(pageId?: string): Promise<PageListResult> {
     const context = this.context;
     if (!context || !this.browser?.isConnected()) throw new Error("Browser is not running");
@@ -1078,8 +1156,16 @@ export class ChromiumFishBrowser implements BrowserApi {
     if (response) result.status = response.status();
     if (opened.length > 0) result.newPages = opened.map((candidate) => this.pageId(candidate));
     if (sink) this.applySideEffects(result, sink);
-    if (options.returnSnapshot) result.snapshot = await this.snapshot();
+    if (options.returnSnapshot) await this.appendSnapshot(result);
     return result;
+  }
+
+  private async appendSnapshot(result: ActionResult): Promise<void> {
+    try {
+      result.snapshot = await this.snapshot();
+    } catch (error) {
+      result.snapshotError = clip(error instanceof Error ? error.message : String(error), 1_000);
+    }
   }
 
   /**
@@ -1273,7 +1359,7 @@ export class ChromiumFishBrowser implements BrowserApi {
       // Before the snapshot, so a page that raised a dialog still reports it even if the
       // snapshot below throws.
       this.applySideEffects(result, baseline.sink);
-      if (options.returnSnapshot) result.snapshot = await this.snapshot();
+      if (options.returnSnapshot) await this.appendSnapshot(result);
       return result;
     } finally {
       baseline.release();
@@ -1291,22 +1377,26 @@ export class ChromiumFishBrowser implements BrowserApi {
     return title;
   }
 
+  @serialized
   async navigate(rawUrl: string, options?: ActionOptions): Promise<ActionResult> {
     const url = assertNavigationUrl(rawUrl, this.config.allowedHosts);
     const page = await this.page();
     return this.navigationAction(page, options, () => page.goto(url.href, { waitUntil: "domcontentloaded" }));
   }
 
+  @serialized
   async navigateBack(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     return this.navigationAction(page, options, () => page.goBack({ waitUntil: "domcontentloaded" }));
   }
 
+  @serialized
   async navigateForward(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     return this.navigationAction(page, options, () => page.goForward({ waitUntil: "domcontentloaded" }));
   }
 
+  @serialized
   async reload(options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     return this.navigationAction(page, options, () => page.reload({ waitUntil: "domcontentloaded" }));
@@ -1336,6 +1426,7 @@ export class ChromiumFishBrowser implements BrowserApi {
    * them — a result that reads as an answer. So a scan that saw the document go away is
    * thrown out and taken again against the document that replaced it.
    */
+  @serialized
   async snapshot(options: SnapshotOptions = {}): Promise<string> {
     const page = await this.page();
     const first = await this.snapshotOnce(page, options);
@@ -1502,6 +1593,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     }
   }
 
+  @serialized
   async getText(options: GetTextOptions = {}): Promise<string> {
     const page = await this.page();
     const frame = this.resolveFrame(page, options.frameId);
@@ -1523,6 +1615,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return clip(text, maxChars);
   }
 
+  @serialized
   async takeScreenshot(options: ScreenshotOptions = {}): Promise<Buffer> {
     const page = await this.page();
     const fullPage = options.fullPage ?? false;
@@ -1755,11 +1848,16 @@ export class ChromiumFishBrowser implements BrowserApi {
 
   private async clickHandle(page: Page, handle: InteractiveHandle): Promise<void> {
     await this.moveTo(page, handle);
-    await page.mouse.down();
-    await page.waitForTimeout(45 + Math.floor(Math.random() * 70));
-    await page.mouse.up();
+    // Keep the curved path and key timing, and let Playwright check occlusion, stability, and enabled state.
+    await handle.click({
+      timeout: LOCATOR_TIMEOUT_MS,
+      delay: 45 + Math.floor(Math.random() * 70),
+      noWaitAfter: true,
+    });
+    this.mousePositions.delete(page);
   }
 
+  @serialized
   async click(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId, { rejectFileInput: true });
@@ -1768,6 +1866,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.actionResult(page, baseline, options);
   }
 
+  @serialized
   async hover(target: string, frameId?: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
@@ -1776,6 +1875,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.actionResult(page, baseline, options);
   }
 
+  @serialized
   async selectOption(
     target: string,
     values: string[],
@@ -1791,6 +1891,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { ...await this.actionResult(page, baseline, options), selectedValues };
   }
 
+  @serialized
   async setChecked(
     target: string,
     checked: boolean,
@@ -1818,6 +1919,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { ...await this.actionResult(page, baseline, options), checked: actual };
   }
 
+  @serialized
   async uploadFile(
     target: string,
     paths: string[],
@@ -1851,6 +1953,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
   }
 
+  @serialized
   async clickAt(x: number, y: number, options?: ActionOptions): Promise<ClickAtResult> {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       throw new Error("click_at requires finite numeric x/y coordinates");
@@ -1873,6 +1976,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return { ...await this.actionResult(page, baseline, options), x, y };
   }
 
+  @serialized
   async drag(
     target: string,
     destination: DragDestination,
@@ -1950,6 +2054,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     }
   }
 
+  @serialized
   async listFrames(options: { includeBox?: boolean } = {}): Promise<FrameSummary[]> {
     const includeBox = options.includeBox === true;
     const page = await this.page();
@@ -2109,11 +2214,13 @@ export class ChromiumFishBrowser implements BrowserApi {
     };
   }
 
+  @serialized
   async findChallenge(): Promise<ChallengeDetection> {
     const page = await this.page();
     return (await this.observeChallenge(page)).detection;
   }
 
+  @serialized
   async solveChallenge(options: ChallengeSolveOptions = {}): Promise<ChallengeSolveResult> {
     if (this.solveChallengeInFlight) {
       const page = await this.page();
@@ -2469,6 +2576,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     }, observed);
   }
 
+  @serialized
   async typeText(
     target: string,
     text: string,
@@ -2480,8 +2588,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     const page = await this.page();
     const handle = await this.resolveTarget(page, target, frameId);
     const baseline = this.actionBaseline(page);
-    // clickHandle rather than mouse.click: the latter presses and releases with no gap,
-    // which is the one synthetic click this server would otherwise still emit.
+    // Type only after the click checks pass, so text never lands on focus held by an occluding control.
     await this.clickHandle(page, handle);
     if (clear) {
       await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
@@ -2492,6 +2599,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.actionResult(page, baseline, options);
   }
 
+  @serialized
   async pressKey(key: string, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const baseline = this.actionBaseline(page);
@@ -2499,6 +2607,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.actionResult(page, baseline, options);
   }
 
+  @serialized
   async scroll(deltaX: number, deltaY: number, options?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const baseline = this.actionBaseline(page);
@@ -2506,6 +2615,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return this.actionResult(page, baseline, options);
   }
 
+  @serialized
   async waitFor(options: WaitForOptions, actionOptions?: ActionOptions): Promise<ActionResult> {
     const page = await this.page();
     const baseline = this.actionBaseline(page);
@@ -2572,6 +2682,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     await page.waitForTimeout(condition.timeMs);
   }
 
+  @serialized
   async evaluate(expression: string): Promise<string> {
     const value = await (await this.page()).evaluate((source) => {
       return (0, eval)(source) as unknown;
@@ -2586,6 +2697,7 @@ export class ChromiumFishBrowser implements BrowserApi {
     return targetId;
   }
 
+  @serialized
   async runTask(task: string, rawUrl: string | undefined, maxSteps: number): Promise<NativeTaskResult> {
     if (!this.config.allowNativeAgent) throw new Error("Native agent tool is not enabled");
     if (rawUrl) await this.navigate(rawUrl);
